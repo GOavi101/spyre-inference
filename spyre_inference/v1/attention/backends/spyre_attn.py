@@ -152,6 +152,10 @@ class SpyreAttentionBackend(AttentionBackend):
         return head_size % 64 == 0
 
     @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        return attn_type in (AttentionType.DECODER, AttentionType.ENCODER_ONLY)
+
+    @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
@@ -258,25 +262,58 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Step 1: Update KV cache (CPU)
-        self._write_to_kv_cache(
-            key[:num_actual_tokens],
-            value[:num_actual_tokens],
-            kv_cache,
-            attn_metadata.slot_mapping,
-            attn_metadata.block_size,
-        )
+        if self.attn_type == AttentionType.ENCODER_ONLY:
+            # Encoder-only: no paged KV cache. K and V are the full input tokens;
+            # reshape them per-sequence (same shape as Q) and pad to KV_LENGTH_ALIGNMENT.
+            compact_k = self._reshape_query_to_sequences(
+                key[:num_actual_tokens],
+                attn_metadata.query_start_loc,
+                attn_metadata.num_seqs,
+                attn_metadata.max_query_len,
+                query.device,
+            )  # [num_seqs, max_query_len, num_kv_heads, head_size]
+            compact_v = self._reshape_query_to_sequences(
+                value[:num_actual_tokens],
+                attn_metadata.query_start_loc,
+                attn_metadata.num_seqs,
+                attn_metadata.max_query_len,
+                query.device,
+            )  # [num_seqs, max_query_len, num_kv_heads, head_size]
+            # Pad KV sequence dimension to KV_LENGTH_ALIGNMENT so the mask and
+            # attention kernel see the same aligned dimension as the decoder path.
+            aligned_kv_len = (
+                (attn_metadata.max_seq_len + self.KV_LENGTH_ALIGNMENT - 1)
+                // self.KV_LENGTH_ALIGNMENT
+                * self.KV_LENGTH_ALIGNMENT
+            )
+            if aligned_kv_len > attn_metadata.max_query_len:
+                pad = aligned_kv_len - attn_metadata.max_query_len
+                compact_k = torch.nn.functional.pad(
+                    compact_k, (0, 0, 0, 0, 0, pad), value=0.0
+                )
+                compact_v = torch.nn.functional.pad(
+                    compact_v, (0, 0, 0, 0, 0, pad), value=0.0
+                )
+        else:
+            # Step 1: Update KV cache (CPU)
+            self._write_to_kv_cache(
+                key[:num_actual_tokens],
+                value[:num_actual_tokens],
+                kv_cache,
+                attn_metadata.slot_mapping,
+                attn_metadata.block_size,
+            )
 
-        # Step 2: Gather compact KV cache (CPU)
-        # compact_k/v: [num_seqs, max_seq_len, num_kv_heads, head_size]
-        compact_k, compact_v = self._gather_compact_kv_cache(
-            kv_cache,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            attn_metadata.block_size,
-            attn_metadata.max_seq_len,
-            query.device,
-        )
+            # Step 2: Gather compact KV cache (CPU)
+            # compact_k/v: [num_seqs, max_seq_len, num_kv_heads, head_size]
+            compact_k, compact_v = self._gather_compact_kv_cache(
+                kv_cache,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                attn_metadata.block_size,
+                attn_metadata.max_seq_len,
+                query.device,
+            )
 
         # Step 3: Reshape query to per-sequence format (CPU)
         # query_per_seq: [num_seqs, max_query_len, num_heads, head_size]

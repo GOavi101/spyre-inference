@@ -229,6 +229,139 @@ def test_spyre_attn(
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
 
+def ref_encoder_only_attn(
+    query: torch.Tensor,   # [num_tokens, num_heads, head_size]
+    key: torch.Tensor,     # [num_tokens, num_kv_heads, head_size]
+    value: torch.Tensor,   # [num_tokens, num_kv_heads, head_size]
+    seq_lens: list[int],
+    scale: float,
+) -> torch.Tensor:
+    """Reference bidirectional (encoder-only) attention."""
+    outputs = []
+    start = 0
+    for seq_len in seq_lens:
+        q = query[start : start + seq_len] * scale  # [seq_len, num_heads, head_size]
+        k = key[start : start + seq_len]
+        v = value[start : start + seq_len]
+
+        num_heads = q.shape[1]
+        num_kv_heads = k.shape[1]
+        if num_heads != num_kv_heads:
+            k = torch.repeat_interleave(k, num_heads // num_kv_heads, dim=1)
+            v = torch.repeat_interleave(v, num_heads // num_kv_heads, dim=1)
+
+        # [num_heads, seq_len, seq_len] — bidirectional, no causal mask
+        attn = torch.einsum("qhd,khd->hqk", q, k).float()
+        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        out = torch.einsum("hqk,khd->qhd", attn, v)
+        outputs.append(out)
+        start += seq_len
+
+    return torch.cat(outputs, dim=0)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [64],
+        [128, 64],
+        [512],
+        [256, 128, 64],
+    ],
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("use_sdpa", [True, False])
+@torch.inference_mode()
+def test_encoder_only_attn(
+    seq_lens: list[int],
+    num_heads: tuple[int, int],
+    head_size: int,
+    dtype: torch.dtype,
+    use_sdpa: bool,
+) -> None:
+    """Validate SpyreAttentionImpl encoder-only (bidirectional) path.
+
+    No KV cache is used: K and V come directly from the input tokens.
+    The metadata mirrors what SpyreEncoderOnlyBuilder produces (causal=False,
+    seq_lens == query_lens).
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_query_heads, num_kv_heads = num_heads
+    assert num_query_heads % num_kv_heads == 0
+    num_tokens = sum(seq_lens)
+    num_seqs = len(seq_lens)
+    max_seq_len = max(seq_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(num_tokens, num_query_heads, head_size, dtype=dtype)
+    key   = torch.randn(num_tokens, num_kv_heads,   head_size, dtype=dtype)
+    value = torch.randn(num_tokens, num_kv_heads,   head_size, dtype=dtype)
+
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32)
+    query_start_loc = torch.tensor([0] + seq_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+
+    # Encoder-only: no paged KV cache needed. Provide a dummy kv_cache and
+    # dummy block_table/slot_mapping — the encoder-only path ignores them.
+    block_size = 16
+    num_blocks = 1
+    kv_cache = torch.zeros(num_blocks, 2, block_size, num_kv_heads, head_size, dtype=dtype)
+    block_table = torch.zeros(num_seqs, 1, dtype=torch.int32)
+    slot_mapping = torch.zeros(num_tokens, dtype=torch.int64)
+
+    attn_metadata = SpyreAttentionMetadata(
+        num_actual_tokens=num_tokens,
+        num_seqs=num_seqs,
+        max_query_len=max_seq_len,
+        max_seq_len=max_seq_len,
+        seq_lens=seq_lens_tensor,
+        query_start_loc=query_start_loc,
+        block_table=block_table,
+        block_size=block_size,
+        slot_mapping=slot_mapping,
+        apply_causal_mask=False,  # bidirectional
+        num_kv_heads=num_kv_heads,
+        num_heads=num_query_heads,
+    )
+
+    from vllm.v1.attention.backend import AttentionType
+    attn_impl = SpyreAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+        attn_type=AttentionType.ENCODER_ONLY,
+        use_sdpa=use_sdpa,
+    )
+
+    output = torch.empty_like(query)
+    attn_impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    ref_output = ref_encoder_only_attn(
+        query=query,
+        key=key,
+        value=value,
+        seq_lens=seq_lens,
+        scale=scale,
+    )
+
+    atol, rtol = (0.1, 0.1) if use_sdpa else (0.3, 5.0)
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize("num_heads", [(8, 2)])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("block_size", [16])
