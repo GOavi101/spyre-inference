@@ -422,10 +422,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         pass
 
     def _sync_device(self) -> None:
-        # TODO: Replace with torch.spyre.synchronize() when available.
-        # For now, all copies are synchronous (no non_blocking), so
-        # explicit sync is not needed.
-        pass
+        torch.spyre.synchronize()
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         return 0, None
