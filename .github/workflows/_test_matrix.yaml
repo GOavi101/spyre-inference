@@ -103,8 +103,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
           - cfg: Spyre attention tests
@@ -113,8 +112,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-attention
           - cfg: Distributed spyre tests
             test_types: core full
@@ -122,8 +120,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-distributed
           - cfg: Upstream vLLM tests
             # Upstream-vLLM suites are excluded from smoke/core (heavy).
@@ -132,8 +129,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
             test_types: full
@@ -141,8 +137,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
             test_types: full
@@ -150,8 +145,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-upstream-model
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
