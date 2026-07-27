@@ -105,7 +105,6 @@ class _SpyreRotaryMixin:
     """
 
     _key_counter = itertools.count()
-    cos_sin_cache: torch.Tensor
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -120,6 +119,10 @@ class _SpyreRotaryMixin:
         self._padded_inner = round_up(self.rotary_dim // 2, _SPYRE_STICK)
         self._rotation_cache: torch.Tensor | None = None
         self._rope_key = f"spyre_rope_{next(self._key_counter)}"
+
+    def _apply(self, fn, recurse=True):
+        # cos_sin_cache has no Spyre kernel; keep cos_sin_cache on CPU.
+        return self
 
     def _get_rotation_cache(self) -> torch.Tensor:
         """Lazily build the CPU 2x2 rotation cache [max_pos, 2, 2, padded_inner] from
