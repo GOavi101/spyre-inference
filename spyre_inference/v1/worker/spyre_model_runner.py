@@ -410,8 +410,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
         # Move layer weights to Spyre device.
-        # Embedding weights stay on CPU via SpyreVocabParallelEmbedding._apply
-        # (see #392); no manual pin loop needed.
         self.model.to(device=self._spyre_device)
 
         # Pooler / classify heads run on CPU after _SpyreModelWrapper D2H's
