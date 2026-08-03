@@ -136,12 +136,14 @@ def test_spyre_strided_scatter_source(spyre_device):
     kv_cache[block_indices, 1, block_offsets] = v
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=("Spyre lacks a native index_select kernel. This blocks on-device RoPE cos/sin gather."),
-)
 def test_spyre_index_select_for_rope(spyre_device):
-    """index_select rows from a cache (RoPE cos/sin gather primitive)."""
+    """index_select rows from a cache (RoPE cos/sin gather primitive).
+
+    torch-spyre now has a multi-row index_select kernel, so this passes. The
+    single-row case still SIGABRTs (torch-spyre#3418; see
+    test_spyre_single_row_index_select), and single-token decode hits that case
+    every step, so SpyreRotaryEmbedding.gather_rotation still gathers on CPU. Move
+    it on-device once the single-row probe below flips to passing."""
     cos_sin_cache = torch.randn(2048, 64, dtype=torch.float16, device=spyre_device)
     positions = torch.arange(32, device=spyre_device)
     out = cos_sin_cache.index_select(0, positions)
@@ -149,8 +151,29 @@ def test_spyre_index_select_for_rope(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-# Note: the embedding CPU-fallback probe lives in
-# tests/test_vocab_parallel_embedding.py::test_embedding_cpu_fallback_xfail
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre's dsc codegen SIGABRTs on a single-row index_select "
+        "(!allocNode->layoutDimOrder_.empty(), dsc2.cpp:4023) — the same crash as "
+        "the single-row embedding gather (torch-spyre#3418). Single-token decode "
+        "steps hit this every step, which is why the RoPE cos/sin gather "
+        "(SpyreRotaryEmbedding.gather_rotation) stays on CPU rather than using the "
+        "on-device index_select above. When this flips to passing, move that gather "
+        "on-device."
+    ),
+)
+def test_spyre_single_row_index_select(spyre_device):
+    """A one-row index_select over the 4D RoPE rotation cache (single-token decode)."""
+    cache = torch.randn(2048, 2, 2, 64, dtype=torch.float16, device=spyre_device)
+    idx = torch.zeros(1, dtype=torch.int64, device=spyre_device)
+    out = cache.index_select(0, idx)
+    expected = cache.cpu().index_select(0, idx.cpu())
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+# Note: the embedding single-row probe lives in
+# tests/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device
 # (xfail strict). It is intentionally not duplicated here.
 
 

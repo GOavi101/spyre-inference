@@ -98,7 +98,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.26.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "30c708894aee9bd78827919f15401cd08b2e46c9" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "dedc5b1d958be68251101dd5c9a5dba0b9a36c2a" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
@@ -118,6 +118,7 @@ members = ["tests/plugin"]
 [tool.uv.extra-build-dependencies]
 # Pin the same torch version for building torch-spyre to avoid any ABI drift
 torch-spyre = ["torch==2.13.0"]
+vllm = ["torch"] # Makes uv resolve torch during build-isolation via the sources defined here rather than pypi, avoiding failure on s390x
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
 # The `explicit=true` setting means this index will only be used for packages that we explicitly set
@@ -127,6 +128,26 @@ torch-spyre = ["torch==2.13.0"]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+# Vendored static metadata for the source-built (ppc64le) torch.
+# This avoids needing to create a full build environment for torch on every `uv sync`.
+[[tool.uv.dependency-metadata]]
+name = "torch"
+version = "2.13.0a0+gitcf30153"
+requires-python = ">=3.10"
+requires-dist = [
+    "filelock",
+    "typing-extensions>=4.10.0",
+    "setuptools>=77.0.3",
+    "sympy>=1.13.3",
+    "networkx>=2.5.1",
+    "jinja2",
+    "fsspec>=0.8.5",
+    "optree>=0.13.0; extra == 'optree'",
+    "opt-einsum>=3.3; extra == 'opt-einsum'",
+    "pyyaml; extra == 'pyyaml'",
+]
+provides-extras = ["optree", "opt-einsum", "pyyaml"]
 
 [tool.ty.rules]
 # TODO: re-enable after fixing subclass attribute lookups in custom_ops/linear.py.

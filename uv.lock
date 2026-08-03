@@ -53,6 +53,13 @@ overrides = [
     { name = "triton", marker = "sys_platform == 'never'" },
 ]
 
+[[manifest.dependency-metadata]]
+name = "torch"
+version = "2.13.0a0+gitcf30153"
+requires-dist = ["filelock", "typing-extensions>=4.10.0", "setuptools>=77.0.3", "sympy>=1.13.3", "networkx>=2.5.1", "jinja2", "fsspec>=0.8.5", "optree>=0.13.0 ; extra == 'optree'", "opt-einsum>=3.3 ; extra == 'opt-einsum'", "pyyaml ; extra == 'pyyaml'"]
+requires-python = ">=3.10"
+provides-extras = ["optree", "opt-einsum", "pyyaml"]
+
 [[package]]
 name = "accelerate"
 version = "1.14.0"
@@ -4400,7 +4407,7 @@ requires-dist = [
     { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", marker = "platform_machine != 'ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
-    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=30c708894aee9bd78827919f15401cd08b2e46c9" },
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=dedc5b1d958be68251101dd5c9a5dba0b9a36c2a" },
     { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.26.0" },
 ]
 
@@ -4763,7 +4770,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=30c708894aee9bd78827919f15401cd08b2e46c9#30c708894aee9bd78827919f15401cd08b2e46c9" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=dedc5b1d958be68251101dd5c9a5dba0b9a36c2a#dedc5b1d958be68251101dd5c9a5dba0b9a36c2a" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
