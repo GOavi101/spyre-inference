@@ -3,6 +3,9 @@ name: vLLM Benchmark
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       vllm_branch:
@@ -38,6 +41,9 @@ permissions:
 jobs:
   # ─── Generate benchmark matrix from spyre config files ───
   set-parameters:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'vllm-bench')
     runs-on: ubuntu-latest
     outputs:
       benchmark_matrix: ${{ steps.set-parameters.outputs.benchmark_matrix }}
@@ -145,7 +151,7 @@ jobs:
         # hand-duplicate ibm-aiu-setup.sh sourcing.
         run: |
           mkdir -p benchmark-results
-          make perf-tests RESULTS_DIR=benchmark-results > benchmark-results/run.log 2>&1
+          make perf-tests RESULTS_DIR=benchmark-results
 
       - name: Install ClickHouse ingest dependencies
         if: github.event_name == 'push'

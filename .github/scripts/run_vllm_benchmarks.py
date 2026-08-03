@@ -93,6 +93,9 @@ def build_env_vars(env_config: dict) -> dict[str, str]:
     return env_vars
 
 
+VLLM_WRAPPER = Path(__file__).parent / "vllm_bench_wrapper.py"
+
+
 def run_benchmark(
     bench_type: str,
     test_name: str,
@@ -103,7 +106,7 @@ def run_benchmark(
     aiu_world_size: str,
 ) -> bool:
     """Run a single vllm bench command. Returns True on success."""
-    cmd = ["vllm", "bench", bench_type]
+    cmd = [sys.executable, str(VLLM_WRAPPER), "bench", bench_type]
     cmd.extend(build_command_args(parameters))
     cmd.extend(["--output-json", str(results_dir / f"{test_name}.json")])
 
@@ -116,10 +119,16 @@ def run_benchmark(
     log.info("=== Running %s test: %s ===", bench_type, test_name)
     log.info("Command: %s", " ".join(cmd))
 
-    result = subprocess.run(cmd, env=env)
+    log_file = results_dir / f"{test_name}.log"
+    with open(log_file, "w") as lf:
+        result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         log.error("Test %s failed with exit code %d", test_name, result.returncode)
+        if result.stderr:
+            stderr_lines = result.stderr.strip().splitlines()[-50:]
+            log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
+    log.info("Test %s passed", test_name)
     return True
 
 
@@ -187,64 +196,74 @@ def run_serve_benchmark(
     model = server_params.pop("model")
     host = str(server_params.get("host", "127.0.0.1"))
     port = int(server_params.get("port", 8000))
-    server_cmd = ["vllm", "serve", model]
+    server_cmd = [sys.executable, str(VLLM_WRAPPER), "serve", model]
     server_cmd.extend(build_command_args(server_params))
 
     log.info("=== Starting vLLM server for serve test: %s ===", test_name)
     log.info("Server command: %s", " ".join(server_cmd))
 
-    server_proc = subprocess.Popen(server_cmd, env=env)
+    server_log = results_dir / f"{test_name}_server.log"
+    with open(server_log, "w") as server_lf:
+        server_proc = subprocess.Popen(server_cmd, env=env, stdout=server_lf, stderr=server_lf)
 
-    # Wait for server health
-    health_url = f"http://{host}:{port}/health"
-    server_ready = False
-    for i in range(1, health_timeout + 1):
-        if server_proc.poll() is not None:
-            log.error("Server process died with exit code %d", server_proc.returncode)
+        # Wait for server health
+        health_url = f"http://{host}:{port}/health"
+        server_ready = False
+        for i in range(1, health_timeout + 1):
+            if server_proc.poll() is not None:
+                log.error("Server process died with exit code %d", server_proc.returncode)
+                return False
+            try:
+                urllib.request.urlopen(health_url, timeout=2)
+                log.info("Server ready after %ds", i)
+                server_ready = True
+                break
+            except Exception:
+                time.sleep(1)
+
+        if not server_ready:
+            log.error("Server did not become healthy within %ds", health_timeout)
+            server_proc.terminate()
+            server_proc.wait(timeout=10)
             return False
-        try:
-            urllib.request.urlopen(health_url, timeout=2)
-            log.info("Server ready after %ds", i)
-            server_ready = True
-            break
-        except Exception:
-            time.sleep(1)
 
-    if not server_ready:
-        log.error("Server did not become healthy within %ds", health_timeout)
+        # Run bench serve
+        bench_cmd = [sys.executable, str(VLLM_WRAPPER), "bench", "serve"]
+        bench_cmd.extend(build_command_args(bench_parameters))
+        bench_cmd.extend(
+            [
+                "--save-result",
+                "--result-dir",
+                str(results_dir),
+                "--result-filename",
+                f"{test_name}.json",
+            ]
+        )
+
+        log.info("=== Running serve benchmark: %s ===", test_name)
+        log.info("Bench command: %s", " ".join(bench_cmd))
+
+        bench_log = results_dir / f"{test_name}_bench.log"
+        with open(bench_log, "w") as blf:
+            result = subprocess.run(
+                bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
+            )
+
+        # Cleanup server
         server_proc.terminate()
-        server_proc.wait(timeout=10)
-        return False
-
-    # Run bench serve
-    bench_cmd = ["vllm", "bench", "serve"]
-    bench_cmd.extend(build_command_args(bench_parameters))
-    bench_cmd.extend(
-        [
-            "--save-result",
-            "--result-dir",
-            str(results_dir),
-            "--result-filename",
-            f"{test_name}.json",
-        ]
-    )
-
-    log.info("=== Running serve benchmark: %s ===", test_name)
-    log.info("Bench command: %s", " ".join(bench_cmd))
-
-    result = subprocess.run(bench_cmd, env=env)
-
-    # Cleanup server
-    server_proc.terminate()
-    try:
-        server_proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        server_proc.kill()
-        server_proc.wait()
+        try:
+            server_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_proc.wait()
 
     if result.returncode != 0:
         log.error("Serve test %s failed with exit code %d", test_name, result.returncode)
+        if result.stderr:
+            stderr_lines = result.stderr.strip().splitlines()[-50:]
+            log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
+    log.info("Serve test %s passed", test_name)
     return True
 
 
