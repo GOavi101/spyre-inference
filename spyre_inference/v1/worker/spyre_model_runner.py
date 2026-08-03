@@ -412,6 +412,26 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
+        # Pooler / classify heads run on CPU after _SpyreModelWrapper D2H's
+        # hidden_states. Cross-encoder rerankers (e.g. bge-reranker) call
+        # ClassifierPoolerHead → RobertaClassificationHead (nn.Linear) on those
+        # CPU tensors — weights must stay on CPU or F.linear hits a device
+        # mismatch (cpu activations × spyre weights). Same pattern as embed
+        # poolers (CLS/MEAN/LAST + normalize), which already assume CPU.
+        if self.model_config.runner_type == "pooling":
+            pinned = []
+            if hasattr(self.model, "pooler"):
+                self.model.pooler.to("cpu")
+                pinned.append("pooler")
+            if hasattr(self.model, "classifier"):
+                self.model.classifier.to("cpu")
+                pinned.append("classifier")
+            if pinned:
+                logger.info(
+                    "Pooling: kept %s on CPU (match D2H hidden_states for classify/score)",
+                    ", ".join(pinned),
+                )
+
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 

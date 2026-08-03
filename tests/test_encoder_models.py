@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre product embed tests vs cached HF refs in encoder_embed_refs.json.
+"""Spyre product embed tests vs cached HF refs and reranker smoke tests.
 
-Regenerate: ``python tests/data/generate_encoder_embed_refs.py``
+Regenerate embed refs: ``python tests/data/generate_encoder_embed_refs.py``
 """
 
 from __future__ import annotations
@@ -33,6 +33,12 @@ EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-278m-multilingual",
     "intfloat/multilingual-e5-large",
     "sentence-transformers/all-roberta-large-v1",
+]
+
+# Cross-encoder reranker smoke (classify / score path). One model is enough —
+# both BGE variants share XLMRobertaForSequenceClassification.
+RERANKER_MODELS = [
+    "BAAI/bge-reranker-v2-m3",
 ]
 
 # Match upstream check_embeddings_close(tol=1e-2).
@@ -79,3 +85,19 @@ def test_encoder_embed_models(model: str) -> None:
         assert sim >= COSINE_MIN, (
             f"{model}: cosine {sim:.4f} < {COSINE_MIN} vs cached HF reference for prompt {prompt!r}"
         )
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", RERANKER_MODELS)
+def test_encoder_rerank_models(model: str) -> None:
+    """Load reranker and return one finite score via LLM.score()."""
+    llm = LLM(
+        model=model,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=1,
+        enforce_eager=True,
+    )
+    scores = llm.score("What is Spyre?", "An IBM AI accelerator.")
+    assert len(scores) == 1
+    assert math.isfinite(scores[0].outputs.score)
