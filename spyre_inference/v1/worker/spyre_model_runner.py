@@ -274,6 +274,10 @@ class _SpyreModelWrapper:
         context. Modules with no Spyre path return None from gather_rotation."""
         if positions is None or not self._rope_modules or not is_forward_context_available():
             return
+        # vLLM's positions buffer is int64; downcast on the host (free, and positions are
+        # always < max_model_len) so the on-device gather uses int32 indices directly and
+        # skips torch-spyre's internal int64 downcast.
+        positions = positions.to(torch.int32)
         rope_rot = {}
         for rope in self._rope_modules:
             rot = rope.gather_rotation(positions, self._spyre_device)
