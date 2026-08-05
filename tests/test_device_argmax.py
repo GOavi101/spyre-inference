@@ -149,6 +149,24 @@ def test_float32_logits():
     torch.testing.assert_close(greedy_token_ids(logits), reference(logits), atol=0, rtol=0)
 
 
+def test_every_where_operand_is_a_device_tensor():
+    """Python-float operands would leave the device.
+
+    torch_spyre/ops/eager.py registers ``aten.where.self`` only -- not the
+    Scalar overloads. ``torch.where(cond, t, 1.0)`` therefore lowers through a
+    composite that wraps the float in a *CPU* tensor, handing ``where.self`` a
+    mixed-device operand. Keeping the sentinels and the mask fill as tensors is
+    what avoids that, so assert it rather than rely on reading _reduce.
+    """
+    logits = torch.randn(2, 4096, dtype=torch.float16)
+    hi_pos, lo_pos, valid_mask, *scalars = _get_constants(logits, 4000)
+
+    assert valid_mask is not None, "expected the padded case to build a mask"
+    for const in (hi_pos, lo_pos, valid_mask, *scalars):
+        assert isinstance(const, torch.Tensor)
+        assert const.device == logits.device
+
+
 def test_rejects_non_2d_input():
     with pytest.raises(ValueError, match=r"\[batch, vocab\]"):
         argmax_digits(torch.randn(2, 3, 4, dtype=torch.float16))

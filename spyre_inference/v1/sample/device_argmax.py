@@ -62,15 +62,22 @@ def _digit_constants(
     valid_vocab: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float, float]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     """Build the resident per-column constants for one logits shape.
 
-    Returns ``(hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel)``. The
-    position tensors are ``[1, padded_vocab]`` so they broadcast over the batch.
-    ``valid_mask`` is None when there is no padding to exclude.
+    Returns ``(hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel, mask_fill)``.
+    The position tensors are ``[1, padded_vocab]`` so they broadcast over the
+    batch; ``valid_mask`` is None when there is no padding to exclude.
+
+    Every ``where`` operand is a device tensor, including the scalars. Only
+    ``aten.where.self`` is registered for Spyre (torch_spyre/ops/eager.py), so
+    a Python float would route to ``aten::where.ScalarOther``, whose composite
+    decomposition wraps the scalar in a *CPU* tensor and hands ``where.self``
+    a mixed-device operand.
     """
     hi_sentinel = float((padded_vocab - 1) // _RADIX + 1)
-    lo_sentinel = float(_RADIX)
 
     if dtype == torch.float16 and hi_sentinel > _FP16_EXACT_INT_MAX:
         raise ValueError(
@@ -78,6 +85,9 @@ def _digit_constants(
             f"which fp16 cannot represent exactly (limit {_FP16_EXACT_INT_MAX}). "
             f"Raise _RADIX above {_RADIX} to rebalance the two digits."
         )
+
+    def scalar(value: float) -> torch.Tensor:
+        return torch.full((1, 1), value, dtype=dtype).to(device)
 
     # arange is a CPU fallback on Spyre, so build on the host once and keep the
     # result resident on the device; this is setup cost, not per-step cost.
@@ -89,7 +99,14 @@ def _digit_constants(
     if valid_vocab < padded_vocab:
         valid_mask = (positions < valid_vocab).unsqueeze(0).to(device)
 
-    return hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel
+    return (
+        hi_pos,
+        lo_pos,
+        valid_mask,
+        scalar(hi_sentinel),
+        scalar(float(_RADIX)),
+        scalar(torch.finfo(dtype).min),
+    )
 
 
 @lru_cache(maxsize=8)
@@ -98,7 +115,7 @@ def _cached_constants(
     valid_vocab: int,
     device_str: str,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float, float]:
+):
     return _digit_constants(padded_vocab, valid_vocab, torch.device(device_str), dtype)
 
 
@@ -119,10 +136,10 @@ def _get_constants(logits, valid_vocab):
     return _cached_constants(padded_vocab, valid_vocab, str(logits.device), logits.dtype)
 
 
-def _reduce(logits, hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel):
+def _reduce(logits, hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel, mask_fill):
     """Pure-tensor reduction that torch.compile can trace and lower to Spyre."""
     if valid_mask is not None:
-        logits = torch.where(valid_mask, logits, torch.finfo(logits.dtype).min)
+        logits = torch.where(valid_mask, logits, mask_fill)
 
     is_max = logits == logits.amax(dim=-1, keepdim=True)
 
@@ -157,9 +174,7 @@ def argmax_digits(
     if logits.ndim != 2:
         raise ValueError(f"expected [batch, vocab] logits, got shape {tuple(logits.shape)}")
 
-    hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel = _get_constants(logits, valid_vocab)
-
-    return _reduce(logits, hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel)
+    return _reduce(logits, *_get_constants(logits, valid_vocab))
 
 
 def combine_digits(hi: torch.Tensor, lo: torch.Tensor) -> torch.Tensor:

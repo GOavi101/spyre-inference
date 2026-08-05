@@ -385,12 +385,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._spyre_org_vocab_for_sample = None
 
         if state is not None:
-            (
-                scheduler_output,
-                logits,
-                spec_decode_metadata,
-                *rest,
-            ) = state
+            logits = state.logits
             org_vocab = self._spyre_org_vocab_size(logits)
             if isinstance(logits, torch.Tensor) and org_vocab <= 0:
                 org_vocab = logits.shape[-1]
@@ -402,16 +397,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 and is_pure_greedy(
                     self.input_batch.sampling_metadata,
                     has_grammar=False,
-                    has_spec=spec_decode_metadata is not None,
+                    has_spec=state.spec_decode_metadata is not None,
                 )
             )
             if on_spyre and not use_device:
-                logits = SpyreLogitsProcessor.to_host_logits(logits, org_vocab)
-                self.execute_model_state = (
-                    scheduler_output,
-                    logits,
-                    spec_decode_metadata,
-                    *rest,
+                self.execute_model_state = state._replace(
+                    logits=SpyreLogitsProcessor.to_host_logits(logits, org_vocab)
                 )
             self._spyre_device_greedy = use_device
             self._spyre_org_vocab_for_sample = org_vocab
