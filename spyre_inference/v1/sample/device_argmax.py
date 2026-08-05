@@ -50,6 +50,7 @@ token id.
 from functools import lru_cache
 
 import torch
+import torch._dynamo as dynamo
 
 # Both digits must stay below the largest integer fp16 represents exactly.
 _RADIX = 128
@@ -101,6 +102,40 @@ def _cached_constants(
     return _digit_constants(padded_vocab, valid_vocab, torch.device(device_str), dtype)
 
 
+@dynamo.disable
+def _get_constants(logits, valid_vocab):
+    """Fetch cached constants outside of Dynamo's trace.
+
+    Dynamo traces through lru_cache and captures the int64 tensor
+    construction, which Inductor then lowers with ``spyre::to_dtype_cpu``
+    -- an op with no CPU kernel. Wrapping the lookup in ``@dynamo.disable``
+    makes the tensors opaque graph inputs instead.
+    """
+    padded_vocab = logits.shape[-1]
+    if valid_vocab is None:
+        valid_vocab = padded_vocab
+    if not 0 < valid_vocab <= padded_vocab:
+        raise ValueError(f"valid_vocab {valid_vocab} outside (0, {padded_vocab}]")
+    return _cached_constants(padded_vocab, valid_vocab, str(logits.device), logits.dtype)
+
+
+def _reduce(logits, hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel):
+    """Pure-tensor reduction that torch.compile can trace and lower to Spyre."""
+    if valid_mask is not None:
+        logits = torch.where(valid_mask, logits, torch.finfo(logits.dtype).min)
+
+    is_max = logits == logits.amax(dim=-1, keepdim=True)
+
+    # min(x) = -max(-x); amin is not in Spyre's eager op registry.
+    hi_sel = torch.where(is_max, hi_pos, hi_sentinel)
+    hi_min = (-(-hi_sel).amax(dim=-1, keepdim=True))
+
+    lo_sel = torch.where(hi_sel == hi_min, lo_pos, lo_sentinel)
+    lo_min = (-(-lo_sel).amax(dim=-1, keepdim=True))
+
+    return hi_min, lo_min
+
+
 def argmax_digits(
     logits: torch.Tensor,
     valid_vocab: int | None = None,
@@ -122,30 +157,9 @@ def argmax_digits(
     if logits.ndim != 2:
         raise ValueError(f"expected [batch, vocab] logits, got shape {tuple(logits.shape)}")
 
-    padded_vocab = logits.shape[-1]
-    valid_vocab = padded_vocab if valid_vocab is None else valid_vocab
-    if not 0 < valid_vocab <= padded_vocab:
-        raise ValueError(f"valid_vocab {valid_vocab} outside (0, {padded_vocab}]")
+    hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel = _get_constants(logits, valid_vocab)
 
-    hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel = _cached_constants(
-        padded_vocab, valid_vocab, str(logits.device), logits.dtype
-    )
-
-    if valid_mask is not None:
-        # Replace rather than add: an additive -inf can overflow to NaN.
-        logits = torch.where(valid_mask, logits, torch.finfo(logits.dtype).min)
-
-    is_max = logits == logits.amax(dim=-1, keepdim=True)
-
-    # We need the minimum along dim=-1, but `amin` is not registered for eager
-    # Spyre (only `amax` is). Use the identity  min(x) = -max(-x).
-    hi_sel = torch.where(is_max, hi_pos, hi_sentinel)
-    hi_min = (-(-hi_sel).amax(dim=-1, keepdim=True))
-
-    lo_sel = torch.where(hi_sel == hi_min, lo_pos, lo_sentinel)
-    lo_min = (-(-lo_sel).amax(dim=-1, keepdim=True))
-
-    return hi_min, lo_min
+    return _reduce(logits, hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel)
 
 
 def combine_digits(hi: torch.Tensor, lo: torch.Tensor) -> torch.Tensor:

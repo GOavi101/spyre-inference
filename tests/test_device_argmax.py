@@ -25,6 +25,8 @@ import torch
 
 from spyre_inference.v1.sample.device_argmax import (
     _RADIX,
+    _get_constants,
+    _reduce,
     argmax_digits,
     combine_digits,
     greedy_token_ids,
@@ -216,11 +218,12 @@ def test_on_spyre_matches_cpu_reference(spyre_device, mode):
     logits_cpu = torch.randn(8, 32000, dtype=torch.float16)
     logits = logits_cpu.to(spyre_device)
 
-    fn = argmax_digits
     if mode == "compile":
-        fn = torch.compile(argmax_digits, dynamic=False)
-
-    hi, lo = fn(logits)
+        consts = _get_constants(logits, None)
+        fn = torch.compile(_reduce, dynamic=False)
+        hi, lo = fn(logits, *consts)
+    else:
+        hi, lo = argmax_digits(logits)
 
     got = combine_digits(hi.cpu(), lo.cpu())
     torch.testing.assert_close(got, reference(logits_cpu), atol=0, rtol=0)
