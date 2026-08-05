@@ -171,10 +171,36 @@ def test_rejects_vocab_too_large_for_fp16():
 
 @pytest.fixture()
 def spyre_device():
-    from spyre_testing_plugin.pytest_plugin import spyre_available
+    """Claim a Spyre card, or skip when hardware/runtime is not usable.
 
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
+    ``spyre_available()`` does ``torch.randn(..., device="spyre")``. A native
+    SIGABRT during that H2D copy (busy VFIO, missing RANK env, etc.) kills the
+    whole pytest process -- Python ``except`` cannot catch it. Gate on the
+    soft hardware check first, set the comms env that libspyre_comms captures
+    at load, then claim the device explicitly.
+    """
+    import os
+
+    from spyre_testing_plugin.vfio_reaper import spyre_hardware_present
+
+    if not spyre_hardware_present():
+        pytest.skip("Spyre hardware not present (no /dev/vfio or AIU_WORLD_SIZE)")
+
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
+    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "1")
+
+    try:
+        import torch_spyre  # noqa: F401
+
+        torch.spyre.set_device(0)
+        # empty+fill avoids the randn path that aborted in spyre__normal_.
+        torch.empty(1, dtype=torch.float16, device="spyre").fill_(0)
+    except Exception as exc:
+        pytest.skip(f"Spyre device not usable: {exc}")
+
     return torch.device("spyre")
 
 
@@ -211,7 +237,8 @@ def test_on_spyre_does_not_fall_back_to_cpu(spyre_device):
 
     from torch_spyre.ops.fallbacks import FallbackWarning
 
-    logits = torch.randn(8, 32000, dtype=torch.float16, device=spyre_device)
+    # Build on CPU then H2D -- avoids spyre__normal_, which aborted the probe.
+    logits = torch.randn(8, 32000, dtype=torch.float16).to(spyre_device)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", FallbackWarning)
