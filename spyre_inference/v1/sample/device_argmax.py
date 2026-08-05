@@ -33,7 +33,7 @@ two digits that individually stay inside the exact range::
     index = hi * RADIX + lo        hi < ceil(V / RADIX), lo < RADIX
 
 and reduce each digit separately using only ops that torch-spyre runs natively
-(``amax``, ``amin``, ``eq``, ``where``). Device-to-host traffic drops from
+(``amax``, ``eq``, ``where``, ``neg``). Device-to-host traffic drops from
 ``[batch, vocab]`` to ``[batch, 2]``; the two digits are recombined in int64 on
 the host, where the arithmetic is exact.
 
@@ -137,16 +137,13 @@ def argmax_digits(
 
     is_max = logits == logits.amax(dim=-1, keepdim=True)
 
-    # Non-maximal columns take the sentinel, which exceeds every real high
-    # digit, so the min lands on the lowest high digit among the maxima.
+    # We need the minimum along dim=-1, but `amin` is not registered for eager
+    # Spyre (only `amax` is). Use the identity  min(x) = -max(-x).
     hi_sel = torch.where(is_max, hi_pos, hi_sentinel)
-    hi_min = hi_sel.amin(dim=-1, keepdim=True)
+    hi_min = (-(-hi_sel).amax(dim=-1, keepdim=True))
 
-    # hi_sel already holds the sentinel off the maxima, so this equality alone
-    # selects "is a maximum AND sits in the winning high digit" -- no boolean
-    # combination needed.
     lo_sel = torch.where(hi_sel == hi_min, lo_pos, lo_sentinel)
-    lo_min = lo_sel.amin(dim=-1, keepdim=True)
+    lo_min = (-(-lo_sel).amax(dim=-1, keepdim=True))
 
     return hi_min, lo_min
 
