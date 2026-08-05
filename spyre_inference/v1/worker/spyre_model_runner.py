@@ -373,16 +373,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return logits.shape[-1]
         return 0
 
-    def _spyre_scale_preserves_argmax(self) -> bool:
-        lp = self._spyre_logits_processor()
-        if lp is None:
-            return True
-        # Non-positive scale reverses / collapses the argmax (upstream get_top_tokens).
-        return not (lp.scale <= 0.0 and lp.scale != 1.0)
-
     @torch.inference_mode()
     def sample_tokens(self, grammar_output):
-        """Convert Spyre logits to CPU unless Stage 2 on-device greedy applies."""
+        """Convert Spyre logits to CPU unless Stage 2 on-device greedy applies.
+
+        Logits only arrive on Spyre when SpyreLogitsProcessor found nothing to
+        post-process, so scale/soft_cap need no argmax-preservation check here.
+        """
         state = self.execute_model_state
         self._spyre_device_greedy = False
         self._spyre_org_vocab_for_sample = None
@@ -402,7 +399,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 _DEVICE_GREEDY
                 and on_spyre
                 and grammar_output is None
-                and self._spyre_scale_preserves_argmax()
                 and is_pure_greedy(
                     self.input_batch.sampling_metadata,
                     has_grammar=False,

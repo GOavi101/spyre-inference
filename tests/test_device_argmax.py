@@ -229,6 +229,31 @@ def test_on_spyre_matches_cpu_reference(spyre_device, mode):
     torch.testing.assert_close(got, reference(logits_cpu), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("mode", ["eager", "compile"])
+def test_on_spyre_masks_padding_columns(spyre_device, mode):
+    """The masked branch is what production runs; the unmasked one is not.
+
+    Whenever vocab_size > org_vocab_size the runner passes valid_vocab, which
+    turns on the ``where(valid_mask, logits, finfo.min)`` step. That step
+    broadcasts a [1, vocab] bool condition over the batch -- a shape the other
+    on-device tests never reach, since they pass valid_vocab=None.
+    """
+    valid, padded = 32000, 32064
+    logits_cpu = torch.full((4, padded), -5.0, dtype=torch.float16)
+    logits_cpu[:, valid:] = 0.0  # padding columns beat every real logit unmasked
+    logits_cpu[:, 12345] = -1.0
+    logits = logits_cpu.to(spyre_device)
+
+    if mode == "compile":
+        consts = _get_constants(logits, valid)
+        hi, lo = torch.compile(_reduce, dynamic=False)(logits, *consts)
+    else:
+        hi, lo = argmax_digits(logits, valid_vocab=valid)
+
+    got = combine_digits(hi.cpu(), lo.cpu())
+    assert torch.equal(got, torch.full((4,), 12345, dtype=torch.int64))
+
+
 def test_on_spyre_does_not_fall_back_to_cpu(spyre_device):
     """The point of the decomposition is avoiding argmax's CPU round-trip.
 

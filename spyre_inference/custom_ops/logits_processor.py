@@ -31,13 +31,18 @@ _SAMPLER_PROFILING = os.environ.get("SPYRE_SAMPLER_PROFILING", "0") == "1"
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
 class SpyreLogitsProcessor(LogitsProcessor):
-    def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Gather TP-sharded logits and leave them on Spyre when possible.
+    def _keeps_logits_on_device(self) -> bool:
+        """Whether ``forward`` can run its post-processing on Spyre.
 
-        The model runner decides whether to keep them on-device for Stage 2
-        greedy or to convert to CPU for the upstream host sampler.
+        ``forward`` applies soft_cap (``tanh``) and an in-place ``*= scale``
+        after this method returns. Both used to land on CPU because the gather
+        ended with a D2H. Leaving logits on Spyre silently moves them onto the
+        device, where in-place mul on a non-contiguous tensor is a known
+        torch-spyre failure (test_spyre_inplace_mul_noncontiguous) and tanh at
+        full vocab width is unexercised. Only stay on-device when both are
+        no-ops; anything else takes the original CPU path.
         """
-        return super()._gather_logits(logits)
+        return self.soft_cap is None and self.scale == 1.0
 
     def _get_logits(
         self,
@@ -46,17 +51,17 @@ class SpyreLogitsProcessor(LogitsProcessor):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
         logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
-        logits = self._gather_logits(logits)
+        logits = super()._gather_logits(logits)
         if logits is None:
             return None
 
-        # Last-dim slice is unreliable on Spyre (see test_spyre_fallback_probes).
-        # Keep the full width on-device and mask via valid_vocab=org_vocab_size
-        # in the Stage 2 reduction; host path slices after D2H.
-        if logits.device.type == "spyre":
+        # Keep the full padded width on-device rather than slicing the last dim
+        # on Spyre; the Stage 2 reduction excludes the padding via
+        # valid_vocab=org_vocab_size instead. The host path slices after D2H.
+        if logits.device.type == "spyre" and self._keeps_logits_on_device():
             return logits
 
-        return logits[..., : self.org_vocab_size]
+        return self.to_host_logits(logits, self.org_vocab_size)
 
     @staticmethod
     def to_host_logits(logits: torch.Tensor, org_vocab_size: int) -> torch.Tensor:
