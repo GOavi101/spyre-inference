@@ -40,11 +40,11 @@ the host, where the arithmetic is exact.
 Tie-breaking matches ``torch.argmax`` (lowest index wins), which matters
 because fp16 ties across a large vocab are common.
 
-This module is the reduction only. Wiring it into the decode path additionally
-requires gating on pure-greedy sampling (no penalties, bad words, logit bias,
-allowed-token masks, or logprobs -- all of which need full logits on the host)
-and, under TP>1, a cross-rank reduction to turn per-shard winners into a global
-token id.
+This module is the reduction used by Stage 2. ``TorchSpyreModelRunner`` calls
+:func:`greedy_token_ids` for pure-greedy batches (see
+:mod:`spyre_inference.v1.sample.pure_greedy`). Non-greedy / logprobs / penalties
+/ masks / grammar still need full logits on the host. Under TP>1 a future
+``get_top_tokens``-style path can avoid the full-vocab all-gather.
 """
 
 from functools import lru_cache

@@ -38,6 +38,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 
@@ -52,13 +53,20 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.sample.device_argmax import greedy_token_ids
+from spyre_inference.v1.sample.pure_greedy import is_pure_greedy
+
+# Set to "0" to force the host sampler even for pure-greedy batches.
+_DEVICE_GREEDY = os.environ.get("SPYRE_DEVICE_GREEDY", "1") != "0"
 
 logger = init_logger(__name__)
 
@@ -291,11 +299,9 @@ class _SpyreModelWrapper:
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
         on CPU (Spyre cannot slice), so the tensor handed to compute_logits
-        is on CPU; move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        is on CPU; move it onto Spyre for the lm_head matmul. Logits stay on
+        Spyre after gather; TorchSpyreModelRunner converts to CPU for the host
+        sampler, or runs Stage 2 on-device greedy when the batch is pure greedy.
         """
         hidden_states = convert(hidden_states, device=self._spyre_device)
         return self._model.compute_logits(hidden_states, *args, **kwargs)
@@ -350,6 +356,81 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+
+        # Stage 2: set in sample_tokens, consumed by _sample.
+        self._spyre_device_greedy = False
+        self._spyre_org_vocab_for_sample: int | None = None
+
+    def _spyre_logits_processor(self) -> SpyreLogitsProcessor | None:
+        lp = getattr(self.model, "logits_processor", None)
+        return lp if isinstance(lp, SpyreLogitsProcessor) else None
+
+    def _spyre_org_vocab_size(self, logits: torch.Tensor | None = None) -> int:
+        lp = self._spyre_logits_processor()
+        if lp is not None:
+            return lp.org_vocab_size
+        if isinstance(logits, torch.Tensor):
+            return logits.shape[-1]
+        return 0
+
+    def _spyre_scale_preserves_argmax(self) -> bool:
+        lp = self._spyre_logits_processor()
+        if lp is None:
+            return True
+        # Non-positive scale reverses / collapses the argmax (upstream get_top_tokens).
+        return not (lp.scale <= 0.0 and lp.scale != 1.0)
+
+    @torch.inference_mode()
+    def sample_tokens(self, grammar_output):
+        """Convert Spyre logits to CPU unless Stage 2 on-device greedy applies."""
+        state = self.execute_model_state
+        self._spyre_device_greedy = False
+        self._spyre_org_vocab_for_sample = None
+
+        if state is not None:
+            (
+                scheduler_output,
+                logits,
+                spec_decode_metadata,
+                *rest,
+            ) = state
+            org_vocab = self._spyre_org_vocab_size(logits)
+            if isinstance(logits, torch.Tensor) and org_vocab <= 0:
+                org_vocab = logits.shape[-1]
+            on_spyre = isinstance(logits, torch.Tensor) and logits.device.type == "spyre"
+            use_device = (
+                _DEVICE_GREEDY
+                and on_spyre
+                and grammar_output is None
+                and self._spyre_scale_preserves_argmax()
+                and is_pure_greedy(
+                    self.input_batch.sampling_metadata,
+                    has_grammar=False,
+                    has_spec=spec_decode_metadata is not None,
+                )
+            )
+            if on_spyre and not use_device:
+                logits = SpyreLogitsProcessor.to_host_logits(logits, org_vocab)
+                self.execute_model_state = (
+                    scheduler_output,
+                    logits,
+                    spec_decode_metadata,
+                    *rest,
+                )
+            self._spyre_device_greedy = use_device
+            self._spyre_org_vocab_for_sample = org_vocab
+
+        return super().sample_tokens(grammar_output)
+
+    def _sample(self, logits, spec_decode_metadata):
+        if self._spyre_device_greedy and logits is not None:
+            valid_vocab = self._spyre_org_vocab_for_sample or logits.shape[-1]
+            token_ids = greedy_token_ids(logits, valid_vocab=valid_vocab)
+            return SamplerOutput(
+                sampled_token_ids=token_ids.to(torch.int32).unsqueeze(-1),
+                logprobs_tensors=None,
+            )
+        return super()._sample(logits, spec_decode_metadata)
 
     @staticmethod
     def _patch_encoder_ops_for_spyre(model_config) -> None:

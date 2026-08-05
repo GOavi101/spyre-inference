@@ -18,32 +18,61 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from .utils import convert
 
 logger = init_logger(__name__)
 
-# When set, wraps the logits D2H in a torch.profiler.record_function span and
-# logs the transfer size once. Sampling runs on the host, so this transfer is
-# the cost that an on-device greedy/top-1 path would remove -- measuring it is
-# what justifies (or deprioritizes) that work.
+# When set, logs the size of a host-path logits D2H once. The runner converts
+# to CPU only when the host sampler is required; pure-greedy Stage 2 skips it.
 _SAMPLER_PROFILING = os.environ.get("SPYRE_SAMPLER_PROFILING", "0") == "1"
 
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
 class SpyreLogitsProcessor(LogitsProcessor):
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Gather TP-sharded logits on Spyre, then move the result to CPU."""
-        gathered = super()._gather_logits(logits)
+        """Gather TP-sharded logits and leave them on Spyre when possible.
 
-        if not _SAMPLER_PROFILING:
-            return convert(gathered, device="cpu")
+        The model runner decides whether to keep them on-device for Stage 2
+        greedy or to convert to CPU for the upstream host sampler.
+        """
+        return super()._gather_logits(logits)
 
-        logger.info_once(
-            "Sampler logits D2H: shape=%s dtype=%s bytes=%d per step",
-            tuple(gathered.shape),
-            gathered.dtype,
-            gathered.numel() * gathered.element_size(),
-        )
-        with torch.profiler.record_function("spyre_sampler::logits_d2h"):
-            return convert(gathered, device="cpu")
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        logits = self._gather_logits(logits)
+        if logits is None:
+            return None
+
+        # Last-dim slice is unreliable on Spyre (see test_spyre_fallback_probes).
+        # Keep the full width on-device and mask via valid_vocab=org_vocab_size
+        # in the Stage 2 reduction; host path slices after D2H.
+        if logits.device.type == "spyre":
+            return logits
+
+        return logits[..., : self.org_vocab_size]
+
+    @staticmethod
+    def to_host_logits(logits: torch.Tensor, org_vocab_size: int) -> torch.Tensor:
+        """D2H + org-vocab trim for the upstream CPU sampler."""
+        if _SAMPLER_PROFILING:
+            logger.info_once(
+                "Sampler logits D2H: shape=%s dtype=%s bytes=%d per step",
+                tuple(logits.shape),
+                logits.dtype,
+                logits.numel() * logits.element_size(),
+            )
+            with torch.profiler.record_function("spyre_sampler::logits_d2h"):
+                host = convert(logits, device="cpu")
+        else:
+            host = convert(logits, device="cpu")
+
+        if host.shape[-1] > org_vocab_size:
+            host = host[..., :org_vocab_size]
+        return host
