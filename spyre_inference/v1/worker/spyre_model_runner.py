@@ -424,6 +424,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _sample(self, logits, spec_decode_metadata):
         if self._spyre_device_greedy and logits is not None:
+            # Mirror the base class: async scheduling backfills the previous
+            # step's sampled ids into sampling_metadata.output_token_ids here.
+            # It is a no-op when output_token_ids is unset, but skipping it
+            # would silently diverge from upstream bookkeeping.
+            self.input_batch.update_async_output_token_ids()
             valid_vocab = self._spyre_org_vocab_for_sample or logits.shape[-1]
             token_ids = greedy_token_ids(logits, valid_vocab=valid_vocab)
             return SamplerOutput(
