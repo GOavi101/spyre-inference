@@ -67,6 +67,7 @@ from spyre_inference.v1.sample.pure_greedy import is_pure_greedy
 
 # Set to "0" to force the host sampler even for pure-greedy batches.
 _DEVICE_GREEDY = os.environ.get("SPYRE_DEVICE_GREEDY", "1") != "0"
+_SAMPLER_PROFILING = os.environ.get("SPYRE_SAMPLER_PROFILING", "0") == "1"
 
 logger = init_logger(__name__)
 
@@ -377,8 +378,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def sample_tokens(self, grammar_output):
         """Convert Spyre logits to CPU unless Stage 2 on-device greedy applies.
 
-        Logits only arrive on Spyre when SpyreLogitsProcessor found nothing to
-        post-process, so scale/soft_cap need no argmax-preservation check here.
+        ``SpyreLogitsProcessor.forward`` applies scale/soft_cap on-device with
+        out-of-place ops, so logits arrive on Spyre even for Granite
+        (``logits_scaling`` → scale != 1). Device greedy then sees the already-
+        scaled tensor; host path D2Hs the same tensor.
         """
         state = self.execute_model_state
         self._spyre_device_greedy = False
@@ -406,6 +409,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
             self._spyre_device_greedy = use_device
             self._spyre_org_vocab_for_sample = org_vocab
+            if use_device and _SAMPLER_PROFILING:
+                logger.info_once(
+                    "Stage 2 on-device greedy: skipping full-vocab logits D2H "
+                    "(reducing on Spyre, returning [batch] token ids)"
+                )
 
         return super().sample_tokens(grammar_output)
 
