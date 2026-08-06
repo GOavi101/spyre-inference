@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Stage 2 pure-greedy eligibility."""
+"""is_pure_greedy eligibility."""
 
 from __future__ import annotations
 

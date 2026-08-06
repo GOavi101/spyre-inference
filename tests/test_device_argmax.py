@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness of the two-digit top-1 reduction in v1/sample/device_argmax.py.
-
-The index arithmetic and tie-breaking are device-independent, so the bulk of
-this suite runs on CPU and is meaningful without a Spyre card. The final tests
-re-run the same reduction on-device (eager and compiled) and skip when no card
-is present.
-"""
+"""device_argmax correctness (CPU + optional Spyre)."""
 
 import pytest
 import torch
@@ -38,7 +32,6 @@ LLAMA_VOCAB, LLAMA_PADDED = 128256, 129024
 
 
 def reference(logits: torch.Tensor, valid_vocab: int | None = None) -> torch.Tensor:
-    """torch.argmax over the unpadded region: the behaviour we must match."""
     if valid_vocab is not None:
         logits = logits[:, :valid_vocab]
     return logits.argmax(dim=-1)
@@ -47,7 +40,6 @@ def reference(logits: torch.Tensor, valid_vocab: int | None = None) -> torch.Ten
 @pytest.mark.parametrize("vocab", [256, 1024, 2048, 32000, GRANITE_VOCAB, LLAMA_VOCAB])
 @pytest.mark.parametrize("batch", [1, 8])
 def test_matches_torch_argmax(vocab: int, batch: int):
-    """Random fp16 logits at realistic vocab sizes."""
     torch.manual_seed(0)
     logits = torch.randn(batch, vocab, dtype=torch.float16)
 
@@ -101,16 +93,11 @@ def test_ties_within_and_across_high_digits():
 
 
 def test_padding_columns_are_excluded():
-    """Zero padding columns must not win when every real logit is negative.
-
-    SpyreParallelLMHead pads its weight rows, and the padding rows are zeros, so
-    the padded logit columns are exactly 0.0. Without masking they would beat
-    any negative real logit.
-    """
+    # Zero padding must not beat negative real logits.
     valid, padded = 3000, 4096
     logits = torch.full((4, padded), -5.0, dtype=torch.float16)
     logits[:, valid:] = 0.0
-    logits[:, 1234] = -1.0  # best real token, still negative
+    logits[:, 1234] = -1.0
 
     got = greedy_token_ids(logits, valid_vocab=valid)
 
@@ -118,7 +105,6 @@ def test_padding_columns_are_excluded():
 
 
 def test_padding_is_a_noop_when_unpadded():
-    """Passing valid_vocab == vocab must not change the result."""
     torch.manual_seed(1)
     logits = torch.randn(4, 2048, dtype=torch.float16)
 
@@ -131,7 +117,6 @@ def test_padding_is_a_noop_when_unpadded():
 
 
 def test_digits_are_small_enough_for_fp16():
-    """Neither digit may leave fp16's exact-integer range; that is the premise."""
     logits = torch.randn(8, LLAMA_PADDED, dtype=torch.float16)
 
     hi, lo = argmax_digits(logits)
@@ -142,7 +127,6 @@ def test_digits_are_small_enough_for_fp16():
 
 
 def test_float32_logits():
-    """The reduction is dtype-agnostic; fp32 must work too."""
     torch.manual_seed(2)
     logits = torch.randn(4, 32000, dtype=torch.float32)
 
@@ -150,14 +134,7 @@ def test_float32_logits():
 
 
 def test_every_where_operand_is_a_device_tensor():
-    """Python-float operands would leave the device.
-
-    torch_spyre/ops/eager.py registers ``aten.where.self`` only -- not the
-    Scalar overloads. ``torch.where(cond, t, 1.0)`` therefore lowers through a
-    composite that wraps the float in a *CPU* tensor, handing ``where.self`` a
-    mixed-device operand. Keeping the sentinels and the mask fill as tensors is
-    what avoids that, so assert it rather than rely on reading _reduce.
-    """
+    # Spyre only registers aten.where.self — scalars must be device tensors.
     logits = torch.randn(2, 4096, dtype=torch.float16)
     hi_pos, lo_pos, valid_mask, *scalars = _get_constants(logits, 4000)
 
@@ -178,7 +155,6 @@ def test_rejects_out_of_range_valid_vocab():
 
 
 def test_rejects_vocab_too_large_for_fp16():
-    """Beyond ~262k the high digit itself leaves fp16's exact range."""
     huge = (2048 * _RADIX) + _RADIX
     with pytest.raises(ValueError, match="fp16 cannot represent"):
         argmax_digits(torch.zeros(1, huge, dtype=torch.float16))
@@ -191,14 +167,7 @@ def test_rejects_vocab_too_large_for_fp16():
 
 @pytest.fixture()
 def spyre_device():
-    """Claim a Spyre card, or skip when hardware/runtime is not usable.
-
-    ``spyre_available()`` does ``torch.randn(..., device="spyre")``. A native
-    SIGABRT during that H2D copy (busy VFIO, missing RANK env, etc.) kills the
-    whole pytest process -- Python ``except`` cannot catch it. Gate on the
-    soft hardware check first, set the comms env that libspyre_comms captures
-    at load, then claim the device explicitly.
-    """
+    # Soft-gate hardware first: spyre_available()'s randn can SIGABRT.
     import os
 
     from spyre_testing_plugin.vfio_reaper import spyre_hardware_present
@@ -216,8 +185,7 @@ def spyre_device():
         import torch_spyre  # noqa: F401
 
         torch.spyre.set_device(0)
-        # empty+fill avoids the randn path that aborted in spyre__normal_.
-        torch.empty(1, dtype=torch.float16, device="spyre").fill_(0)
+        torch.empty(1, dtype=torch.float16, device="spyre").fill_(0)  # not randn
     except Exception as exc:
         pytest.skip(f"Spyre device not usable: {exc}")
 
@@ -226,12 +194,6 @@ def spyre_device():
 
 @pytest.mark.parametrize("mode", ["eager", "compile"])
 def test_on_spyre_matches_cpu_reference(spyre_device, mode):
-    """The same reduction, run on-device, must agree with torch.argmax on CPU.
-
-    This is the probe that decides whether the amax/amin/eq/where decomposition
-    actually holds up on hardware -- every op it uses is documented as
-    Spyre-native, but none has been exercised at [batch, vocab] shapes.
-    """
     torch.manual_seed(3)
     logits_cpu = torch.randn(8, 32000, dtype=torch.float16)
     logits = logits_cpu.to(spyre_device)
@@ -249,16 +211,9 @@ def test_on_spyre_matches_cpu_reference(spyre_device, mode):
 
 @pytest.mark.parametrize("mode", ["eager", "compile"])
 def test_on_spyre_masks_padding_columns(spyre_device, mode):
-    """The masked branch is what production runs; the unmasked one is not.
-
-    Whenever vocab_size > org_vocab_size the runner passes valid_vocab, which
-    turns on the ``where(valid_mask, logits, finfo.min)`` step. That step
-    broadcasts a [1, vocab] bool condition over the batch -- a shape the other
-    on-device tests never reach, since they pass valid_vocab=None.
-    """
     valid, padded = 32000, 32064
     logits_cpu = torch.full((4, padded), -5.0, dtype=torch.float16)
-    logits_cpu[:, valid:] = 0.0  # padding columns beat every real logit unmasked
+    logits_cpu[:, valid:] = 0.0
     logits_cpu[:, 12345] = -1.0
     logits = logits_cpu.to(spyre_device)
 
@@ -273,17 +228,10 @@ def test_on_spyre_masks_padding_columns(spyre_device, mode):
 
 
 def test_on_spyre_does_not_fall_back_to_cpu(spyre_device):
-    """The point of the decomposition is avoiding argmax's CPU round-trip.
-
-    A FallbackWarning here means some op in the chain is not actually native and
-    the full logits tensor is crossing the bus anyway -- which would defeat the
-    whole exercise.
-    """
     import warnings
 
     from torch_spyre.ops.fallbacks import FallbackWarning
 
-    # Build on CPU then H2D -- avoids spyre__normal_, which aborted the probe.
     logits = torch.randn(8, 32000, dtype=torch.float16).to(spyre_device)
 
     with warnings.catch_warnings(record=True) as caught:

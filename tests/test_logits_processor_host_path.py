@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-side tests for SpyreLogitsProcessor host-path helpers."""
+"""SpyreLogitsProcessor.to_host_logits."""
 
 import torch
 
