@@ -160,11 +160,6 @@ def test_rejects_vocab_too_large_for_fp16():
         argmax_digits(torch.zeros(1, huge, dtype=torch.float16))
 
 
-# ---------------------------------------------------------------------------
-# On-device execution (requires a Spyre card)
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture()
 def spyre_device():
     # Soft-gate hardware first: spyre_available()'s randn can SIGABRT.
