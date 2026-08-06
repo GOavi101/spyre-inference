@@ -141,6 +141,8 @@ def _reduce(logits, hi_pos, lo_pos, valid_mask, hi_sentinel, lo_sentinel, mask_f
     if valid_mask is not None:
         logits = torch.where(valid_mask, logits, mask_fill)
 
+    # amax returns an exact element of the input (no accumulation), so == is
+    # bitwise exact — same tie set torch.argmax would see.
     is_max = logits == logits.amax(dim=-1, keepdim=True)
 
     # min(x) = -max(-x); amin is not in Spyre's eager op registry.

@@ -37,14 +37,24 @@ class SpyreLogitsProcessor(LogitsProcessor):
         lm_head: VocabParallelEmbedding,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
+        """Gather logits and leave Spyre tensors unpadded.
+
+        Mirrors upstream ``LogitsProcessor._get_logits`` as of vllm v0.26.0
+        (``apply`` + gather + optional vocab slice). ``super()._get_logits`` is
+        intentionally not used: upstream always does
+        ``logits[..., :org_vocab_size]``, and last-dim slices on Spyre are
+        unreliable (see ``test_spyre_last_dim_slice``). Stage 2 excludes
+        padding via ``valid_vocab`` instead; the host path trims after D2H in
+        :meth:`to_host_logits`.
+
+        Re-check this body when bumping the vLLM pin.
+        """
+        # Keep in sync with upstream apply+gather; only the slice differs on Spyre.
         logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
         logits = super()._gather_logits(logits)
         if logits is None:
             return None
 
-        # Keep the full padded width on-device rather than slicing the last dim
-        # on Spyre; the Stage 2 reduction excludes the padding via
-        # valid_vocab=org_vocab_size instead. Host path slices after D2H.
         if logits.device.type == "spyre":
             return logits
 
@@ -56,17 +66,17 @@ class SpyreLogitsProcessor(LogitsProcessor):
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """Same as upstream, but keep Spyre logits on-device and scale out-of-place.
+        """Apply soft_cap / scale without in-place ops on Spyre.
 
-        Upstream does ``logits *= self.scale``. Granite sets ``logits_scaling``
-        (e.g. 16 → scale=1/16), so that path always runs. In-place mul on a
-        non-contiguous Spyre tensor is a known torch-spyre failure
-        (``test_spyre_inplace_mul_noncontiguous``), and forcing a D2H here just
-        because scale != 1 would disable Stage 2 for every Granite model.
+        Mirrors upstream ``LogitsProcessor.forward`` as of vllm v0.26.0.
+        Semantic change vs upstream: scale is ``logits * self.scale``
+        (out-of-place) instead of ``logits *= self.scale``. In-place mul on a
+        non-contiguous Spyre tensor fails
+        (``test_spyre_inplace_mul_noncontiguous``). Granite sets
+        ``logits_scaling`` (e.g. 16 → scale=1/16), so that path always runs;
+        staying on-device here is what lets Stage 2 see Spyre logits.
 
-        Out-of-place ``logits * scale`` / soft_cap are Spyre-native (mul, div,
-        tanh) and leave logits on the device for the runner to either reduce
-        on-device or D2H for the host sampler.
+        Re-check when bumping the vLLM pin.
         """
         if self.logits_as_input:
             logits = hidden_states
@@ -77,6 +87,7 @@ class SpyreLogitsProcessor(LogitsProcessor):
             return None
 
         if self.soft_cap is not None:
+            # Same math as upstream's three-step soft_cap; fused form is fine.
             logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
 
         if self.scale != 1.0:
@@ -94,9 +105,9 @@ class SpyreLogitsProcessor(LogitsProcessor):
                 logits.dtype,
                 logits.numel() * logits.element_size(),
             )
-            with torch.profiler.record_function("spyre_sampler::logits_d2h"):
-                host = convert(logits, device="cpu")
-        else:
+
+        # record_function is cheap when no profiler is active.
+        with torch.profiler.record_function("spyre_sampler::logits_d2h"):
             host = convert(logits, device="cpu")
 
         if host.shape[-1] > org_vocab_size:

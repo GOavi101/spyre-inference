@@ -372,7 +372,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return lp.org_vocab_size
         if isinstance(logits, torch.Tensor):
             return logits.shape[-1]
-        return 0
+        raise RuntimeError(
+            "Could not determine org_vocab_size: no SpyreLogitsProcessor found "
+            "and no logits tensor provided"
+        )
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output):
@@ -389,9 +392,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         if state is not None:
             logits = state.logits
-            org_vocab = self._spyre_org_vocab_size(logits)
-            if isinstance(logits, torch.Tensor) and org_vocab <= 0:
-                org_vocab = logits.shape[-1]
+            org_vocab = self._spyre_org_vocab_size(
+                logits if isinstance(logits, torch.Tensor) else None
+            )
             on_spyre = isinstance(logits, torch.Tensor) and logits.device.type == "spyre"
             use_device = (
                 _DEVICE_GREEDY

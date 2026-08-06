@@ -44,6 +44,7 @@ def _non_argmax_procs_inactive(sampling_metadata: SamplingMetadata) -> bool:
             if min_toks:
                 return False
             continue
+        # Unknown processor type — fall back to host sampler (safe default).
         return False
     return True
 
