@@ -65,7 +65,7 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.sample.device_argmax import greedy_token_ids
 from spyre_inference.v1.sample.pure_greedy import is_pure_greedy
 
-# SPYRE_DEVICE_GREEDY=0 forces the host sampler for pure-greedy batches.
+# Set to "0" to force the host sampler even for pure-greedy batches.
 _DEVICE_GREEDY = os.environ.get("SPYRE_DEVICE_GREEDY", "1") != "0"
 _SAMPLER_PROFILING = os.environ.get("SPYRE_SAMPLER_PROFILING", "0") == "1"
 
@@ -296,8 +296,13 @@ class _SpyreModelWrapper:
             get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
 
     def compute_logits(self, hidden_states, *args, **kwargs):
-        # Hidden states arrive CPU-sliced; lm_head runs on Spyre. Logits stay
-        # on Spyre — runner D2Hs or Stage-2-reduces in sample_tokens.
+        """Move hidden_states onto Spyre for the lm_head custom op.
+
+        ``gpu_model_runner.execute_model`` slices ``hidden_states[logits_indices]``
+        on CPU (Spyre cannot slice), so the tensor handed here is on CPU. Logits
+        stay on Spyre after gather; ``sample_tokens`` either D2Hs for the host
+        sampler or runs Stage 2 on-device greedy.
+        """
         hidden_states = convert(hidden_states, device=self._spyre_device)
         return self._model.compute_logits(hidden_states, *args, **kwargs)
 
@@ -350,9 +355,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        block_table._compute_slot_mapping_kernel = (
+            _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        )
 
-        # Set in sample_tokens, read in _sample.
+        # Stage 2: set in sample_tokens, consumed by _sample.
         self._spyre_device_greedy = False
         self._spyre_org_vocab_for_sample: int | None = None
 
@@ -366,11 +373,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return lp.org_vocab_size
         if isinstance(logits, torch.Tensor):
             return logits.shape[-1]
-        raise RuntimeError("org_vocab_size: no SpyreLogitsProcessor and no logits")
+        raise RuntimeError(
+            "Could not determine org_vocab_size: no SpyreLogitsProcessor found "
+            "and no logits tensor provided"
+        )
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output):
-        """D2H for host sampler, or keep Spyre logits for on-device greedy."""
+        """Convert Spyre logits to CPU unless Stage 2 on-device greedy applies."""
         state = self.execute_model_state
         self._spyre_device_greedy = False
         self._spyre_org_vocab_for_sample = None
@@ -393,9 +403,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     self._spyre_device_greedy = True
                     self._spyre_org_vocab_for_sample = org_vocab
                     if _SAMPLER_PROFILING:
-                        logger.info_once(
-                            "Stage 2 on-device greedy: skipping full-vocab logits D2H"
-                        )
+                        logger.info_once("Stage 2 on-device greedy: skipping full-vocab logits D2H")
                 else:
                     self.execute_model_state = state._replace(
                         logits=SpyreLogitsProcessor.to_host_logits(logits, org_vocab)
@@ -405,7 +413,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _sample(self, logits, spec_decode_metadata):
         if self._spyre_device_greedy and logits is not None:
-            # Match upstream _sample bookkeeping for async scheduling.
+            # Mirror upstream: async scheduling backfills output_token_ids here.
             self.input_batch.update_async_output_token_ids()
             valid_vocab = self._spyre_org_vocab_for_sample or logits.shape[-1]
             token_ids = greedy_token_ids(logits, valid_vocab=valid_vocab)

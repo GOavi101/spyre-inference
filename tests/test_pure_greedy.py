@@ -12,17 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""is_pure_greedy eligibility."""
+"""
+Unit tests for Stage 2 pure-greedy eligibility.
+"""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import torch
-
-from spyre_inference.v1.sample.pure_greedy import is_pure_greedy
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+
+from spyre_inference.v1.sample.pure_greedy import is_pure_greedy
 
 
 def _metadata(**overrides) -> SamplingMetadata:

@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SpyreLogitsProcessor.to_host_logits."""
+"""
+Test SpyreLogitsProcessor.to_host_logits host-path helpers.
+"""
 
 import torch
 
@@ -20,6 +22,7 @@ from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
 
 
 def test_to_host_logits_trims_to_org_vocab():
+    """Padded logits are trimmed to org_vocab_size on CPU."""
     logits = torch.randn(2, 4096, dtype=torch.float16)
     host = SpyreLogitsProcessor.to_host_logits(logits, org_vocab_size=3000)
     assert host.shape == (2, 3000)
@@ -28,6 +31,7 @@ def test_to_host_logits_trims_to_org_vocab():
 
 
 def test_to_host_logits_noop_when_already_trimmed():
+    """Already-trimmed logits keep their shape."""
     logits = torch.randn(2, 3000, dtype=torch.float16)
     host = SpyreLogitsProcessor.to_host_logits(logits, org_vocab_size=3000)
     assert host.shape == (2, 3000)
