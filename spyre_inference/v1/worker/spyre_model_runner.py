@@ -377,28 +377,29 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         if state is not None:
             logits = state.logits
-            org_vocab = self._spyre_org_vocab_size(
-                logits if isinstance(logits, torch.Tensor) else None
-            )
             on_spyre = isinstance(logits, torch.Tensor) and logits.device.type == "spyre"
-            use_device = (
-                _DEVICE_GREEDY
-                and on_spyre
-                and grammar_output is None
-                and is_pure_greedy(
-                    self.input_batch.sampling_metadata,
-                    has_grammar=False,
-                    has_spec=state.spec_decode_metadata is not None,
+            if on_spyre:
+                org_vocab = self._spyre_org_vocab_size(logits)
+                use_device = (
+                    _DEVICE_GREEDY
+                    and grammar_output is None
+                    and is_pure_greedy(
+                        self.input_batch.sampling_metadata,
+                        has_grammar=False,
+                        has_spec=state.spec_decode_metadata is not None,
+                    )
                 )
-            )
-            if on_spyre and not use_device:
-                self.execute_model_state = state._replace(
-                    logits=SpyreLogitsProcessor.to_host_logits(logits, org_vocab)
-                )
-            self._spyre_device_greedy = use_device
-            self._spyre_org_vocab_for_sample = org_vocab
-            if use_device and _SAMPLER_PROFILING:
-                logger.info_once("Stage 2 on-device greedy: skipping full-vocab logits D2H")
+                if use_device:
+                    self._spyre_device_greedy = True
+                    self._spyre_org_vocab_for_sample = org_vocab
+                    if _SAMPLER_PROFILING:
+                        logger.info_once(
+                            "Stage 2 on-device greedy: skipping full-vocab logits D2H"
+                        )
+                else:
+                    self.execute_model_state = state._replace(
+                        logits=SpyreLogitsProcessor.to_host_logits(logits, org_vocab)
+                    )
 
         return super().sample_tokens(grammar_output)
 
