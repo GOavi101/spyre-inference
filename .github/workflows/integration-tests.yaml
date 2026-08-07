@@ -93,6 +93,7 @@ on:
           - smoke
           - core
           - full
+          - perf
         default: full
 
 concurrency:
