@@ -75,6 +75,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.sample.spyre_sampler import build_spyre_sampler
 
 logger = init_logger(__name__)
 
@@ -359,6 +360,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # int64 at the model boundary.
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
+
+        # Optional host-side Exp(1) noise pool for temp/top-k/top-p sampling
+        # (SPYRE_USE_NOISE_POOL=1). Off by default → same as upstream Sampler.
+        if hasattr(self, "sampler"):
+            self.sampler = build_spyre_sampler(vllm_config)
+            # Spec decode (if ever enabled) captured the old Sampler reference.
+            if getattr(self, "rejection_sampler", None) is not None:
+                self.rejection_sampler.sampler = self.sampler
 
         # Disable GPU-specific features (same as CPUModelRunner)
         self.use_cuda_graph = False

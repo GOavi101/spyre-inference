@@ -28,6 +28,27 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Host sampler noise pool (optional)
+
+For temperature / top-k / top-p sampling, vLLM draws Exp(1) noise every decode
+step (`exponential_()`). That can be slow on some hosts (e.g. s390x). Spyre can
+pre-fill a CPU pool of Exp(1) values once and reuse random slices instead.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPYRE_USE_NOISE_POOL` | `0` | Set to `1` to enable the pool |
+| `SPYRE_NOISE_POOL_MULTIPLIER` | `32` | Pool size = multiplier × `max_num_seqs` × vocab |
+| `SPYRE_NOISE_POOL_DTYPE` | (auto) | `float16` or `float32`; default float32 on s390x/ppc64le, else float16 |
+| `SPYRE_SAMPLER_TIMING` | `0` | If `>0`, log average sample latency every N calls |
+
+When disabled, behaviour matches upstream vLLM. This does **not** move sampling
+onto the Spyre device; logits still go to the host sampler.
+
+```bash
+SPYRE_USE_NOISE_POOL=1 SPYRE_SAMPLER_TIMING=50 \
+  python examples/offline_inference/torch_spyre_inference.py
+```
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:
