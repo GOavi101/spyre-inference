@@ -43,7 +43,7 @@ jobs:
       # should always validate the merged state, not rely on the PR-diff
       # change-detection heuristic.
       skip_if_no_changes: ${{ github.event_name != 'push' }}
-      test_type: ${{ github.event_name == 'push' && 'trunk' || 'full' }}
+      test_type: ${{ github.event_name == 'push' && 'trunk' || 'regression' }}
 
   # ---------------------------------------------------------------------------
   # Required check gate -- this job name must match the existing branch
