@@ -15,9 +15,9 @@
 """Strict-xfail probes for torch-spyre primitives blocking CPU fallbacks.
 
 Each test exercises a single primitive that spyre-inference needs on-device
-(decoder forward, encoder pack, pooling). They are intentionally strict
-xfail: when a primitive starts working in torch-spyre, the corresponding
-probe flips to XPASS and we can remove the associated workaround here.
+(decoder forward, pooling). They are intentionally strict xfail: when a
+primitive starts working in torch-spyre, the corresponding probe flips to
+XPASS and we can remove the associated workaround here.
 
 All tests run against the real Spyre device when available; otherwise they
 skip silently (the same pattern used by test_spyre_attn.py).
@@ -110,9 +110,7 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
         "Spyre cannot use a non-contiguous (strided) tensor as the source of "
         "an indexed scatter write (torch-spyre#3508). Historically this forced "
         "SpyreQKVParallelLinear to D2H before return; we side-step that by "
-        "un-fusing QKV after load. The same gap keeps encoder-only attention "
-        "Q/K/V pack/unpack on CPU (spyre_encoder_attn.py). Once this probe "
-        "passes, move encoder ragged→dense packing back onto Spyre."
+        "un-fusing QKV after load."
     ),
 )
 def test_spyre_strided_scatter_source(spyre_device):
@@ -122,8 +120,6 @@ def test_spyre_strided_scatter_source(spyre_device):
       1. qkv.split()        → strided 2D Spyre views
       2. v.view(-1, H, D)   → non-contiguous 3D Spyre tensor (Attention.forward)
       3. kv_cache[idx] = v  → scatter write with strided source
-
-    Also blocks on-device encoder attention packing (torch-spyre#3508).
     """
     num_tokens = 16
     num_heads, num_kv_heads, head_size = 8, 2, 64
@@ -253,7 +249,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
 # on-device ("eager" mode); only *compiling* it with a data-dependent (SymInt)
 # offset fails to lower ("compile" mode, xfail). That is why the loop stays eager
 # and copies slot offsets to host int constants rather than indexing pages
-# on-device. Same compiled gap (torch-spyre#3508) keeps encoder Q/K/V pack on CPU.
+# on-device.
 
 
 @pytest.mark.parametrize(
@@ -269,9 +265,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
                     "fails to lower ('shape error in scatter op, can not broadcast "
                     "[.,1,.] to [.,u,.]') — torch-spyre#3508. Only compilation is "
                     "blocked; the eager path works, so slot_mapping is copied to "
-                    "host int constants before KV writes. Same gap keeps encoder "
-                    "Q/K/V pack on CPU; once this and test_spyre_strided_scatter_source "
-                    "pass, move encoder packing back onto Spyre."
+                    "host int constants before KV writes."
                 ),
             ),
         ),
