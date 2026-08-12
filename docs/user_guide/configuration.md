@@ -10,7 +10,7 @@ export VLLM_PLUGINS=spyre_inference,spyre_inference_ops,spyre_inference_hf_adapt
 
 `spyre_inference` activates the platform, `spyre_inference_ops` registers the OOT custom
 ops, and `spyre_inference_hf_adaptor` swaps in the hf-adapters Transformers backend
-(needed for `model_impl="transformers"`).
+(needed for `model_impl="transformers"`, including pooling encoder / reranker models).
 
 ## Usage
 

@@ -26,7 +26,7 @@ The plugin registers via three entry points:
 |---|---|---|
 | `vllm.platform_plugins` | `spyre_inference:register` | Registers `TorchSpyrePlatform` — sets dtype, worker class, attention backend, and distributed backend |
 | `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the opaque `spyre_rope_rot` and `spyre_convert` custom ops |
-| `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's `TransformersForCausalLM` with `HfAdaptersForCausalLM` so `model_impl="transformers"` uses hf-adapters (matmul-based RoPE) on Spyre |
+| `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's Transformers CausalLM / Embedding / SeqCls classes with hf-adapters wrappers so `model_impl="transformers"` uses them on Spyre |
 
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
 kernels), so the platform overrides a few CPU-backend assumptions: `import_kernels()` is
@@ -170,13 +170,29 @@ logits indexing).
 ## HF-adapters Transformers backend
 
 When `model_impl="transformers"`, the `register_hf_adapters` general plugin swaps vLLM's
-`TransformersForCausalLM` for `HfAdaptersForCausalLM` (`spyre_inference/hf_adapters.py`).
+Transformers backend classes for hf-adapters wrappers (`spyre_inference/hf_adapters.py`):
+
+| Registry key | Wrapper |
+|--------------|---------|
+| `TransformersForCausalLM` | `HfAdaptersForCausalLM` |
+| `TransformersEmbeddingModel` | `HfAdaptersEmbeddingModel` |
+| `TransformersForSequenceClassification` | `HfAdaptersForSequenceClassification` |
+
 vLLM's stock Transformers backend still handles model creation, weight loading, attention
-routing, the KV cache, and scheduling; the Spyre OOT layers above apply automatically at
-instantiation. The adapter's main job is to replace HF's `RotaryEmbedding` with a
-matmul-based RoPE (`apply_rope_matmul`), padding Q/K into a stick-aligned dimension for
-the rotation when `head_dim/2` is not a multiple of the Spyre block size and contracting
-back afterward.
+routing, the KV cache / pooling, and scheduling; the Spyre OOT layers above apply
+automatically at instantiation. For CausalLM, the adapter's main job is to replace HF's
+`RotaryEmbedding` with a matmul-based RoPE (`apply_rope_matmul`), padding Q/K into a
+stick-aligned dimension for the rotation when `head_dim/2` is not a multiple of the Spyre
+block size and contracting back afterward. Embedding / sequence-classification wrappers
+share that registration seam, then call hf-adapters `prepare_for_spyre` and run
+`prefill_encoder` (same driver as `st_backend`). `prefill_encoder` takes a padded `[B, L]`
+batch, so vLLM's flat token run is split per request at each position restart, padded, and
+re-flattened after cropping. That keeps per-request positions and prevents attention across
+request boundaries (the native encoder backend achieves the same with a block-diagonal
+mask).
+Encoder arches that vLLM routes through
+`as_embedding_model(TransformersForCausalLM)` (e.g. `RobertaForMaskedLM`) are not
+supported on this path; run those with `model_impl="vllm"`.
 
 ## Distributed (TP)
 

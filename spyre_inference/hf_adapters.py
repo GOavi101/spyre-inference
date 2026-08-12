@@ -12,37 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Drop-in replacement for vLLM's TransformersForCausalLM using hf-adapters.
+"""Drop-in replacements for vLLM's Transformers backend using hf-adapters.
 
-Registers as a drop-in replacement for vLLM's TransformersForCausalLM when
-the Spyre platform is active.  vLLM's stock Transformers backend handles
-model creation, weight loading, attention routing, KV cache, scheduling, and
-forward execution.  Spyre OOT layers (SpyreRMSNorm, SpyreSiluAndMul,
-SpyreLinears, etc.) are applied automatically at instantiation time.
+Registers as drop-in replacements for vLLM's Transformers modeling backend
+classes when the Spyre platform is active.  vLLM's stock Transformers backend
+handles model creation, weight loading, attention routing, KV cache /
+pooling, scheduling, and forward execution.  Spyre OOT layers
+(SpyreRMSNorm, SpyreSiluAndMul, SpyreLinears, etc.) are applied automatically
+at instantiation time.
 
 Activated when ``model_impl="transformers"`` on the Spyre platform via
 ``register_hf_adapters()``.
+
+- CausalLM: matmul-based RoPE (``apply_rope_matmul``) after weight load.
+- Embedding / sequence-classification: hf-adapters ``prepare_for_spyre`` +
+  ``prefill_encoder`` after weight load (same driver as ``st_backend``).
+  vLLM's flat token run is unpacked into a right-padded ``[B, L]`` batch so
+  each request keeps its own positions and cannot attend across boundaries.
+
+Encoder arches that vLLM routes through ``as_embedding_model(CausalLM)``
+(e.g. ``RobertaForMaskedLM`` on ``all-roberta-large-v1``) are not supported
+here; run those with ``model_impl="vllm"``.
 """
 
 from __future__ import annotations
 
 import sys
 from collections.abc import Iterable
+from types import ModuleType
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
 from hf_adapters.hf_common import (
     BLOCK_SIZE,
     PrecomputedRotaryEmbedding,
+    SpyreNoAdapterError,
+    SpyreUnsupportedModelError,
     apply_rope_matmul,
     get_backbone,
+    prefill_encoder,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import (
+    TransformersEmbeddingModel,
+    TransformersForCausalLM,
+    TransformersForSequenceClassification,
+)
+from vllm.sequence import IntermediateTensors
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -113,6 +134,349 @@ def _make_spyre_apply_rotary(original_fn, qk_expand=None):
 
     wrapper._spyre_patched = True
     return wrapper
+
+
+def _linear_from_weight(
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    weight_is_transposed: bool = False,
+) -> nn.Linear:
+    """Build stock ``nn.Linear`` from a vLLM projection weight.
+
+    Required because hf-adapters ``prepare_for_spyre`` / ``make_encoder_block``
+    expect Bert-style ``query`` / ``key`` / ``value`` / FFN modules as
+    ``nn.Linear``, while vLLM's Transformers backend leaves ``LinearBase``
+    (and sometimes a fused ``qkv_proj``) in their place. Plain
+    ``nn.Linear(...)`` defaults to float32; we keep the source weight's
+    dtype/device so it stays fp16 under Spyre's platform dtype and matches
+    ``prefill_encoder``'s fp16 mask.
+    """
+    w = weight.detach()
+    if weight_is_transposed:
+        w = w.t().contiguous()
+    out_f, in_f = w.shape
+    lin = nn.Linear(in_f, out_f, bias=bias is not None, dtype=w.dtype, device=w.device)
+    with torch.no_grad():
+        lin.weight.copy_(w)
+        if bias is not None:
+            lin.bias.copy_(bias.detach().to(dtype=w.dtype, device=w.device))
+    lin.weight.requires_grad_(False)
+    if lin.bias is not None:
+        lin.bias.requires_grad_(False)
+    return lin
+
+
+def _replace_linear_base_with_nn_linear(root: nn.Module) -> int:
+    """Undo vLLM's ``LinearBase`` swap so hf-adapters sees stock ``nn.Linear``.
+
+    vLLM's Transformers backend replaces HF linears with ``LinearBase`` (TP /
+    quant). That is correct for the native path, but this wrapper then calls
+    hf-adapters ``prepare_for_spyre``, which was written for unmodified HF
+    models: ``pad_attention_heads_simple`` reads ``proj.weight`` as
+    ``[out, in]`` and rebuilds ``nn.Linear``, and ``make_encoder_block`` closes
+    over plain ``q_proj(x)`` / FFN modules. Converting back is the bridge that
+    lets us reuse that code instead of reimplementing encoder compile against
+    ``LinearBase``.
+    """
+    from vllm.model_executor.layers.linear import LinearBase
+
+    n = 0
+    for name, child in list(root.named_children()):
+        if isinstance(child, LinearBase):
+            weight = getattr(child, "weight", None)
+            if weight is None or weight.dim() != 2:
+                continue
+            setattr(root, name, _linear_from_weight(weight, getattr(child, "bias", None)))
+            n += 1
+        else:
+            n += _replace_linear_base_with_nn_linear(child)
+    return n
+
+
+def _restore_bert_qkv_as_nn_linear(hf_model: nn.Module) -> int:
+    """Rematerialize Bert ``query`` / ``key`` / ``value`` after the QKV split.
+
+    The weight split itself is ``analyze_and_unfuse`` (``torch.split`` into
+    ``q_weight`` / ``k_weight`` / ``v_weight``). That still leaves a single
+    ``qkv_proj`` module; hf-adapters ``prepare_for_spyre`` indexes
+    ``attn.query`` / ``key`` / ``value``, so this step only wraps the already-
+    split parts as stock ``nn.Linear`` under those names. If unfuse was skipped
+    (e.g. quantized), fall back to the same ``torch.split`` on the fused weight.
+    """
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    backbone = get_backbone(hf_model)
+    encoder = getattr(backbone, "encoder", None)
+    if encoder is None or not hasattr(encoder, "layer"):
+        return 0
+
+    restored = 0
+    for layer in encoder.layer:
+        attn = getattr(getattr(layer, "attention", None), "self", None)
+        if attn is None or hasattr(attn, "query"):
+            continue
+        qkv = getattr(attn, "qkv_proj", None)
+        if qkv is None:
+            continue
+
+        if isinstance(qkv, QKVParallelLinear) and getattr(qkv, "q_weight", None) is not None:
+            # Post-analyze_and_unfuse: parts are already split, stored [in, out].
+            attn.query = _linear_from_weight(
+                qkv.q_weight, getattr(qkv, "q_bias", None), weight_is_transposed=True
+            )
+            attn.key = _linear_from_weight(
+                qkv.k_weight, getattr(qkv, "k_bias", None), weight_is_transposed=True
+            )
+            attn.value = _linear_from_weight(
+                qkv.v_weight, getattr(qkv, "v_bias", None), weight_is_transposed=True
+            )
+        elif getattr(qkv, "weight", None) is not None:
+            # Unfuse skipped — same row-wise split analyze_and_unfuse uses.
+            w = qkv.weight.detach()
+            if isinstance(qkv, QKVParallelLinear):
+                sizes = [
+                    qkv.num_heads * qkv.head_size,
+                    qkv.num_kv_heads * qkv.head_size,
+                    qkv.num_kv_heads * qkv.v_head_size,
+                ]
+            else:
+                sizes = [w.shape[0] // 3] * 3
+            wq, wk, wv = torch.split(w, sizes, dim=0)
+            bias = getattr(qkv, "bias", None)
+            if bias is None:
+                bq = bk = bv = None
+            else:
+                bq, bk, bv = torch.split(bias.detach(), sizes, dim=0)
+            attn.query = _linear_from_weight(wq, bq)
+            attn.key = _linear_from_weight(wk, bk)
+            attn.value = _linear_from_weight(wv, bv)
+        else:
+            continue
+
+        if hasattr(attn, "qkv_proj"):
+            delattr(attn, "qkv_proj")
+        restored += 1
+    return restored
+
+
+def _flat_batch_lengths(
+    positions: torch.Tensor,
+    num_tokens: int,
+    *,
+    force_single: bool = False,
+) -> list[int]:
+    """Split vLLM's flat pooling batch into per-request token counts.
+
+    Pooling prefills always start at position 0, so a restart marks a new
+    request — including a batch of single-token requests whose positions are
+    all zeros (``[0, 0, …]`` → ``[1, 1, …]``). Warmup leaves the positions
+    buffer uncleared (also all zeros) but is not a real multi-request batch;
+    the runner sets ``force_single`` for that case instead of guessing from
+    the zeros.
+    """
+    if force_single or positions.numel() != num_tokens:
+        return [num_tokens]
+    starts = (positions == 0).nonzero().flatten().tolist()
+    if not starts or starts[0] != 0:
+        return [num_tokens]
+    bounds = starts + [num_tokens]
+    return [end - start for start, end in zip(bounds, bounds[1:])]
+
+
+def _pack_flat_batch(
+    ids: torch.Tensor,
+    segments: torch.Tensor | None,
+    lengths: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Right-pad a flat token run into the ``[B, L]`` batch prefill_encoder wants.
+
+    Mirrors what a tokenizer hands ``st_backend``: real tokens first, zeros
+    after, and an attention mask carrying each row's true length so
+    prefill_encoder numbers positions per row and masks across rows.
+    """
+    batched = pad_sequence(torch.split(ids, lengths), batch_first=True)
+    mask = (torch.arange(batched.shape[1])[None, :] < torch.tensor(lengths)[:, None]).long()
+    batched_segments = (
+        None if segments is None else pad_sequence(torch.split(segments, lengths), batch_first=True)
+    )
+    return batched, mask, batched_segments
+
+
+class _HfAdaptersEncoderMixin:
+    """Shared prepare / forward for Transformers pooling wrappers."""
+
+    # Set by subclasses; declared for type checkers (provided by Transformers base).
+    model: nn.Module
+    config: PretrainedConfig
+
+    _sequence_classification: bool = False
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._adapter_module: ModuleType | None = None
+        self._hf_adapters_encoder_ready = False
+        # Set by SpyreModelRunner.warming_up_model around _dummy_run only.
+        self._spyre_pooling_warmup = False
+
+    @staticmethod
+    def _resolve_encoder_adapter(
+        config: PretrainedConfig,
+        *,
+        sequence_classification: bool = False,
+    ) -> ModuleType:
+        """Map HF config to an hf-adapters encoder module (AutoSpyre maps)."""
+        import hf_adapters.auto_spyre_model as asm
+        from hf_adapters.hf_common import assert_spyre_dimensions
+
+        config_map = asm.CONFIG_TO_ADAPTER_MODULE_MAPPING
+        arch_map = getattr(asm, "ARCH_TO_ADAPTER_MODULE_MAPPING", {})
+        seq_map = getattr(asm, "SEQUENCE_CLASSIFICATION_CONFIG_TO_ADAPTER_MODULE_MAPPING", None)
+        mapping = seq_map if sequence_classification and seq_map is not None else config_map
+        model_name = str(getattr(config, "_name_or_path", None) or "")
+
+        def _check(module: ModuleType) -> ModuleType:
+            # Decoder adapters are rejected before assert_spyre_dimensions so a
+            # CausalLM config raises SpyreNoAdapterError (recoverable) rather than
+            # SpyreUnsupportedModelError from the stick-alignment check.
+            if not getattr(module, "_is_encoder_only", False):
+                raise SpyreNoAdapterError(
+                    f"hf-adapters module {module.__name__} is not encoder-only"
+                )
+            assert_spyre_dimensions(config, model_name=model_name)
+            return module
+
+        for arch in getattr(config, "architectures", None) or []:
+            if arch in arch_map:
+                return _check(arch_map[arch])
+
+        cfg_type = type(config)
+        if cfg_type in mapping:
+            return _check(mapping[cfg_type])
+
+        # Subclass fallbacks: skip non-encoder candidates rather than let _check
+        # raise on one and abandon a later match.
+        for cfg_cls, module in mapping.items():
+            if isinstance(config, cfg_cls) and getattr(module, "_is_encoder_only", False):
+                return _check(module)
+
+        if sequence_classification:
+            for cfg_cls, module in config_map.items():
+                if isinstance(config, cfg_cls) and getattr(module, "_is_encoder_only", False):
+                    return _check(module)
+
+        raise SpyreNoAdapterError(
+            f"No hf-adapters encoder for config type {type(config).__name__} "
+            f"(architectures={getattr(config, 'architectures', None)})"
+        )
+
+    def prepare_hf_adapters_encoder(self) -> None:
+        """Restore Bert layout, then ``prepare_for_spyre`` (before ``.to("spyre")``)."""
+        if self._hf_adapters_encoder_ready:
+            return
+        try:
+            adapter = self._resolve_encoder_adapter(
+                self.config,
+                sequence_classification=self._sequence_classification,
+            )
+        except (SpyreNoAdapterError, SpyreUnsupportedModelError):
+            logger.warning(
+                "No usable hf-adapters encoder for %s; keeping Transformers forward",
+                type(self.config).__name__,
+                exc_info=True,
+            )
+            return
+
+        n_qkv = _restore_bert_qkv_as_nn_linear(self.model)
+        n_lin = _replace_linear_base_with_nn_linear(self.model)
+        # No dtype cast: Spyre's platform forces model_config.dtype=float16, and
+        # _linear_from_weight preserves it through the LinearBase→nn.Linear
+        # restore. That matches prefill_encoder's fp16 additive mask.
+        adapter.prepare_for_spyre(self.model)
+        self._adapter_module = adapter
+        self._hf_adapters_encoder_ready = True
+        logger.debug(
+            "HfAdapters encoder ready (%s): restored %d QKV, converted %d LinearBase, "
+            "%d compiled blocks",
+            adapter.__name__,
+            n_qkv,
+            n_lin,
+            len(getattr(self.model, "_spyre_compiled_blocks", [])),
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor | IntermediateTensors:
+        if not self._hf_adapters_encoder_ready or self._adapter_module is None:
+            return super().forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+
+        if intermediate_tensors is not None or inputs_embeds is not None:
+            raise NotImplementedError(
+                "hf-adapters encoder path does not support PP intermediates " "or inputs_embeds"
+            )
+        if input_ids is None:
+            raise ValueError("hf-adapters encoder forward requires input_ids")
+
+        # Host-side on purpose: prefill_encoder's contract is CPU [B, L] ids /
+        # mask (same device split as st_backend). It builds pad, position_ids,
+        # and the bidirectional mask with host ops, then moves only the
+        # backbone inputs to Spyre. The flat→padded pack (split / pad_sequence /
+        # nonzero→tolist lengths) also has no usable Spyre path. The model
+        # wrapper leaves ints on CPU when this encoder path is active, so these
+        # .cpu() calls are no-ops in the steady state — not a per-step D2H.
+        ids_cpu = input_ids.detach().cpu().flatten()
+        # Segment ids matter for Bert-family cross-encoders; prefill_encoder
+        # falls back to all-zeros (correct for single-sentence embedding).
+        segments = kwargs.get("token_type_ids")
+        if segments is not None:
+            segments = segments.detach().cpu().flatten()
+
+        # vLLM concatenates every scheduled request into one flat token run, so
+        # split it back apart: collapsing it into a single sequence would let one
+        # request attend to another and number positions across the boundary.
+        # Warmup leaves positions all-zero (same pattern as N single-token
+        # requests); the runner sets _spyre_pooling_warmup so we don't mis-split.
+        lengths = _flat_batch_lengths(
+            positions.detach().cpu(),
+            ids_cpu.numel(),
+            force_single=getattr(self, "_spyre_pooling_warmup", False),
+        )
+        if len(lengths) == 1:
+            # Every position holds a real token: the Spyre runner disables cudagraph
+            # and DP padding, the two sources of trailing pad in the flat batch.
+            batched = ids_cpu[None, ...]
+            mask = torch.ones(batched.shape, dtype=torch.long)
+            batched_segments = None if segments is None else segments[None, ...]
+        else:
+            batched, mask, batched_segments = _pack_flat_batch(ids_cpu, segments, lengths)
+
+        hidden = prefill_encoder(
+            self._adapter_module._run_backbone_forward,
+            self.model,
+            batched,
+            mask,
+            token_type_ids=batched_segments,
+        )
+        if len(lengths) == 1:
+            return hidden[0, ...]
+
+        # Drop each row's right padding and re-flatten for the pooler, which
+        # indexes hidden states by cumulative prompt length. Cropping runs on
+        # CPU because aten.slice does not lower on Spyre; _SpyreModelWrapper
+        # moves hidden states host-side anyway.
+        hidden = hidden.to("cpu")
+        return torch.cat([hidden[row, :length] for row, length in enumerate(lengths)], dim=0)
 
 
 class HfAdaptersForCausalLM(TransformersForCausalLM):
@@ -234,7 +598,23 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
             patched_mods.add(id(mod))
 
 
+class HfAdaptersEmbeddingModel(_HfAdaptersEncoderMixin, TransformersEmbeddingModel):
+    """TransformersEmbeddingModel wrapper to use HF adapters."""
+
+    _sequence_classification = False
+
+
+class HfAdaptersForSequenceClassification(
+    _HfAdaptersEncoderMixin, TransformersForSequenceClassification
+):
+    """TransformersForSequenceClassification wrapper to use HF adapters."""
+
+    _sequence_classification = True
+
+
 # vLLM's Transformers backend test checks ModelConfig.using_transformers_backend()
-# compares _ModelInfo.architecture (set to model_cls.__name__) against "TransformersForCausalLM".
-# Without this, the subclass name "HfAdaptersForCausalLM" causes that check to return False.
+# compares _ModelInfo.architecture (set to model_cls.__name__) against the
+# Transformers backend class name. Without this, subclass names fail that check.
 HfAdaptersForCausalLM.__name__ = "TransformersForCausalLM"
+HfAdaptersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
+HfAdaptersForSequenceClassification.__name__ = "TransformersForSequenceClassification"

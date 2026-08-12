@@ -41,14 +41,22 @@ def register_ops():
 
 
 def register_hf_adapters():
-    # Override the Transformers backend model class so that
-    # ``model_impl="transformers"`` uses hf-adapters'
+    # Override the Transformers backend model classes so that
+    # ``model_impl="transformers"`` uses hf-adapters wrappers.
     try:
         from vllm.model_executor.models import ModelRegistry
 
         ModelRegistry.register_model(
             "TransformersForCausalLM",
             "spyre_inference.hf_adapters:HfAdaptersForCausalLM",
+        )
+        ModelRegistry.register_model(
+            "TransformersEmbeddingModel",
+            "spyre_inference.hf_adapters:HfAdaptersEmbeddingModel",
+        )
+        ModelRegistry.register_model(
+            "TransformersForSequenceClassification",
+            "spyre_inference.hf_adapters:HfAdaptersForSequenceClassification",
         )
     except Exception:
         logger.warning("Failed to register hf-adapters Transformers backend", exc_info=True)

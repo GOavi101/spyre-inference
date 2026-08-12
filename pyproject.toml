@@ -100,7 +100,7 @@ vllm = [
   { git = "https://github.com/vllm-project/vllm", rev = "v0.26.0" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "56c288343bd199bbdd65365b24bffdbd39c2b34e" }
-hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
+hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "1e330ec78f6a9a09ce6ad710d345876e555566c4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

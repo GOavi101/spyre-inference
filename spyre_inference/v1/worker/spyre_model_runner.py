@@ -237,8 +237,17 @@ class _SpyreModelWrapper:
         # Prime RoPE while positions are still on the host (no D2H).
         self._prime_rope_rotation(kwargs.get("positions"))
 
-        # Convert integer tensor inputs to Spyre int64
+        # hf-adapters encoder forward packs the flat batch and calls
+        # prefill_encoder on CPU ints (that driver H2D's for the backbone).
+        # Promoting them to Spyre here would just bounce Spyre→CPU every step.
+        inner = self._model
+        if hasattr(inner, "_orig_mod"):
+            inner = inner._orig_mod
+        keep_ints_on_cpu = getattr(inner, "_hf_adapters_encoder_ready", False)
+
         def _convert_int(t):
+            if keep_ints_on_cpu:
+                return t
             if (
                 t is not None
                 and isinstance(t, torch.Tensor)
@@ -350,7 +359,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        block_table._compute_slot_mapping_kernel = (
+            _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        )
 
     @staticmethod
     def _patch_encoder_ops_for_spyre(model_config) -> None:
@@ -409,6 +420,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Un-fuse QKV projections.
         analyze_and_unfuse(self.model)
 
+        # Transformers pooling: prepare_for_spyre after unfuse, before .to("spyre").
+        prepare = getattr(self.model, "prepare_hf_adapters_encoder", None)
+        if callable(prepare):
+            prepare()
+
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
@@ -423,6 +439,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
+
+        if getattr(self.model, "_hf_adapters_encoder_ready", False):
+            logger.info("Pooling model using hf-adapters prepare_for_spyre / prefill_encoder")
 
         # Pooler / classify heads run on CPU after _SpyreModelWrapper D2H's
         # hidden_states. Cross-encoder rerankers (e.g. bge-reranker) call
@@ -513,27 +532,39 @@ class TorchSpyreModelRunner(GPUModelRunner):
             max(16, self.max_num_reqs),
             self.scheduler_config.max_num_batched_tokens,
         )
-        with _set_spyre_compilation_settings(self.vllm_config):
-            use_eager_pooling_warmup = (
-                self.model_config.runner_type == "pooling"
-                and self.vllm_config.model_config.enforce_eager
-            )
-            if use_eager_pooling_warmup:
-                # Match single-sequence embed metadata; cap tokens for DMA.
-                num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
-                saved_max_num_seqs = self.scheduler_config.max_num_seqs
-                try:
-                    self.scheduler_config.max_num_seqs = 1
-                    logger.info(
-                        "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
-                        num_tokens,
-                        saved_max_num_seqs,
-                    )
+        # _dummy_run leaves the positions buffer as zeros. That pattern is also
+        # a valid batch of single-token requests, so the hf-adapters encoder
+        # path cannot tell them apart from positions alone — mark warmup
+        # explicitly for the duration of the dummy forward.
+        model = self.get_model()
+        mark_warmup = getattr(model, "_hf_adapters_encoder_ready", False)
+        if mark_warmup:
+            model._spyre_pooling_warmup = True
+        try:
+            with _set_spyre_compilation_settings(self.vllm_config):
+                use_eager_pooling_warmup = (
+                    self.model_config.runner_type == "pooling"
+                    and self.vllm_config.model_config.enforce_eager
+                )
+                if use_eager_pooling_warmup:
+                    # Match single-sequence embed metadata; cap tokens for DMA.
+                    num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
+                    saved_max_num_seqs = self.scheduler_config.max_num_seqs
+                    try:
+                        self.scheduler_config.max_num_seqs = 1
+                        logger.info(
+                            "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
+                            num_tokens,
+                            saved_max_num_seqs,
+                        )
+                        self._dummy_run(num_tokens)
+                    finally:
+                        self.scheduler_config.max_num_seqs = saved_max_num_seqs
+                else:
                     self._dummy_run(num_tokens)
-                finally:
-                    self.scheduler_config.max_num_seqs = saved_max_num_seqs
-            else:
-                self._dummy_run(num_tokens)
+        finally:
+            if mark_warmup:
+                model._spyre_pooling_warmup = False
         logger.info("Warmup done in %.3fs.", time.time() - t0)
 
     # --- KV cache allocation ---
