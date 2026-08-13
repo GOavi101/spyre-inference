@@ -113,13 +113,14 @@ def _overwrite(
     dims: list[int],
     offsets: list[int],
 ) -> None:
-    """Write input into output at the specified position (in-place).
+    """Write input into output starting at ``offsets`` along ``dims`` (in-place).
 
-    narrow().copy_() at a concrete offset works on both CPU and Spyre.
+    narrow().copy_() at a concrete offset works on both CPU and Spyre. The extent
+    along each dim comes from ``input``, matching ``torch.ops.spyre.overwrite``.
     """
     sliced_t = output
     for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], input.size(dim))
     sliced_t.copy_(input)
 
 
@@ -228,10 +229,43 @@ def _maybe_compile(fn):
 # ---------------------------------------------------------------------------
 
 
+def slot_runs(
+    block_indices: list[int],
+    block_offsets: list[int],
+    num_tokens: int,
+) -> list[tuple[int, int, int, int]]:
+    """Split ``[0, num_tokens)`` into maximal same-page consecutive-slot runs.
+
+    Returns ``(page_idx, first_offset, start, stop)`` tuples, each writable with a
+    single slice write. A prefill normally yields one run per page and a decode
+    step one run per sequence; a scattered slot mapping still writes correctly,
+    just with more runs.
+    """
+    runs: list[tuple[int, int, int, int]] = []
+    start = 0
+    while start < num_tokens:
+        page = block_indices[start]
+        offset = block_offsets[start]
+        stop = start + 1
+        while (
+            stop < num_tokens
+            and block_indices[stop] == page
+            and block_offsets[stop] == offset + (stop - start)
+        ):
+            stop += 1
+        runs.append((page, offset, start, stop))
+        start = stop
+    return runs
+
+
 def _create_compilable_reshape_and_cache(num_tokens: int):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
-    Dynamo unrolls the loop because num_tokens is a closure constant.
+    Writes are batched per slot run because the cost is dominated by dispatch
+    count, not bytes moved: each device round trip costs the same whether it
+    writes one slot or a whole page. The slicing / symbolic-offset support this
+    path is waiting on (issue #405) removes the per-offset recompile but not the
+    per-dispatch cost, so the batching is still needed once it lands.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -243,11 +277,21 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         block_offsets,
         target_device,
     ):
-        for t in range(num_tokens):
-            k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
-            v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
-            _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
-            _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
+        for page_idx, offset, start, stop in slot_runs(block_indices, block_offsets, num_tokens):
+            # Transpose to the pages' [num_kv_heads, slots, head_size] layout on the
+            # host -- Spyre slicing corrupts memory, which is why key/value arrive
+            # on CPU -- then one transfer per run carries the whole thing over.
+            # A run of one keeps the per-token indexing instead: batching buys
+            # nothing there, and the transposed slice is a different layout for the
+            # runtime, which showed up as an ITL regression on decode steps.
+            if stop - start == 1:
+                k_run = convert(key[start].unsqueeze(1).contiguous(), target_device)
+                v_run = convert(value[start].unsqueeze(1).contiguous(), target_device)
+            else:
+                k_run = convert(key[start:stop].transpose(0, 1).contiguous(), target_device)
+                v_run = convert(value[start:stop].transpose(0, 1).contiguous(), target_device)
+            _overwrite(k_run, k_pages[page_idx], [1], [offset])
+            _overwrite(v_run, v_pages[page_idx], [1], [offset])
 
     return specialized_reshape_and_cache_kernel
 
