@@ -28,6 +28,19 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+### Encoder / pooling warmup
+
+After upstream `profile_run`, pooling dummies **1×32** and **`max_num_seqs`×32** so the
+first 32-token bench hits cached kernels. Override:
+
+```bash
+export SPYRE_WARMUP_PROMPT_LENS=32
+export SPYRE_WARMUP_BATCH_SIZES=1,4
+```
+
+For 100 prompts at `--max-num-seqs 64` also warm the leftover 36: `1,36,64`.
+See [Encoder warmup vs first bench](encoder-warmup-vs-bench.md).
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:

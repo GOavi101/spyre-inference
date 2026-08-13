@@ -9,6 +9,7 @@ nav:
       - Offline Inference: examples/offline_inference
     - User Guide:
       - Configuration: user_guide/configuration.md
+      - Encoder warmup vs first bench: user_guide/encoder-warmup-vs-bench.md
       - Kineto Profiling: user_guide/kineto_profiling.md
     - Developer Guide:
       - Contributing: contributing/README.md
@@ -21,6 +22,7 @@ nav:
     - Offline Inference: examples/offline_inference
   - User Guide:
     - Configuration: user_guide/configuration.md
+    - Encoder warmup vs first bench: user_guide/encoder-warmup-vs-bench.md
     - Kineto Profiling: user_guide/kineto_profiling.md
   - Developer Guide:
     - Contributing: contributing/README.md
