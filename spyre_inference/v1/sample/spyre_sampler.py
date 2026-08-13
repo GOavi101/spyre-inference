@@ -227,9 +227,7 @@ class SpyreSampler(Sampler):
         noise_pool: ExponentialNoisePool | None = None,
     ) -> None:
         super().__init__(logprobs_mode)
-        self.topk_topp_sampler = SpyreTopKTopPSampler(
-            logprobs_mode, noise_pool=noise_pool
-        )
+        self.topk_topp_sampler = SpyreTopKTopPSampler(logprobs_mode, noise_pool=noise_pool)
 
 
 def build_spyre_sampler(vllm_config: VllmConfig) -> SpyreSampler:

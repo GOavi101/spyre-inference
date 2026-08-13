@@ -137,9 +137,7 @@ def test_seeded_row_reads_pool_values_not_fresh_noise():
     sampled = pooled_random_sample(probs.clone(), {0: gen}, pool)
 
     check_gen = torch.Generator().manual_seed(555)
-    offset = int(
-        torch.randint(0, pool.numel - vocab + 1, (1,), generator=check_gen).item()
-    )
+    offset = int(torch.randint(0, pool.numel - vocab + 1, (1,), generator=check_gen).item())
     expected_q = pool.pool[offset : offset + vocab]
     expected = probs.clone().div_(expected_q).argmax(dim=-1)
     assert sampled.item() == expected.item()
