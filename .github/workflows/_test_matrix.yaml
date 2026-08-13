@@ -394,15 +394,15 @@ jobs:
         # marker-combo invocation, so the marker set is not duplicated here.
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
-          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ strategy.job-index }}.xml
+          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ matrix.test_target }}.xml
           echo "tests done"
 
       - name: Upload JUnit results
         if: ${{ always() && steps.gate.outputs.run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ strategy.job-index }}
-          path: junit-${{ strategy.job-index }}.xml
+          name: junit-${{ matrix.test_target }}
+          path: junit-${{ matrix.test_target }}.xml
           retention-days: 14
 
       - name: Publish JUnit test report
@@ -410,7 +410,7 @@ jobs:
         uses: dorny/test-reporter@v1
         with:
           name: 'Test report (${{ matrix.cfg }})'
-          path: junit-${{ strategy.job-index }}.xml
+          path: junit-${{ matrix.test_target }}.xml
           # dorny/test-reporter@v1 has no python-specific reporter; java-junit
           # parses the generic JUnit-XML schema pytest's --junit-xml emits.
           reporter: java-junit

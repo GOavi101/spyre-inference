@@ -70,7 +70,7 @@ jobs:
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       TRIGGERING_AT: ${{ github.event.workflow_run.created_at || '' }}
       # display_title carries "integration-tests (<test_type>)" via that
-      # workflow's run-name, or the bare tier ("trunk" / "full") via
+      # workflow's run-name, or the bare tier ("trunk" / "regression") via
       # test_each_commit's -- the only way this job can recover which tier
       # ran without an extra API call.
       TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
@@ -178,18 +178,17 @@ jobs:
         run: |
           if [[ "${TRIGGERING_WORKFLOW}" == "test_each_commit" ]]; then
             # test_each_commit's run-name IS the external-facing tier name
-            # itself ("trunk" on push, "full" otherwise) -- no parens to
-            # parse out.
+            # itself ("trunk" on push, "regression" otherwise) -- no parens
+            # to parse out.
             TIER="${TRIGGERING_DISPLAY_TITLE}"
           else
             # integration-tests' run-name is deliberately
-            # "integration-tests (<inputs.test_type>)" -- the RAW,
-            # external-facing test_type value the caller passed (e.g.
-            # "integration" / "regression" / "trunk"), before
-            # _test_matrix.yaml's resolve job maps it to its internal
-            # smoke/core/full vocabulary (see that workflow's run-name
-            # comment) -- so parsing it out of display_title recovers the
-            # real external-facing value without an extra API call.
+            # "integration-tests (<inputs.test_type>)" -- the RAW test_type
+            # value the caller passed (e.g. "integration" / "regression" /
+            # "trunk"); there is no internal alias vocabulary to resolve
+            # through (see _test_matrix.yaml's test_type description) -- so
+            # parsing it out of display_title recovers the real external-
+            # facing value without an extra API call.
             TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
           fi
           echo "Resolved test_type: ${TIER:-<none>}"
