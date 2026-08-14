@@ -81,8 +81,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
 }
 
-# --8<-- [end:env-vars-definition]
-
 
 def __getattr__(name: str):
     """Lazy attribute access into ``environment_variables``.
