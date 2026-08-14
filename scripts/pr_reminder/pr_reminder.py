@@ -33,6 +33,8 @@ Environment variables:
   STALE_HOURS             inactivity threshold in hours (default 24)
   MAX_IDLE_DAYS           skip PRs idle longer than this; 0 disables (default 30)
   EXEMPT_LABELS           comma-separated labels that exclude a PR
+  EXEMPT_TITLE_TEXT       comma-separated title substrings that exclude a PR
+                          (default "do not merge")
   SLACK_HEADER_TEMPLATE   overrides HEADER_TEMPLATE
   SLACK_PR_LINE_TEMPLATE  overrides PR_LINE_TEMPLATE
   SLACK_FOOTER_TEMPLATE   overrides FOOTER_TEMPLATE
@@ -43,6 +45,7 @@ fail. Every failure path exits non-zero so the Actions run goes red.
 
 import logging
 import os
+import re
 import sys
 import traceback
 from argparse import ArgumentParser, Namespace
@@ -55,6 +58,12 @@ from slack_sdk.webhook import WebhookClient
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("pr_reminder")
+
+
+def normalize_title(text: str) -> str:
+    """Lowercase and fold runs of whitespace/-/_ to single spaces, for matching."""
+    return re.sub(r"[\s_-]+", " ", text).strip().lower()
+
 
 GITHUB_API = "https://api.github.com"
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY") or "torch-spyre/spyre-inference"
@@ -82,6 +91,14 @@ EXEMPT_LABELS = {
     label.strip().lower()
     for label in (os.environ.get("EXEMPT_LABELS") or "keep-open,stale,do-not-merge").split(",")
     if label.strip()
+}
+# Authors flag "not ready" in the title far more often than with a label, so the
+# title is checked too. Patterns are matched against a normalized title, which
+# lets one entry cover "DO NOT MERGE", "do-not-merge" and "[Do Not Merge]".
+EXEMPT_TITLE_TEXT = {
+    normalized
+    for text in (os.environ.get("EXEMPT_TITLE_TEXT") or "do not merge").split(",")
+    if (normalized := normalize_title(text))
 }
 
 TITLE_MAX_CHARS = 120
@@ -161,11 +178,16 @@ def select_stale(prs: list[dict], now: datetime) -> tuple[list[dict], int]:
     oldest = now - timedelta(days=MAX_IDLE_DAYS) if MAX_IDLE_DAYS > 0 else None
     eligible = []
     abandoned = 0
+    title_flagged = 0
     for pr in prs:
         if pr.get("draft"):
             continue
         labels = {label["name"].lower() for label in pr.get("labels") or []}
         if labels & EXEMPT_LABELS:
+            continue
+        title_key = normalize_title(pr["title"])
+        if any(text in title_key for text in EXEMPT_TITLE_TEXT):
+            title_flagged += 1
             continue
         updated = parse_timestamp(pr["updated_at"])
         if updated > newest:
@@ -177,6 +199,8 @@ def select_stale(prs: list[dict], now: datetime) -> tuple[list[dict], int]:
 
     eligible.sort(key=lambda pr: pr["updated_at"])
     log.info("%d of %d open PRs are stale (>= %gh idle)", len(eligible), len(prs), STALE_HOURS)
+    if title_flagged:
+        log.info("Skipped %d PRs flagged in their title", title_flagged)
     if abandoned:
         log.info("Skipped %d PRs idle for more than %g days", abandoned, MAX_IDLE_DAYS)
     return eligible[:MAX_PRS], len(eligible)
