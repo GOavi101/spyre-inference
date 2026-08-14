@@ -27,7 +27,6 @@ over scattered ``os.environ.get`` calls.
 
 from __future__ import annotations
 
-import functools
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -37,6 +36,9 @@ if TYPE_CHECKING:
     SPYRE_USE_NOISE_POOL: bool = False
     SPYRE_NOISE_POOL_MULTIPLIER: int = 32
     SPYRE_NOISE_POOL_DTYPE: str | None = None
+
+# Populated by ``enable_envs_cache()``; ``None`` means uncached / lazy.
+_env_cache: dict[str, Any] | None = None
 
 
 def env_with_choices(
@@ -81,38 +83,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
 }
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Lazy attribute access into ``environment_variables``.
 
-    After ``enable_envs_cache()``, values are cached (do not change env after
-    service init if cache is enabled).
+    After ``enable_envs_cache()``, values are served from ``_env_cache`` (do
+    not change env after service init if cache is enabled).
     """
-    if name in environment_variables:
-        return environment_variables[name]()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def _is_envs_cache_enabled() -> bool:
-    global __getattr__
-    return hasattr(__getattr__, "cache_clear")
+    if name not in environment_variables:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if _env_cache is not None:
+        return _env_cache[name]
+    return environment_variables[name]()
 
 
 def enable_envs_cache() -> None:
     """Cache env lookups after service initialization."""
-    if _is_envs_cache_enabled():
+    global _env_cache
+    if _env_cache is not None:
         return
-    global __getattr__
-    __getattr__ = functools.cache(__getattr__)
-    for key in environment_variables:
-        __getattr__(key)
+    _env_cache = {key: getter() for key, getter in environment_variables.items()}
 
 
 def disable_envs_cache() -> None:
     """Clear the env cache (for tests that mutate ``os.environ``)."""
-    global __getattr__
-    if _is_envs_cache_enabled():
-        assert hasattr(__getattr__, "__wrapped__")
-        __getattr__ = __getattr__.__wrapped__
+    global _env_cache
+    _env_cache = None
 
 
 def is_set(name: str) -> bool:
