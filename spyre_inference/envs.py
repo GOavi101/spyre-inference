@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-inference environment variables (vLLM-style).
+"""Spyre-inference environment variables.
 
 Central place for config levers: documentation, defaults, lazy evaluation,
-and optional caching after service init. Prefer ``import spyre_inference.envs
-as envs`` and ``envs.SPYRE_…`` over scattered ``os.environ.get`` calls.
-
-Usage::
+and optional caching after service init. Prefer::
 
     import spyre_inference.envs as envs
 
     if envs.SPYRE_USE_NOISE_POOL:
         ...
+
+over scattered ``os.environ.get`` calls.
 """
 
 from __future__ import annotations
@@ -66,12 +65,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in host-side Exp(1) noise pool for temperature / top-k / top-p
     # sampling. Sampling still runs on CPU; this only replaces per-step
     # ``exponential_()`` with slices from a pre-filled buffer (useful on
-    # s390x). Off by default → same as upstream vLLM. This is a host
+    # s390x). Off by default -> same as upstream vLLM. This is a host
     # stopgap, not on-device / torch.compile sampling.
     "SPYRE_USE_NOISE_POOL": lambda: os.getenv("SPYRE_USE_NOISE_POOL", "0") == "1",
-    # Pool size = multiplier × max_num_seqs × vocab_size.
+    # Pool size = multiplier * max_num_seqs * vocab_size.
     "SPYRE_NOISE_POOL_MULTIPLIER": lambda: int(os.getenv("SPYRE_NOISE_POOL_MULTIPLIER", "32")),
-    # Explicit pool dtype: "float16" / "float32". None → auto
+    # Explicit pool dtype: "float16" / "float32". None -> auto
     # (float32 on s390x/ppc64le, else float16).
     "SPYRE_NOISE_POOL_DTYPE": env_with_choices(
         "SPYRE_NOISE_POOL_DTYPE",
