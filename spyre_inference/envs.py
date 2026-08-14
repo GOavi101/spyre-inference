@@ -62,8 +62,6 @@ def env_with_choices(
     return _get_validated_env
 
 
-# --8<-- [start:env-vars-definition]
-
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in host-side Exp(1) noise pool for temperature / top-k / top-p
     # sampling. Sampling still runs on CPU; this only replaces per-step
