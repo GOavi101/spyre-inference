@@ -362,7 +362,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # regardless of self.device.
 
         # Optional host-side Exp(1) noise pool for temp/top-k/top-p sampling
-        # (SPYRE_USE_NOISE_POOL=1). Off by default → same as upstream Sampler.
+        # (envs.SPYRE_USE_NOISE_POOL). Off by default → same as upstream Sampler.
         if hasattr(self, "sampler"):
             self.sampler = build_spyre_sampler(vllm_config)
             # Spec decode (if ever enabled) captured the old Sampler reference.

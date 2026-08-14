@@ -31,21 +31,25 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 ## Host sampler noise pool (optional)
 
 For temperature / top-k / top-p sampling, vLLM draws Exp(1) noise every decode
-step (`exponential_()`). That can be slow on some hosts (e.g. s390x). Spyre can
-pre-fill a CPU pool of Exp(1) values once and reuse random slices instead.
+step (`exponential_()`). That can be slow on some hosts (e.g. s390x). As a
+**host-side stopgap**, Spyre can pre-fill a CPU pool of Exp(1) values once and
+reuse random slices instead. This does **not** move sampling onto the Spyre
+device or through `torch.compile`; prefer a compiled / on-device sampler when
+that work lands.
+
+Knobs live in `spyre_inference/envs.py` (vLLM-style lazy env module):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SPYRE_USE_NOISE_POOL` | `0` | Set to `1` to enable the pool |
 | `SPYRE_NOISE_POOL_MULTIPLIER` | `32` | Pool size = multiplier × `max_num_seqs` × vocab |
 | `SPYRE_NOISE_POOL_DTYPE` | (auto) | `float16` or `float32`; default float32 on s390x/ppc64le, else float16 |
-| `SPYRE_SAMPLER_TIMING` | `0` | If `>0`, log average sample latency every N calls |
 
-When disabled, behaviour matches upstream vLLM. This does **not** move sampling
-onto the Spyre device; logits still go to the host sampler.
+When disabled, behaviour matches upstream vLLM. Use the Spyre / Kineto profiler
+for sampler latency — do not inject timing into the production sample path.
 
 ```bash
-SPYRE_USE_NOISE_POOL=1 SPYRE_SAMPLER_TIMING=50 \
+SPYRE_USE_NOISE_POOL=1 \
   python examples/offline_inference/torch_spyre_inference.py
 ```
 

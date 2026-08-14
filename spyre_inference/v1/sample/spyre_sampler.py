@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,22 +14,20 @@
 
 """Spyre sampler with a pre-generated exponential-noise pool.
 
-Port of the sendnn-inference noise-pool idea for the torch-spyre / spyre-inference
-stack. Sampling still runs on **CPU** (host logits); torch-spyre is only the
-model device. The pool avoids slow per-step ``Tensor.exponential_()`` on
-platforms such as s390x when doing Gumbel-max sampling
-(``argmax(probs / q)``, ``q ~ Exp(1)``).
+Host-side stopgap: sampling still runs on **CPU** (host logits); torch-spyre
+is only the model device. The pool avoids slow per-step
+``Tensor.exponential_()`` on platforms such as s390x when doing Gumbel-max
+sampling (``argmax(probs / q)``, ``q ~ Exp(1)``).
 
-Opt-in via ``SPYRE_USE_NOISE_POOL=1``. When disabled, behaviour matches
-upstream vLLM's ``Sampler``.
+This is **not** on-device / ``torch.compile`` sampling — prefer that path
+when ready. Opt-in via ``SPYRE_USE_NOISE_POOL=1`` (see ``spyre_inference.envs``).
+When disabled, behaviour matches upstream vLLM's ``Sampler``.
 """
 
 from __future__ import annotations
 
-import os
 import platform
 import random
-import time
 
 import torch
 from vllm.config import VllmConfig
@@ -42,19 +40,14 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.sample.sampler import Sampler
 
-logger = init_logger(__name__)
+import spyre_inference.envs as envs
 
-_USE_NOISE_POOL = os.environ.get("SPYRE_USE_NOISE_POOL", "0") == "1"
-_NOISE_POOL_MULTIPLIER = int(os.environ.get("SPYRE_NOISE_POOL_MULTIPLIER", "32"))
-_SAMPLER_TIMING = int(os.environ.get("SPYRE_SAMPLER_TIMING", "0"))
+logger = init_logger(__name__)
 
 
 def get_noise_pool_dtype() -> torch.dtype:
-    """Pool dtype: float32 on s390x/ppc64le, float16 elsewhere.
-
-    Override with ``SPYRE_NOISE_POOL_DTYPE=float16|float32``.
-    """
-    override = os.environ.get("SPYRE_NOISE_POOL_DTYPE", "").strip().lower()
+    """Pool dtype from ``SPYRE_NOISE_POOL_DTYPE``, else platform default."""
+    override = envs.SPYRE_NOISE_POOL_DTYPE
     if override in ("float16", "fp16", "half"):
         return torch.float16
     if override in ("float32", "fp32", "float"):
@@ -164,16 +157,9 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         super().__init__(logprobs_mode)
         self.noise_pool = noise_pool
         self.forward = self.forward_native
-
-        self._timing_interval = _SAMPLER_TIMING
-        self._timing_enabled = self._timing_interval > 0
-        self._timing_calls = 0
-        self._timing_total_s = 0.0
-
         logger.info(
-            "SpyreTopKTopPSampler initialized: noise_pool=%s, timing=%s",
+            "SpyreTopKTopPSampler initialized: noise_pool=%s",
             "on" if self.noise_pool is not None else "off",
-            f"every {self._timing_interval} calls" if self._timing_enabled else "off",
         )
 
     def forward_native(
@@ -191,31 +177,11 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
 
-        start = time.perf_counter() if self._timing_enabled else 0.0
         if self.noise_pool is None:
             sampled = random_sample(probs, generators)
         else:
             sampled = pooled_random_sample(probs, generators, self.noise_pool)
-        if self._timing_enabled:
-            self._record_timing(time.perf_counter() - start, probs.shape)
         return sampled, logits_to_return
-
-    def _record_timing(self, elapsed_s: float, shape: torch.Size) -> None:
-        self._timing_calls += 1
-        self._timing_total_s += elapsed_s
-        if self._timing_calls >= self._timing_interval:
-            path = "pool" if self.noise_pool is not None else "exponential_"
-            logger.info(
-                "Spyre sampler [%s]: %.3f ms/call avg over %d calls "
-                "(last shape: batch=%d, vocab=%d)",
-                path,
-                1000.0 * self._timing_total_s / self._timing_calls,
-                self._timing_calls,
-                shape[0],
-                shape[1],
-            )
-            self._timing_calls = 0
-            self._timing_total_s = 0.0
 
 
 class SpyreSampler(Sampler):
@@ -237,16 +203,17 @@ def build_spyre_sampler(vllm_config: VllmConfig) -> SpyreSampler:
     behaviour (pool path disabled inside ``SpyreTopKTopPSampler``).
     """
     noise_pool: ExponentialNoisePool | None = None
-    if _USE_NOISE_POOL:
+    if envs.SPYRE_USE_NOISE_POOL:
         vocab_size = vllm_config.model_config.get_vocab_size()
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        numel = _NOISE_POOL_MULTIPLIER * max_num_seqs * vocab_size
+        multiplier = envs.SPYRE_NOISE_POOL_MULTIPLIER
+        numel = multiplier * max_num_seqs * vocab_size
         dtype = get_noise_pool_dtype()
         logger.info(
             "Building exponential-noise pool: %d elements "
             "(%d x max_num_seqs=%d x vocab_size=%d), dtype=%s (~%.2f GiB)",
             numel,
-            _NOISE_POOL_MULTIPLIER,
+            multiplier,
             max_num_seqs,
             vocab_size,
             dtype,
