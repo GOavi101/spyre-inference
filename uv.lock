@@ -4399,6 +4399,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "coverage" },
     { name = "spyre-testing-plugin" },
 ]
 
@@ -4412,7 +4413,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "spyre-testing-plugin", editable = "tests/plugin" }]
+dev = [
+    { name = "coverage" },
+    { name = "spyre-testing-plugin", editable = "tests/plugin" },
+]
 
 [[package]]
 name = "spyre-testing-plugin"

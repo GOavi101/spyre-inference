@@ -273,4 +273,5 @@ plugins.md007.indent = 4
 [dependency-groups]
 dev = [
     "spyre-testing-plugin",
+    "coverage",
 ]
