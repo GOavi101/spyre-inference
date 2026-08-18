@@ -17,10 +17,13 @@
 from spyre_inference.v1.encoder_buckets import (
     batch_buckets,
     encoder_batch_bucket,
+    encoder_bucket_valid_row_indices,
     encoder_len_bucket,
+    expand_packed_to_encoder_bucket,
     len_buckets,
     next_bucket,
     pooling_warmup_shapes,
+    runtime_encoder_bucket,
 )
 
 
@@ -82,9 +85,89 @@ def test_warmup_shapes_are_bucket_cartesian(monkeypatch):
 def test_warmup_shapes_skip_over_token_budget(monkeypatch):
     monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "64,256")
     monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
-    # 4*256 = 1024 > 200 tokens
+    # 4*256 = 1024 > 300 tokens; 4*64 = 256 still fits.
     assert pooling_warmup_shapes(
         max_num_seqs=4,
         max_model_len=2048,
-        max_num_batched_tokens=200,
+        max_num_batched_tokens=300,
     ) == [(4, 64)]
+
+
+def test_runtime_bucket_matches_warmup_shape(monkeypatch):
+    monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "64,128")
+    monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+    # 3×30 → pad to the warmed (4, 64) so T = 256.
+    assert runtime_encoder_bucket(
+        num_seqs=3,
+        max_query_len=30,
+        max_num_seqs=4,
+        max_model_len=128,
+        max_num_batched_tokens=512,
+    ) == (4, 64)
+
+
+def test_runtime_bucket_none_when_over_token_budget(monkeypatch):
+    monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "64")
+    monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
+    assert (
+        runtime_encoder_bucket(
+            num_seqs=3,
+            max_query_len=30,
+            max_num_seqs=4,
+            max_model_len=2048,
+            max_num_batched_tokens=200,
+        )
+        is None
+    )
+
+
+def test_expand_packed_to_encoder_bucket_pads_seq_and_batch():
+    padded_ids, padded_pos = expand_packed_to_encoder_bucket(
+        input_ids=[1, 2, 3, 4, 5],
+        positions=[0, 1, 2, 0, 1],
+        query_lens=[3, 2],
+        batch_bucket=4,
+        len_bucket=4,
+        pad_token_id=9,
+    )
+    assert padded_ids == [
+        1,
+        2,
+        3,
+        9,  # seq 0
+        4,
+        5,
+        9,
+        9,  # seq 1
+        9,
+        9,
+        9,
+        9,  # dummy
+        9,
+        9,
+        9,
+        9,  # dummy
+    ]
+    assert padded_pos == [
+        0,
+        1,
+        2,
+        3,
+        0,
+        1,
+        2,
+        3,
+        0,
+        1,
+        2,
+        3,
+        0,
+        1,
+        2,
+        3,
+    ]
+
+
+def test_encoder_bucket_valid_row_indices_skips_pads():
+    indices = encoder_bucket_valid_row_indices([3, 2], len_bucket=4)
+    assert indices == [0, 1, 2, 4, 5]

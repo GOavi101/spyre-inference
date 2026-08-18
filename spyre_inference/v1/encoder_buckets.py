@@ -14,11 +14,14 @@
 
 """Encoder compile-shape buckets.
 
-Spyre ``torch.compile(dynamic=False)`` specializes the encoder SDPA batch
-``[B, H, L, D]``. Without a ladder, every new ``max_len`` (after stick align)
-or ``num_seqs`` compiles a new graph (~60s). Pad L and B up to the next
-configured bucket so a 30-token, 3-seq request reuses the warmed ``(4, 64)``
-graph.
+Spyre ``torch.compile(dynamic=False)`` specializes both the encoder SDPA batch
+``[B, H, L, D]`` and the body (embed / Linear / LN) on flat ``[T, …]``. Without
+a ladder, every new ``max_len`` or ``num_seqs`` compiles a new graph (~60s).
+
+Pad each sequence to the next length bucket ``L`` and the batch to ``B`` so
+``T = B × L``. A 30-token, 3-seq request then reuses the warmed ``(4, 64)``
+graph for attention **and** Linear/LN. Attention still masks to the real
+lengths so pad tokens do not mix into embeddings.
 
 Env:
     SPYRE_ENCODER_BUCKET_LENS          CSV of prompt-length buckets
@@ -32,6 +35,7 @@ Env:
 from __future__ import annotations
 
 import os
+from typing import NamedTuple
 
 # Stick size; every length bucket must be a multiple of this.
 ENCODER_SEQ_ALIGNMENT = 64
@@ -119,3 +123,91 @@ def pooling_warmup_shapes(
             seen.add(key)
             shapes.append(key)
     return shapes
+
+
+class EncoderBucketPad(NamedTuple):
+    """Runtime pad of a pooling batch onto a warmed ``(B, L)`` shape."""
+
+    batch_bucket: int
+    len_bucket: int
+    orig_query_lens: list[int]
+    orig_num_tokens: int
+    orig_num_reqs: int
+
+    @property
+    def num_tokens(self) -> int:
+        return self.batch_bucket * self.len_bucket
+
+
+def runtime_encoder_bucket(
+    num_seqs: int,
+    max_query_len: int,
+    max_num_seqs: int,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+) -> tuple[int, int] | None:
+    """``(B, L)`` to pad onto, or ``None`` if that shape does not fit the budget.
+
+    ``None`` means leave the batch unpadded (a new compile, same as before).
+    """
+    if num_seqs < 1 or max_query_len < 1:
+        return None
+    batch_bucket = encoder_batch_bucket(num_seqs, max_num_seqs)
+    len_bucket = encoder_len_bucket(max_query_len)
+    if len_bucket > max_model_len:
+        return None
+    if batch_bucket * len_bucket > max_num_batched_tokens:
+        return None
+    return batch_bucket, len_bucket
+
+
+def expand_packed_to_encoder_bucket(
+    input_ids: list[int],
+    positions: list[int],
+    query_lens: list[int],
+    batch_bucket: int,
+    len_bucket: int,
+    pad_token_id: int = 0,
+) -> tuple[list[int], list[int]]:
+    """Pad each sequence to ``L`` and the batch to ``B``; return ``[B*L]`` lists.
+
+    Real pad tokens continue positions from the true length. Dummy sequences
+    (batch pad) are ``pad_token_id`` with positions ``0 .. L-1``.
+    """
+    if len(query_lens) > batch_bucket:
+        raise ValueError(
+            f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}"
+        )
+    if any(length > len_bucket for length in query_lens):
+        raise ValueError(
+            f"a query length exceeds len_bucket={len_bucket}: {query_lens}"
+        )
+
+    total = batch_bucket * len_bucket
+    padded_ids = [int(pad_token_id)] * total
+    padded_pos = [0] * total
+    src = 0
+    for seq_idx, length in enumerate(query_lens):
+        dst = seq_idx * len_bucket
+        padded_ids[dst : dst + length] = list(input_ids[src : src + length])
+        padded_pos[dst : dst + length] = list(positions[src : src + length])
+        for offset in range(length, len_bucket):
+            padded_pos[dst + offset] = offset
+        src += length
+    for seq_idx in range(len(query_lens), batch_bucket):
+        dst = seq_idx * len_bucket
+        for offset in range(len_bucket):
+            padded_pos[dst + offset] = offset
+    return padded_ids, padded_pos
+
+
+def encoder_bucket_valid_row_indices(
+    orig_query_lens: list[int],
+    len_bucket: int,
+) -> list[int]:
+    """Row indices of real tokens inside a ``B×L`` packed hidden state."""
+    indices: list[int] = []
+    for seq_idx, length in enumerate(orig_query_lens):
+        start = seq_idx * len_bucket
+        indices.extend(range(start, start + length))
+    return indices

@@ -69,7 +69,13 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.encoder_buckets import pooling_warmup_shapes
+from spyre_inference.v1.encoder_buckets import (
+    EncoderBucketPad,
+    encoder_bucket_valid_row_indices,
+    expand_packed_to_encoder_bucket,
+    pooling_warmup_shapes,
+    runtime_encoder_bucket,
+)
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -343,6 +349,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
+        # Set during pooling execute_model when the batch is expanded to (B, L).
+        self._encoder_bucket: EncoderBucketPad | None = None
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -485,6 +493,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         ``force_attention=True`` so pack/SDPA is in the graph. Upstream
         ``_dummy_run`` skips attention metadata unless that flag is set;
         the encoder impl then no-ops and the first real embed still compiles.
+        Runtime pooling pads each sequence to ``L`` and the batch to ``B`` so
+        Linear/LN see ``T = B × L`` and reuse the same warmed graphs.
         """
         logger.info("Warming up model...")
         t0 = time.time()
@@ -581,6 +591,180 @@ class TorchSpyreModelRunner(GPUModelRunner):
             hidden_states = convert(hidden_states, self._spyre_device)
         return hidden_states, last_hidden_states
 
+    def execute_model(self, scheduler_output, intermediate_tensors=None):
+        self._encoder_bucket = None
+        try:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+        finally:
+            self._encoder_bucket = None
+
+    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        self._maybe_expand_pooling_inputs_to_encoder_bucket(num_scheduled_tokens)
+        return result
+
+    def _maybe_expand_pooling_inputs_to_encoder_bucket(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> None:
+        """Rewrite packed inputs to ``B`` sequences of length ``L`` (``T = B×L``).
+
+        Linear/LN compile on the flat token count; attention compiles on
+        ``[B, H, L, D]``. One warmup per ``(B, L)`` covers both when the
+        runtime batch is padded the same way. Attention still masks with the
+        original lengths (kept in ``seq_lens``).
+        """
+        self._encoder_bucket = None
+        if self.model_config.runner_type != "pooling":
+            return
+
+        num_reqs = self.input_batch.num_reqs
+        orig_lens = [int(n) for n in num_scheduled_tokens[:num_reqs]]
+        orig_tokens = int(sum(orig_lens))
+        if orig_tokens <= 0:
+            return
+
+        bucket = runtime_encoder_bucket(
+            num_seqs=num_reqs,
+            max_query_len=max(orig_lens),
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=self.max_num_tokens,
+        )
+        if bucket is None:
+            return
+        batch_bucket, len_bucket = bucket
+        if (
+            batch_bucket == num_reqs
+            and orig_tokens == batch_bucket * len_bucket
+            and all(length == len_bucket for length in orig_lens)
+        ):
+            return
+
+        pad_token_id = getattr(self.model_config.hf_config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
+            self.input_ids.cpu[:orig_tokens].tolist(),
+            self.positions[:orig_tokens].detach().cpu().tolist(),
+            orig_lens,
+            batch_bucket,
+            len_bucket,
+            pad_token_id=int(pad_token_id),
+        )
+        num_tokens = batch_bucket * len_bucket
+        self.input_ids.cpu[:num_tokens].copy_(
+            torch.tensor(padded_ids, dtype=self.input_ids.cpu.dtype)
+        )
+        if self.input_ids.gpu is not self.input_ids.cpu:
+            self.input_ids.copy_to_gpu(num_tokens)
+        self.positions[:num_tokens].copy_(
+            torch.tensor(
+                padded_pos,
+                dtype=self.positions.dtype,
+                device=self.positions.device,
+            )
+        )
+
+        qsl = np.arange(0, num_tokens + 1, len_bucket, dtype=self.query_start_loc.np.dtype)
+        self.query_start_loc.np[: batch_bucket + 1] = qsl
+        self.query_start_loc.np[batch_bucket + 1 :].fill(num_tokens)
+        self.query_start_loc.copy_to_gpu()
+
+        # Dummy sequences fully attend among pad tokens so SDPA is not all -inf.
+        dummy = torch.full(
+            (batch_bucket - num_reqs,),
+            len_bucket,
+            dtype=self.optimistic_seq_lens_cpu.dtype,
+        )
+        self.optimistic_seq_lens_cpu[num_reqs:batch_bucket] = dummy
+        self.seq_lens[num_reqs:batch_bucket] = dummy.to(device=self.seq_lens.device)
+        self.optimistic_seq_lens_cpu[batch_bucket:].fill_(0)
+        self.seq_lens[batch_bucket:].fill_(0)
+
+        self._encoder_bucket = EncoderBucketPad(
+            batch_bucket=batch_bucket,
+            len_bucket=len_bucket,
+            orig_query_lens=orig_lens,
+            orig_num_tokens=orig_tokens,
+            orig_num_reqs=num_reqs,
+        )
+
+    def _get_slot_mappings(
+        self,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_tokens_unpadded: int,
+        ubatch_slices=None,
+    ):
+        bucket = self._encoder_bucket
+        if bucket is not None:
+            num_tokens_padded = bucket.num_tokens
+            num_reqs_padded = bucket.batch_bucket
+            num_tokens_unpadded = bucket.num_tokens
+        return super()._get_slot_mappings(
+            num_tokens_padded,
+            num_reqs_padded,
+            num_tokens_unpadded,
+            ubatch_slices,
+        )
+
+    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
+        if self._encoder_bucket is not None:
+            return self._encoder_bucket.num_tokens
+        return super()._pad_for_sequence_parallelism(num_scheduled_tokens)
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        bucket = self._encoder_bucket
+        if bucket is not None:
+            kwargs["num_tokens"] = bucket.num_tokens
+            kwargs["num_reqs"] = bucket.batch_bucket
+            kwargs["max_query_len"] = bucket.len_bucket
+            kwargs["num_tokens_padded"] = bucket.num_tokens
+            kwargs["num_reqs_padded"] = bucket.batch_bucket
+            args = ()
+        return super()._build_attention_metadata(*args, **kwargs)
+
+    def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
+        bucket = self._encoder_bucket
+        saved_pos = None
+        if bucket is not None:
+            saved_pos = self.positions[: bucket.num_tokens].clone()
+        result = super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+        if saved_pos is None:
+            return result
+        self.positions[: saved_pos.shape[0]].copy_(saved_pos)
+        input_ids, inputs_embeds, _positions, *rest = result
+        return (input_ids, inputs_embeds, self.positions[:num_input_tokens], *rest)
+
+    def _unpad_encoder_hidden(
+        self, hidden_states: torch.Tensor, num_scheduled_tokens: int
+    ) -> torch.Tensor:
+        """Gather real tokens out of a ``B×L`` packed hidden state."""
+        bucket = self._encoder_bucket
+        if bucket is None:
+            if hidden_states.shape[0] != num_scheduled_tokens:
+                hidden_states = select_rows(
+                    hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
+                )
+            return hidden_states
+        indices = encoder_bucket_valid_row_indices(
+            bucket.orig_query_lens, bucket.len_bucket
+        )
+        return select_rows(
+            hidden_states, torch.tensor(indices, dtype=torch.int64)
+        )
+
+    def _restore_orig_query_start_loc(self) -> None:
+        bucket = self._encoder_bucket
+        if bucket is None:
+            return
+        cu = np.cumsum([0, *bucket.orig_query_lens], dtype=self.query_start_loc.np.dtype)
+        num_reqs = bucket.orig_num_reqs
+        self.query_start_loc.np[: num_reqs + 1] = cu
+        self.query_start_loc.np[num_reqs + 1 :].fill(cu[-1])
+        self.query_start_loc.copy_to_gpu()
+
     def _dummy_pooler_run_task(
         self,
         hidden_states: torch.Tensor,
@@ -659,8 +843,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         if not self._pooling_on_spyre:
+            hidden_states = self._unpad_encoder_hidden(
+                convert(hidden_states, "cpu"), num_scheduled_tokens
+            )
+            self._restore_orig_query_start_loc()
             return super()._pool(
-                convert(hidden_states, "cpu"),
+                hidden_states,
                 num_scheduled_tokens,
                 num_scheduled_tokens_np,
                 kv_connector_output,
@@ -681,10 +869,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Crop via index_select — Spyre dim-0 slice views are unsafe.
         hidden_states = convert(hidden_states, self._spyre_device)
-        if hidden_states.shape[0] != num_scheduled_tokens:
-            hidden_states = select_rows(
-                hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
-            )
+        hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
+        self._restore_orig_query_start_loc()
 
         # Mirror GPUModelRunner._pool after crop. Build the cursor on CPU:
         # upstream does ``cumsum[1:] - 1`` for last_token_indices; that offset-1

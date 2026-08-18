@@ -31,17 +31,23 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 ## Encoder / pooling compile buckets
 
 Spyre `torch.compile(dynamic=False)` specializes exact encoder SDPA shapes
-`[B, H, L, D]`. A new `max_len` or `num_seqs` otherwise compiles a new graph
-(~60s). The plugin pads **L** and **B** up to the next configured bucket and
-warms those shapes at serve start (compiled pooling only).
+`[B, H, L, D]` **and** the rest of the model on the flat token count `[T, …]`.
+A new `max_len` or `num_seqs` otherwise compiles a new graph (~60s).
+
+The plugin pads **each sequence** to the next length bucket `L` and the **batch**
+to `B`, so `T = B × L`. One warmup dummy per `(B, L)` then covers Linear / LN
+and attention together. Attention still masks to the real prompt lengths so
+pad tokens do not mix into embeddings; pooling gathers the real tokens back
+before CLS / LAST / MEAN.
 
 | Env | Default | Meaning |
 |---|---|---|
 | `SPYRE_ENCODER_BUCKET_LENS` | `64,128,256,512,1024,2048` | Prompt-length ladder (rounded up to a multiple of 64) |
 | `SPYRE_ENCODER_BUCKET_BATCH_SIZES` | `1, 2, 4, …, max_num_seqs` | Batch ladder |
 
-A 30-token, 3-seq request with `--max-num-seqs 4` reuses the warmed `(B=4, L=64)`
-SDPA graph. Extra pad rows/tokens are masked `-inf` / zeros.
+A 30-token, 3-seq request with `--max-num-seqs 4` is padded to `(B=4, L=64)`
+(`T=256`) and reuses that warmed graph. If `(B, L)` would exceed
+`--max-num-batched-tokens`, the batch is left unpadded (a new compile).
 
 Compiled pooling warmup dummies every `(B, L)` in the ladder with
 `force_attention=True` (upstream dummy otherwise skips encoder attention).
@@ -56,11 +62,6 @@ vllm serve ibm-granite/granite-embedding-125m-english \
   --runner pooling --max-num-seqs 4 \
   --compilation-config '{"mode":"STOCK_TORCH_COMPILE"}'
 ```
-
-Keep `--max-concurrency` equal to `--max-num-seqs` on `vllm bench serve`, and
-`num-prompts` a multiple of concurrency, so leftover batches do not introduce
-a new `B`.
-
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:
