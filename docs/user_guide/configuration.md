@@ -62,6 +62,11 @@ vllm serve ibm-granite/granite-embedding-125m-english \
   --runner pooling --max-num-seqs 4 \
   --compilation-config '{"mode":"STOCK_TORCH_COMPILE"}'
 ```
+
+`enforce_eager=False` is vLLM's default and is **not** enough to compile on Spyre.
+Without `compilation_config.mode=STOCK_TORCH_COMPILE`, the plugin stays in eager
+and logs `Compilation disabled (compilation mode is NONE; ...)`.
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:

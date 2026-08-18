@@ -89,6 +89,23 @@ logger = init_logger(__name__)
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
 
 
+def compilation_disabled_reason(enforce_eager: bool, mode: CompilationMode) -> str | None:
+    """Why ``torch.compile`` is skipped, or ``None`` if we should compile.
+
+    Spyre stays eager when ``compilation_config.mode`` is unset/NONE even if
+    ``enforce_eager=False`` (vLLM's default). Do not report that as
+    ``enforce_eager=True``.
+    """
+    if enforce_eager:
+        return "enforce_eager=True"
+    if mode is CompilationMode.NONE:
+        return (
+            "compilation mode is NONE; pass compilation_config "
+            "mode=STOCK_TORCH_COMPILE to enable compile"
+        )
+    return None
+
+
 # Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
 # (unavailable with VLLM_TARGET_DEVICE=empty).
 
@@ -466,8 +483,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 f"are supported."
             )
 
-        if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
-            logger.info("Compilation disabled (enforce_eager=True)")
+        reason = compilation_disabled_reason(
+            self.vllm_config.model_config.enforce_eager, mode
+        )
+        if reason:
+            logger.info("Compilation disabled (%s)", reason)
             return
 
         # Trigger whole-model compile:
