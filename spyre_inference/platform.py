@@ -298,14 +298,14 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
-        # The list-based attention backend requires 64-element stick alignment for
+        # The Spyre paged attention backend requires 64-element stick alignment for
         # torch.compile.
         cache_config = vllm_config.cache_config
         original_block_size = cache_config.block_size
         if original_block_size % 64 != 0:
             new_block_size = ((original_block_size + 63) // 64) * 64
             logger.warning(
-                "Block size must be a multiple of 64 for the list-based attention "
+                "Block size must be a multiple of 64 for the Spyre paged attention "
                 "backend. Overriding block_size from %d to %d.",
                 original_block_size,
                 new_block_size,

@@ -951,17 +951,18 @@ def patch_backend_list(request, monkeypatch):
     ):
         if "AttentionBackendEnum.FLEX_ATTENTION" in str(backend_to_test):
             return
-        # Force block_size=64 for list-based attention
+        # Force block_size=64 for Spyre paged attention
         # This overrides the test's default block_size=16
         kwargs["block_size"] = 64
         return orig_tbc(batch_spec, model, backend_to_test, *args, **kwargs)
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
-    # The upstream test allocates one kv_cache tensor of
-    # [num_blocks, num_kv_heads, block_size, 2 * head_size]; SpyreAttentionImpl
-    # wants (k_pages, v_pages), each a per-block list of
-    # [num_kv_heads, block_size, head_size].
+    # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
+    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
+    # layout underneath is token-major, which upstream expresses separately via
+    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
+    # layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -982,9 +983,10 @@ def patch_backend_list(request, monkeypatch):
         if backend == AttentionBackendEnum.CUSTOM:
             # K and V are concatenated on the last dim.
             head_size = kv_cache.shape[-1] // 2
+            kv_cache = kv_cache.transpose(1, 2)
             k_blocks = kv_cache[..., :head_size].contiguous()
             v_blocks = kv_cache[..., head_size:].contiguous()
-            kv_cache = (list(k_blocks.unbind(0)), list(v_blocks.unbind(0)))
+            kv_cache = (k_blocks, v_blocks)
         return orig_run_attention_backend(
             backend,
             kv_cache_spec,

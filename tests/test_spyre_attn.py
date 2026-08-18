@@ -67,8 +67,8 @@ def configure_compilation(request, monkeypatch):
     original_limit = torch._dynamo.config.accumulated_recompile_limit
 
     cfg.mode = compilation_mode
-    # Increase recompilation limit to handle list-based page_indices
-    # which trigger recompilation on each unique block index value
+    # Increase recompilation limit: the page-attention kernel is specialized
+    # (and so recompiled) per unique (num_blocks, padded_query_len)
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
     yield mode_name
@@ -232,8 +232,8 @@ def _alibi_slopes(num_heads: int) -> list[float]:
 
 def ref_attn(
     query: torch.Tensor,
-    key_cache: list[torch.Tensor],
-    value_cache: list[torch.Tensor],
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
     query_lens: list[int],
     kv_lens: list[int],
     block_tables: torch.Tensor,
@@ -258,13 +258,11 @@ def ref_attn(
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables_np[i, :num_kv_blocks]
 
-        # Gather from page lists
+        # Pages are token-major, so dim 0 of the concat is the token axis.
         k_blocks = [key_cache[idx] for idx in block_indices]
         v_blocks = [value_cache[idx] for idx in block_indices]
-        # Each block: [num_kv_heads, block_size, head_size]
-        # cat along block_size dim → [num_kv_heads, total_tokens, head_size]
-        k = torch.cat(k_blocks, dim=1).transpose(0, 1)[:kv_len]  # [kv_len, num_kv_heads, head_size]
-        v = torch.cat(v_blocks, dim=1).transpose(0, 1)[:kv_len]
+        k = torch.cat(k_blocks, dim=0)[:kv_len]  # [kv_len, num_kv_heads, head_size]
+        v = torch.cat(v_blocks, dim=0)[:kv_len]
 
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
@@ -343,12 +341,8 @@ def _run_spyre_attn_test(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
-    k_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
-    v_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
+    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
@@ -372,24 +366,20 @@ def _run_spyre_attn_test(
             for token_idx in range(historical_len):
                 actual_block = block_tables[seq_idx, token_idx // block_size].item()
                 block_offset = token_idx % block_size
-                k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
-                v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
+                k_pages_cpu[actual_block][block_offset] = historical_keys[token_idx]
+                v_pages_cpu[actual_block][block_offset] = historical_values[token_idx]
         for token_idx in range(historical_len, kv_len):
             block_idx = token_idx // block_size
             block_offset = token_idx % block_size
             actual_block = block_tables[seq_idx, block_idx].item()
-            k_pages_cpu[actual_block][:, block_offset, :] = key[
-                q_offset + token_idx - historical_len
-            ]
-            v_pages_cpu[actual_block][:, block_offset, :] = value[
-                q_offset + token_idx - historical_len
-            ]
+            k_pages_cpu[actual_block][block_offset] = key[q_offset + token_idx - historical_len]
+            v_pages_cpu[actual_block][block_offset] = value[q_offset + token_idx - historical_len]
             slot_mapping.append(actual_block * block_size + block_offset)
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
-    v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
+    k_pages = k_pages_cpu.to(cache_device)
+    v_pages = v_pages_cpu.to(cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -825,7 +815,7 @@ def test_spyre_attn_mqa(
 def test_block_size_validation():
     """Test that SpyreAttentionMetadataBuilder validates block_size alignment.
 
-    The list-based attention backend requires block_size to be a multiple of 64
+    The Spyre paged attention backend requires block_size to be a multiple of 64
     for proper stick alignment during torch.compile. This test verifies the
     validation raises ValueError for invalid block sizes and accepts valid ones.
     """
@@ -913,23 +903,15 @@ def test_sliding_window_none_equivalence(default_vllm_config):
     # Single sequence: query_len=32, kv_len=256
     query_len, kv_len = 32, 256
 
-    k_pages_cpu = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
-    v_pages_cpu = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
+    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
 
     # Pre-populate KV cache
     for i in range(kv_len):
         block_idx = i // block_size
         block_offset = i % block_size
-        k_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
-            num_kv_heads, head_size, dtype=dtype
-        )
-        v_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
-            num_kv_heads, head_size, dtype=dtype
-        )
+        k_pages_cpu[block_idx][block_offset] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+        v_pages_cpu[block_idx][block_offset] = torch.randn(num_kv_heads, head_size, dtype=dtype)
 
     cu_query_lens = torch.tensor([0, query_len], dtype=torch.int32)
     kv_lens_tensor = torch.tensor([kv_len], dtype=torch.int32)
@@ -1149,19 +1131,18 @@ def test_reshape_and_cache_batched(
 
     def fresh_pages(device):
         # Sentinel fill, not zeros, so an untouched slot is distinguishable.
-        return [
-            torch.full((num_kv_heads, block_size, head_size), -7.0, dtype=torch.float16).to(device)
-            for _ in range(num_pages)
-        ]
+        return torch.full(
+            (num_pages, block_size, num_kv_heads, head_size), -7.0, dtype=torch.float16
+        ).to(device)
 
     # Per-token write-back, the implementation this replaces, as the oracle.
     k_expected, v_expected = fresh_pages(cache_device), fresh_pages(cache_device)
     for t in range(num_tokens):
-        torch.narrow(k_expected[block_indices[t]], 1, block_offsets[t], 1).copy_(
-            convert(key[t].unsqueeze(1).contiguous(), cache_device)
+        torch.narrow(k_expected[block_indices[t]], 0, block_offsets[t], 1).copy_(
+            convert(key[t].unsqueeze(0), cache_device)
         )
-        torch.narrow(v_expected[block_indices[t]], 1, block_offsets[t], 1).copy_(
-            convert(value[t].unsqueeze(1).contiguous(), cache_device)
+        torch.narrow(v_expected[block_indices[t]], 0, block_offsets[t], 1).copy_(
+            convert(value[t].unsqueeze(0), cache_device)
         )
 
     k_actual, v_actual = fresh_pages(cache_device), fresh_pages(cache_device)
