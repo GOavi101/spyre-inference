@@ -209,3 +209,18 @@ When exploring a new feature area (e.g., FP8 quantization, new operators, hardwa
 - **Match existing style**: Follow established code patterns and architectural conventions
 - **Prefer simplicity**: When uncertain, choose the simpler, more concise implementation
 - **Assume vLLM familiarity**: The reader may not be an expert on the specific code being read, but should have general experience with vLLM
+
+## DCO (Developer Certificate of Origin)
+
+All commits must include a `Signed-off-by` line. Use the `-s` flag or append manually:
+
+```bash
+# With git commit
+git commit -s -m "Your commit message"
+
+# Or amend an existing commit
+git commit --amend -s --no-edit
+```
+
+The sign-off email must match your GitHub email. If they do not match, DCO checks will fail.
+For help configuring git with your GitHub identity, invoke the `github-commit` skill.
