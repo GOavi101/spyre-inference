@@ -492,6 +492,7 @@ def _run_spyre_attn_test(
         pytest.param([(33, 96)], id="prefill(q=33,kv=96)"),
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
+        pytest.param([(64, 512), (32, 256)], id="batch_prefill(2seqs_swapped)"),
         pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
     ],
 )

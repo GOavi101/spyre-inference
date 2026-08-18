@@ -1184,6 +1184,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             result = convert(result, dtype=output.dtype)
             result = result.reshape(1, num_heads, aligned_max_query_len, head_size)
             result = result.transpose(1, 2).contiguous()
-            output[q_start:q_end] = result[0, :query_len, :, :]
+            # Keep the .clone() until torch-spyre#3826 is fixed.
+            output[q_start:q_end] = result[0, :query_len, :, :].clone()
 
         return output
