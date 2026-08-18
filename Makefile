@@ -107,7 +107,8 @@ RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
         test-smoke test-attention test-distributed \
-        test-upstream test-upstream-distributed test-upstream-model
+        test-upstream test-upstream-distributed test-upstream-model \
+        tests-single-card tests-multi-card
 
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[0-9a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -175,6 +176,23 @@ test-upstream-distributed: ## Run the upstream+distributed marker combo.
 test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='upstream and model and not distributed' JUNIT_XML=$(JUNIT_XML)
 
+# Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
+tests-single-card: ## Run the non-distributed marker combos (smoke/attention/upstream/upstream-model). Needs 1 card.
+	mkdir -p "$(RESULTS_DIR)"; \
+	rc=0; \
+	$(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/smoke.xml" || rc=1; \
+	$(MAKE) test-attention JUNIT_XML="$(RESULTS_DIR)/attention.xml" || rc=1; \
+	$(MAKE) test-upstream JUNIT_XML="$(RESULTS_DIR)/upstream.xml" || rc=1; \
+	$(MAKE) test-upstream-model JUNIT_XML="$(RESULTS_DIR)/upstream-model.xml" || rc=1; \
+	exit $$rc
+
+tests-multi-card: ## Run the distributed marker combos (distributed/upstream-distributed). Needs 2 cards.
+	mkdir -p "$(RESULTS_DIR)"; \
+	rc=0; \
+	$(MAKE) test-distributed JUNIT_XML="$(RESULTS_DIR)/distributed.xml" || rc=1; \
+	$(MAKE) test-upstream-distributed JUNIT_XML="$(RESULTS_DIR)/upstream-distributed.xml" || rc=1; \
+	exit $$rc
+
 # When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same
 # coverage), GHA's _test_matrix.yaml runs this as 6 separate marker-combo
 # jobs, not one unfiltered run -- mirror that here so
@@ -188,12 +206,8 @@ tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default r
 	else \
 	  mkdir -p "$(RESULTS_DIR)"; \
 	  rc=0; \
-	  $(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/smoke.xml" || rc=1; \
-	  $(MAKE) test-attention JUNIT_XML="$(RESULTS_DIR)/attention.xml" || rc=1; \
-	  $(MAKE) test-distributed JUNIT_XML="$(RESULTS_DIR)/distributed.xml" || rc=1; \
-	  $(MAKE) test-upstream JUNIT_XML="$(RESULTS_DIR)/upstream.xml" || rc=1; \
-	  $(MAKE) test-upstream-distributed JUNIT_XML="$(RESULTS_DIR)/upstream-distributed.xml" || rc=1; \
-	  $(MAKE) test-upstream-model JUNIT_XML="$(RESULTS_DIR)/upstream-model.xml" || rc=1; \
+	  $(MAKE) tests-single-card RESULTS_DIR="$(RESULTS_DIR)" || rc=1; \
+	  $(MAKE) tests-multi-card RESULTS_DIR="$(RESULTS_DIR)" || rc=1; \
 	  exit $$rc; \
 	fi
 
