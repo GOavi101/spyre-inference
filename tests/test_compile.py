@@ -26,15 +26,17 @@ import pytest
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
             "\n\nIBMs main businesses are the companies that provide the services of the",
         ),
-        pytest.param(
-            ("google/gemma-3-1b-it", "\n\nIBM's main"),
-            marks=pytest.mark.skip(reason="Gemma3 currently doesn't work with torch.compile"),
+        (
+            "google/gemma-3-1b-it",
+            "\n\nIBM's main businesses are:\n\n*   **Consulting:** Providing",
         ),
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
     from vllm import LLM, SamplingParams
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
     prompt = "What are IBMs main businesses?"
 
