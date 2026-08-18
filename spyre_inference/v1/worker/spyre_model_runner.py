@@ -54,6 +54,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -61,12 +62,14 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
 )
+from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.encoder_buckets import pooling_warmup_shapes
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -76,10 +79,7 @@ from spyre_inference.v1.pool import (
 
 logger = init_logger(__name__)
 
-# Observed Spyre DMA failure threshold for encoder-only dummy batches with
-# multiple sequences.  Pooling warmup stays below this limit.
-SPYRE_ENCODER_DMA_TOKEN_LIMIT = 30
-# Token count for pooling warmup (single sequence), kept under the DMA limit.
+# Eager pooling dummy stays tiny (compile is a no-op; avoids a large DMA).
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
 
 
@@ -478,27 +478,30 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     def warming_up_model(self) -> None:
-        """Run a dummy forward pass to warm up kernels and optional compile.
+        """Warm kernels / compile.
 
-        In eager mode, pooling models cap token count
-        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1`` to
-        stay under the Spyre DMA limit for encoder dummy batches. Compiled
-        mode uses the normal warmup size so shapes match torch.compile.
+        Eager pooling: one short dummy (DMA-safe; compile is off).
+        Compiled pooling: dummy each encoder bucket ``(B, L)`` with
+        ``force_attention=True`` so pack/SDPA is in the graph. Upstream
+        ``_dummy_run`` skips attention metadata unless that flag is set;
+        the encoder impl then no-ops and the first real embed still compiles.
         """
         logger.info("Warming up model...")
         t0 = time.time()
-        num_tokens = min(
-            max(16, self.max_num_reqs),
-            self.scheduler_config.max_num_batched_tokens,
-        )
         with _set_spyre_compilation_settings(self.vllm_config):
-            use_eager_pooling_warmup = (
-                self.model_config.runner_type == "pooling"
-                and self.vllm_config.model_config.enforce_eager
+            is_pooling = self.model_config.runner_type == "pooling"
+            compiled = (
+                not self.vllm_config.model_config.enforce_eager
+                and self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE
             )
-            if use_eager_pooling_warmup:
-                # Match single-sequence embed metadata; cap tokens for DMA.
-                num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
+            if is_pooling and compiled:
+                self._warmup_pooling_bucket_shapes()
+            elif is_pooling:
+                num_tokens = min(
+                    max(16, self.max_num_reqs),
+                    self.scheduler_config.max_num_batched_tokens,
+                    SPYRE_ENCODER_WARMUP_MAX_TOKENS,
+                )
                 saved_max_num_seqs = self.scheduler_config.max_num_seqs
                 try:
                     self.scheduler_config.max_num_seqs = 1
@@ -511,12 +514,54 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 finally:
                     self.scheduler_config.max_num_seqs = saved_max_num_seqs
             else:
+                num_tokens = min(
+                    max(16, self.max_num_reqs),
+                    self.scheduler_config.max_num_batched_tokens,
+                )
                 self._dummy_run(num_tokens)
         logger.info("Warmup done in %.3fs.", time.time() - t0)
 
+    def _warmup_pooling_bucket_shapes(self) -> None:
+        """Dummy each ``(B, L)`` bucket so the first client batch is a cache hit."""
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
+        if not shapes:
+            logger.warning("No pooling warmup shapes; falling back to a single dummy run")
+            self._dummy_run(
+                min(16, self.scheduler_config.max_num_batched_tokens),
+                force_attention=True,
+            )
+            return
+
+        saved_max_num_seqs = self.scheduler_config.max_num_seqs
+        try:
+            for batch_size, prompt_len in shapes:
+                num_tokens = batch_size * prompt_len
+                self.scheduler_config.max_num_seqs = batch_size
+                logger.info(
+                    "Pooling warmup: batch_size=%d prompt_len=%d (%d tokens)",
+                    batch_size,
+                    prompt_len,
+                    num_tokens,
+                )
+                self._dummy_run(num_tokens, force_attention=True)
+        finally:
+            self.scheduler_config.max_num_seqs = saved_max_num_seqs
+
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
-        """Force D2H for warmup: upstream ``hidden_states[logit_indices]`` needs CPU."""
+        """Force D2H during dummy forward (upstream logits index is CPU).
+
+        Pooling must pass ``force_attention=True``. Upstream skips attention
+        metadata unless that flag or a FULL cudagraph is set; encoder impl
+        then does ``if attn_metadata is None: return output`` and never
+        compiles pack/SDPA. Real ``execute_model`` always has metadata.
+        """
+        if self.model_config.runner_type == "pooling":
+            kwargs.setdefault("force_attention", True)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:
@@ -534,8 +579,51 @@ class TorchSpyreModelRunner(GPUModelRunner):
             and hidden_states.device.type != "spyre"
         ):
             hidden_states = convert(hidden_states, self._spyre_device)
-        # Sampler warmup only needs last_hidden_states on CPU.
         return hidden_states, last_hidden_states
+
+    def _dummy_pooler_run_task(
+        self,
+        hidden_states: torch.Tensor,
+        task: PoolingTask,
+    ) -> PoolerOutput:
+        """Same as GPU dummy pooler, but the cursor stays on CPU like ``_pool``."""
+        if not self._pooling_on_spyre:
+            return super()._dummy_pooler_run_task(hidden_states, task)
+
+        num_tokens = hidden_states.shape[0]
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_np = np.full(num_reqs, min_tokens_per_req)
+        num_scheduled_tokens_np[-1] += num_tokens % num_reqs
+        assert np.sum(num_scheduled_tokens_np) == num_tokens
+        assert len(num_scheduled_tokens_np) == num_reqs
+
+        req_num_tokens = num_tokens // num_reqs
+        dummy_prompt_lens = torch.from_numpy(num_scheduled_tokens_np)
+        dummy_token_ids = torch.zeros(
+            (num_reqs, req_num_tokens), dtype=torch.int32, device=self.device
+        )
+
+        model = cast(VllmModelForPooling, self.get_model())
+        dummy_pooling_params = PoolingParams(task=task)
+        dummy_pooling_params.verify(self.model_config)
+        to_update = model.pooler.get_pooling_updates(task)
+        to_update.apply(dummy_pooling_params)
+
+        dummy_metadata = PoolingMetadata(
+            prompt_lens=dummy_prompt_lens,
+            prompt_token_ids=dummy_token_ids,
+            prompt_token_ids_cpu=dummy_token_ids.cpu(),
+            pooling_params=[dummy_pooling_params] * num_reqs,
+            pooling_states=[PoolingStates() for i in range(num_reqs)],
+        )
+        dummy_metadata.build_pooling_cursor(
+            num_scheduled_tokens_np,
+            seq_lens_cpu=dummy_prompt_lens,
+            device=torch.device("cpu"),
+        )
+        return model.pooler(hidden_states=hidden_states, pooling_metadata=dummy_metadata)
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         """Drop token-level tasks on Spyre pooler (slice views are unsafe)."""

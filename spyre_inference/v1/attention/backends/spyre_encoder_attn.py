@@ -31,12 +31,21 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _overwrite,
 )
+from spyre_inference.v1.encoder_buckets import (
+    ENCODER_SEQ_ALIGNMENT,
+    encoder_batch_bucket,
+    encoder_len_bucket,
+)
 
-# Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
-# L-aligned keeps P·V's K stick-aligned; D-aligned keeps QKᵀ's K stick-aligned
-# so Inductor never enters insert_bmm_padding (torch-spyre KeyError: 'val' on
-# FX nodes missing meta["val"] when padding MiniLM's head_size=32).
-ENCODER_SEQ_ALIGNMENT = 64
+
+def _scheduler_max_num_seqs(num_seqs: int) -> int:
+    """Serve ``max_num_seqs`` when a vLLM config is active; else ``num_seqs``."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        return get_current_vllm_config().scheduler_config.max_num_seqs
+    except Exception:
+        return num_seqs
 
 
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
@@ -99,19 +108,22 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         dtype = query_cpu.dtype
 
         max_len = max(query_lens, default=0)
-        aligned_len = (
-            (max_len + ENCODER_SEQ_ALIGNMENT - 1) // ENCODER_SEQ_ALIGNMENT * ENCODER_SEQ_ALIGNMENT
-        )
-        aligned_len = max(aligned_len, ENCODER_SEQ_ALIGNMENT)
+        # Next compile bucket, not just stick-align: 30-token seqs reuse L=64.
+        aligned_len = encoder_len_bucket(max_len)
+        packed_seqs = encoder_batch_bucket(num_seqs, _scheduler_max_num_seqs(num_seqs))
 
-        # Dense padded batch: [num_seqs, H, L_aligned, D_padded]. Zeros stay pad.
-        q_batched = torch.zeros(num_seqs, num_heads, aligned_len, head_size_padded, dtype=dtype)
-        k_batched = torch.zeros(num_seqs, num_kv_heads, aligned_len, head_size_padded, dtype=dtype)
-        v_batched = torch.zeros(num_seqs, num_kv_heads, aligned_len, head_size_padded, dtype=dtype)
+        # Dense padded batch: [B_bucket, H, L_bucket, D_padded]. Extra rows stay 0.
+        q_batched = torch.zeros(packed_seqs, num_heads, aligned_len, head_size_padded, dtype=dtype)
+        k_batched = torch.zeros(
+            packed_seqs, num_kv_heads, aligned_len, head_size_padded, dtype=dtype
+        )
+        v_batched = torch.zeros(
+            packed_seqs, num_kv_heads, aligned_len, head_size_padded, dtype=dtype
+        )
 
         # Additive mask: 0 where a (query, kv) pair may attend, -inf elsewhere.
         neg_inf = torch.finfo(dtype).min
-        mask = torch.full((num_seqs, 1, aligned_len, aligned_len), neg_inf, dtype=dtype)
+        mask = torch.full((packed_seqs, 1, aligned_len, aligned_len), neg_inf, dtype=dtype)
 
         for s in range(num_seqs):
             q_start = q_starts[s]
@@ -139,7 +151,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         v_dev = convert(v_batched, target_device.type)
         mask_dev = convert(mask, target_device.type)
 
-        # Single on-device SDPA: [num_seqs, H, L_aligned, D_padded].
+        # Single on-device SDPA: [B_bucket, H, L_bucket, D_padded].
         attn_out = F.scaled_dot_product_attention(
             q_dev, k_dev, v_dev, attn_mask=mask_dev, **sdpa_kwargs
         )
