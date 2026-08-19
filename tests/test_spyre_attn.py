@@ -22,6 +22,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
@@ -45,6 +46,13 @@ def configure_device(request, monkeypatch):
     if device_mode == "spyre" and not spyre_available():
         pytest.skip("Spyre device not available")
     return device_mode
+
+
+@pytest.fixture()
+def force_compile_attn(request, monkeypatch):
+    """Flip the SPYRE_FORCE_COMPILE_ATTN gate; the env var is only read at import."""
+    monkeypatch.setattr(spyre_attn, "_FORCE_COMPILE_ATTN", request.param)
+    return request.param
 
 
 @pytest.fixture()
@@ -493,6 +501,46 @@ def test_spyre_attn_core(
     configure_device: str,
 ) -> None:
     """Attention correctness across execution modes with representative config."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize("force_compile_attn", [True], indirect=True)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
+        pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
+    ],
+)
+def test_spyre_attn_force_compile_attn_multi_seq(
+    default_vllm_config,
+    force_compile_attn: bool,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """SPYRE_FORCE_COMPILE_ATTN=1 over a multi-sequence batch.
+
+    Sequences past batch slot 0 silently gathered slot 0's KV pages
+    (torch-spyre#3770); only a real batch on device catches it.
+    """
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
