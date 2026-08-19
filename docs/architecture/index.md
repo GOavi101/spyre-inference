@@ -100,12 +100,14 @@ The `SpyreAttentionBackend` implements paged attention using pure PyTorch operat
 online softmax that iterates over pages without any compact-gather step, reading each
 page by indexing the dense tensor with a one-element int32 device tensor (an indirect
 access, so the compiled bundle carries a real index rather than a constant slice) and
-permuting the token-major page to head-major on device before the matmuls:
+permuting the token-major page to head-major on device before the matmuls. The cache is
+allocated with the slot axis outermost in the device layout (`slot_major_kv_layout`) so
+the write can scatter through a slot-major view of it:
 
 | Step | Device | Operation |
 |---|---|---|
-| 1. q/k/v → CPU | CPU | Bring `q`, `k`, `v` to CPU once (Spyre slicing corrupts strided views) |
-| 2. Reshape & cache | Spyre | Overwrite new K/V into the dense paged cache, one write per same-page slot run (token-major pages take the K/V slice as-is, no host transpose) |
+| 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
+| 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
