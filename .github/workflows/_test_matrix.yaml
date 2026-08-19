@@ -7,12 +7,13 @@ name: Test matrix (reusable)
 #
 #   test_each_commit.yaml (push/PR/merge_group): skip_if_no_changes=true, so the
 #     build/test only runs when source files changed. Installs the locked
-#     baseline RPMs (spyre-rpm-install) and runs on the standing image.
+#     baseline RPMs (spyre-rpm-install) on the standing image, so every PR
+#     builds against the pinned spyre-rpms.lock set.
 #
 #   integration-tests.yaml (upstream-dependency dispatch): skip_if_no_changes=
 #     false (always run). May pass runner_label to pick a per-PR image, rpm_*
-#     to layer override RPMs, and torch_spyre_ref to build a specific
-#     torch-spyre from source.
+#     to layer override RPMs, torch_spyre_ref to build a specific torch-spyre
+#     from source, and use_prebaked_image=true to skip the baseline RPM install.
 #
 # Each caller supplies its own fan-in gate job (the required-check name lives in
 # the caller, since a reusable workflow's internal job names do not surface as
@@ -28,6 +29,13 @@ on:
         required: false
         type: boolean
         default: true
+      use_prebaked_image:
+        # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
+        # action). It does not change the override step or any other step.
+        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        required: false
+        type: boolean
+        default: false
       torch_spyre_ref:
         description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
         required: false
@@ -331,9 +339,12 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
         id: spyre-rpms
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
@@ -562,7 +573,11 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
+        if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
