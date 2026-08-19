@@ -29,7 +29,9 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
-pytestmark = pytest.mark.attention
+# extra `encoder_attention` mark so CI can split this into its own job
+# because these tests are pretty slow.
+pytestmark = [pytest.mark.attention, pytest.mark.encoder_attention]
 
 
 @pytest.fixture()

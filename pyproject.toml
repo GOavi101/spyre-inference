@@ -249,7 +249,9 @@ filterwarnings = [
 markers = [
     "distributed: Tests requiring multiple spyre cards",
     "upstream: Tests coming from upstream vLLM",
-    "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job",
+    "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py, tests/test_spyre_encoder_attn.py); slow, runs in its own CI job",
+    "encoder_attention: encoder-attention subset (tests/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
+    "compile: torch.compile end-to-end tests (tests/test_compile.py); slow, runs in its own CI job",
     "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
     "fp8: FP8 quantization tests (tests/test_fp8.py)",
 ]

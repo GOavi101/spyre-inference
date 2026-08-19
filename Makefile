@@ -91,6 +91,9 @@ MARK_EXPR :=
 else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),integration)
+# Single-invocation integration = the union of the CI smoke + compile jobs, so
+# `make tests TEST_TYPE=integration` locally keeps the compile coverage that CI
+# splits into its own job. (compile is not attention-marked, so it stays in.)
 MARK_EXPR := -m "not (distributed or upstream or attention)"
 else ifeq ($(TEST_TYPE),unit)
 MARK_EXPR := -m "not upstream"
@@ -158,11 +161,17 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
 	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
 
-test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention).
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention)' JUNIT_XML=$(JUNIT_XML)
+test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-compile).
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or compile)' JUNIT_XML=$(JUNIT_XML)
 
-test-attention: ## Run the attention-only marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+test-compile: ## Run the torch.compile marker combo (its own job; slow).
+	$(MAKE) run-one MARK_OVERRIDE='compile and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+test-attention: ## Run the decoder-attention marker combo (attention minus the encoder split).
+	$(MAKE) run-one MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
+	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
 test-distributed: ## Run the distributed marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='distributed and not upstream' JUNIT_XML=$(JUNIT_XML)
@@ -177,11 +186,13 @@ test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='upstream and model and not distributed' JUNIT_XML=$(JUNIT_XML)
 
 # Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
-tests-single-card: ## Run the non-distributed marker combos (smoke/attention/upstream/upstream-model). Needs 1 card.
+tests-single-card: ## Run the non-distributed marker combos (smoke/compile/attention/encoder-attention/upstream/upstream-model). Needs 1 card.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	$(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/smoke.xml" || rc=1; \
+	$(MAKE) test-compile JUNIT_XML="$(RESULTS_DIR)/compile.xml" || rc=1; \
 	$(MAKE) test-attention JUNIT_XML="$(RESULTS_DIR)/attention.xml" || rc=1; \
+	$(MAKE) test-encoder-attention JUNIT_XML="$(RESULTS_DIR)/encoder-attention.xml" || rc=1; \
 	$(MAKE) test-upstream JUNIT_XML="$(RESULTS_DIR)/upstream.xml" || rc=1; \
 	$(MAKE) test-upstream-model JUNIT_XML="$(RESULTS_DIR)/upstream-model.xml" || rc=1; \
 	exit $$rc

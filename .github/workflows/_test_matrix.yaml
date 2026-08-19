@@ -171,7 +171,7 @@ jobs:
       matrix:
         include:
           - cfg: Non-distributed spyre tests
-            # Fast per-op unit tests: the smoke set.
+            # Fast per-op unit tests: the smoke set (compile split out below).
             test_types: unit integration regression trunk
             runs_on:
               - x86_64
@@ -180,7 +180,21 @@ jobs:
             image_label: image_torch_spyre
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
+          - cfg: Spyre compile tests
+            # Split out of smoke (it was ~20 min of a ~28 min job). MUST keep
+            # `integration` in this set: the multi-repo integration hook runs
+            # only the integration-tagged configs, so dropping it here would
+            # silently lose the torch.compile end-to-end check that guards
+            # against upstream-runtime regressions.
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-compile
           - cfg: Spyre attention tests
+            # Decoder attention only; the encoder split runs below.
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -188,6 +202,14 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention
+          - cfg: Encoder attention tests
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-encoder-attention
           - cfg: Distributed spyre tests
             test_types: unit regression trunk
             runs_on:
