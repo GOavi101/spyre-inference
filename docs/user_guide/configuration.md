@@ -28,6 +28,22 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Host sampler (async noise + log-space Gumbel)
+
+Spyre replaces vLLM's default host sampler with a Spyre-optimized path
+(ported from [sendnn-inference#1046](https://github.com/torch-spyre/sendnn-inference/pull/1046)):
+
+1. **Async noise ring buffer** — Exp(1) log-noise is filled on a background
+   thread; the decode loop borrows zero-copy rows instead of calling
+   `exponential_()` on the critical path.
+2. **TP rank-0 sampling** — when tensor-parallel and logits are on CPU, only
+   rank 0 samples and broadcasts token ids (and logprobs) to the other ranks.
+3. **Log-space Gumbel** — sample as `argmax(logits - log_noise)` instead of
+   `argmax(probs / noise)`, which removes softmax from the hot path while
+   preserving token order / distribution.
+
+Sampling still runs on the **CPU**; this does not move the sampler onto Spyre.
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:
