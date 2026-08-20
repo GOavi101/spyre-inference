@@ -364,9 +364,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
 
-        # Host sampler: async Exp(1) log-noise ring buffer + log-space Gumbel
-        # (no per-step exponential_/softmax) and TP rank-0 sample + broadcast.
-        # Port of sendnn-inference#1046.
+        # Host sampler (sendnn-inference#1046): async Exp(1) log-noise ring
+        # buffer + log-space Gumbel + TP rank-0 sample/broadcast. Falls back
+        # to upstream Sampler when vllm_config lacks max_num_seqs / vocab.
         if hasattr(self, "sampler"):
             self.sampler = build_spyre_sampler(vllm_config)
             if getattr(self, "rejection_sampler", None) is not None:

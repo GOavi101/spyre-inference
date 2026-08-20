@@ -35,7 +35,6 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         vocab_size: int,
         max_batch_size: int,
         logprobs_mode: LogprobsMode = "raw_logprobs",
-        noise_scale: int = 4,
     ):
         """Initialize the SpyreTopKTopPSampler with a asynchronous exponential
         noise ring buffer.
@@ -46,18 +45,16 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             max_batch_size: The maximum batch size that will be processed.
                 Determines the total capacity of the pre-allocated noise buffer.
             logprobs_mode: See vllm.v1.sample.ops.topk_topp_sampler for details.
-            noise_scale: Ring-buffer depth multiplier (``rows = scale * max_batch_size``).
-                Must be >= 2. Typically from ``envs.SPYRE_ASYNC_NOISE_SCALE``.
         """
         super().__init__(logprobs_mode=logprobs_mode)
 
         self._noise_buffer = AsyncExponential_RingBuffer(
             vocab_size=vocab_size,
             max_batch_size=max_batch_size,
-            scale=noise_scale,
         )
         # Always use the native path (async log-noise Gumbel); do not dispatch
-        # to CUDA/flashinfer variants from the base class.
+        # to CUDA/flashinfer variants from the base class. (spyre-inference
+        # adaptation; sendnn relies on the CPU dispatch in TopKTopPSampler.)
         self.forward = self.forward_native
 
     def forward_native(

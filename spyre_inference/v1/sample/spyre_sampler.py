@@ -21,7 +21,6 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-import spyre_inference.envs as envs
 from spyre_inference.v1.sample.spyre_topk_topp_sampler import SpyreTopKTopPSampler
 
 
@@ -35,7 +34,6 @@ class SpyreSampler(Sampler):
         vllm_config: VllmConfig,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
-        noise_scale: int | None = None,
     ):
         """Initialize the SpyreSampler with Spyre-optimized sampling components.
 
@@ -52,8 +50,6 @@ class SpyreSampler(Sampler):
             use_fp64_gumbel: See vllm.v1.sample.sampler.Sampler for details.
                 This parameter is not supported by SpyreSampler.
                 Defaults to False.
-            noise_scale: Async ring-buffer depth multiplier. ``None`` reads
-                ``envs.SPYRE_ASYNC_NOISE_SCALE`` (default 4).
 
         Raises:
             ValueError: If use_fp64_gumbel is True, as SpyreSampler does
@@ -64,7 +60,8 @@ class SpyreSampler(Sampler):
         if use_fp64_gumbel:
             raise ValueError("SpyreSampler does not support use_fp64_gumbel=True")
 
-        # Current vLLM Sampler only takes logprobs_mode (no use_fp64_gumbel).
+        # Current spyre-inference vLLM Sampler only takes logprobs_mode
+        # (sendnn passes use_fp64_gumbel=False as well).
         super().__init__(logprobs_mode=logprobs_mode)
 
         # read concurrency and vocab size from vllm_config
@@ -75,15 +72,11 @@ class SpyreSampler(Sampler):
         if vocab_size is None:
             raise ValueError("SpyreSampler requires vllm_config to specify vocab_size")
 
-        if noise_scale is None:
-            noise_scale = envs.SPYRE_ASYNC_NOISE_SCALE
-
         # override topk_topp_sampler with spyre-specific topk-topp-sampler
         self.topk_topp_sampler: SpyreTopKTopPSampler = SpyreTopKTopPSampler(
             max_batch_size=max_concurrency,
             vocab_size=vocab_size,
             logprobs_mode=logprobs_mode,
-            noise_scale=noise_scale,
         )
 
     @staticmethod
@@ -111,26 +104,15 @@ class SpyreSampler(Sampler):
         Returns:
             The vocab_size value if present, otherwise None.
         """
-        model_config = getattr(vllm_config, "model_config", None)
-        if model_config is None:
-            return None
-        get_vocab = getattr(model_config, "get_vocab_size", None)
-        if callable(get_vocab):
-            try:
-                return int(get_vocab())
-            except Exception:
-                pass
-        hf_cfg = getattr(model_config, "hf_config", None)
-        if hf_cfg is None:
-            return None
-        if hasattr(hf_cfg, "vocab_size"):
-            # convention: HuggingFace model configs have a vocab_size attribute
-            return hf_cfg.vocab_size
-        text_config = getattr(hf_cfg, "text_config", None)
-        if text_config is not None and hasattr(text_config, "vocab_size"):
-            # fallback: some multi-modal HuggingFace model configs have a
-            # text_config with a vocab_size attribute
-            return text_config.vocab_size
+        if hasattr(vllm_config, "model_config") and hasattr(vllm_config.model_config, "hf_config"):
+            hf_cfg = vllm_config.model_config.hf_config
+            if hasattr(hf_cfg, "vocab_size"):
+                # convention: HuggingFace model configs have a vocab_size attribute
+                return hf_cfg.vocab_size
+            elif hasattr(hf_cfg, "text_config") and hasattr(hf_cfg.text_config, "vocab_size"):
+                # fallback: some multi-modal HuggingFace model configs have a text_config
+                # with a vocab_size attribute
+                return hf_cfg.text_config.vocab_size
         return None
 
     def forward(
