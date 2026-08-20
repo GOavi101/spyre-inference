@@ -21,6 +21,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+import spyre_inference.envs as envs
 from spyre_inference.v1.sample.spyre_topk_topp_sampler import SpyreTopKTopPSampler
 
 
@@ -34,6 +35,7 @@ class SpyreSampler(Sampler):
         vllm_config: VllmConfig,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
+        noise_scale: int | None = None,
     ):
         """Initialize the SpyreSampler with Spyre-optimized sampling components.
 
@@ -50,6 +52,8 @@ class SpyreSampler(Sampler):
             use_fp64_gumbel: See vllm.v1.sample.sampler.Sampler for details.
                 This parameter is not supported by SpyreSampler.
                 Defaults to False.
+            noise_scale: Async ring-buffer depth multiplier. ``None`` reads
+                ``envs.SPYRE_ASYNC_NOISE_SCALE`` (default 4).
 
         Raises:
             ValueError: If use_fp64_gumbel is True, as SpyreSampler does
@@ -71,11 +75,15 @@ class SpyreSampler(Sampler):
         if vocab_size is None:
             raise ValueError("SpyreSampler requires vllm_config to specify vocab_size")
 
+        if noise_scale is None:
+            noise_scale = envs.SPYRE_ASYNC_NOISE_SCALE
+
         # override topk_topp_sampler with spyre-specific topk-topp-sampler
         self.topk_topp_sampler: SpyreTopKTopPSampler = SpyreTopKTopPSampler(
             max_batch_size=max_concurrency,
             vocab_size=vocab_size,
             logprobs_mode=logprobs_mode,
+            noise_scale=noise_scale,
         )
 
     @staticmethod

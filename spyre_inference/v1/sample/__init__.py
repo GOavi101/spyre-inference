@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host sampler path for Spyre (async noise ring buffer + log-space Gumbel)."""
+"""Host sampler path for Spyre (async noise ring buffer + log-space Gumbel).
+
+Ring-buffer depth is controlled by ``envs.SPYRE_ASYNC_NOISE_SCALE``.
+"""
 
 from __future__ import annotations
 

@@ -31,7 +31,10 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 ## Host sampler (async noise + log-space Gumbel)
 
 Spyre replaces vLLM's default host sampler with a Spyre-optimized path
-(ported from [sendnn-inference#1046](https://github.com/torch-spyre/sendnn-inference/pull/1046)):
+(ported from [sendnn-inference#1046](https://github.com/torch-spyre/sendnn-inference/pull/1046)).
+This supersedes the earlier static Exp(1) noise-pool stopgap: noise is still
+precomputed on the host, but via an async ring buffer that refills in the
+background instead of a one-shot flat pool.
 
 1. **Async noise ring buffer** — Exp(1) log-noise is filled on a background
    thread; the decode loop borrows zero-copy rows instead of calling
@@ -43,6 +46,19 @@ Spyre replaces vLLM's default host sampler with a Spyre-optimized path
    preserving token order / distribution.
 
 Sampling still runs on the **CPU**; this does not move the sampler onto Spyre.
+Use the Spyre / Kineto profiler for sampler latency — do not inject timing into
+the production sample path.
+
+Knobs live in `spyre_inference/envs.py` (vLLM-style lazy env module):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPYRE_ASYNC_NOISE_SCALE` | `4` | Ring depth = scale × `max_num_seqs` (must be ≥ 2) |
+
+```bash
+SPYRE_ASYNC_NOISE_SCALE=8 \
+  python examples/offline_inference/torch_spyre_inference.py
+```
 
 ## pyproject.toml Reference
 
