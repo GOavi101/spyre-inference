@@ -24,7 +24,7 @@ import torch
 
 from spyre_inference.custom_ops.utils import convert
 
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backend import (
@@ -61,12 +61,6 @@ def _record_function(name: str):
 
     return decorator
 
-
-# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
-# regardless of the vLLM compilation config. Used to evaluate the compiled path
-# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
-# Default: off (unset or "0").
-_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
@@ -140,13 +134,11 @@ def _overwrite(
     sliced_t.copy_(input)
 
 
-def _maybe_compile(fn):
-    """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
-
-    Used only for the online-softmax attention kernel; the reshape/cache
-    kernel is compiled unconditionally instead (see _reshape_and_cache).
+def _maybe_compile(fn, compile_enabled: bool):
+    """Compile `fn` when enabled. Attention compiles separately from the model's
+    fullgraph capture, which can't hold its per-sequence Python loop.
     """
-    if _FORCE_COMPILE_ATTN:
+    if compile_enabled:
         return torch.compile(fn, dynamic=False)
     return fn
 
@@ -831,6 +823,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
+        # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
+        # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
+        # treat as compiled. The platform resolves compiled runs to STOCK.
+        _mode = get_current_vllm_config().compilation_config.mode
+        self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
+
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
@@ -874,7 +872,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     padded_query_len,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
-                )
+                ),
+                self._compile_attn,
             )
         return self._attn_fns[key]
 
