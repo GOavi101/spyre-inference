@@ -16,6 +16,9 @@
 
 Port of sendnn-inference#1046 (Holtz): async Exp(1) log-noise, TP rank-0
 sample + broadcast, and log-space Gumbel.
+
+Config levers live in ``spyre_inference.envs`` (``SPYRE_USE_SPYRE_SAMPLER``,
+``SPYRE_ASYNC_NOISE_SCALE``).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import warnings
 from vllm.config import VllmConfig
 from vllm.v1.sample.sampler import Sampler
 
+import spyre_inference.envs as envs
 from spyre_inference.v1.sample.async_ring_buffer import (
     AsyncExponential_RingBuffer,
     AsyncRingBuffer,
@@ -36,10 +40,12 @@ from spyre_inference.v1.sample.spyre_topk_topp_sampler import SpyreTopKTopPSampl
 def build_spyre_sampler(vllm_config: VllmConfig) -> Sampler:
     """Build Holtz SpyreSampler, or fall back to upstream Sampler.
 
-    Mirrors sendnn ``SpyreCausalLM`` wiring: if ``vllm_config`` lacks
-    ``max_num_seqs`` / vocab size, warn and use the default Sampler.
+    Falls back when ``SPYRE_USE_SPYRE_SAMPLER=0`` or when ``vllm_config`` lacks
+    ``max_num_seqs`` / vocab size (same as sendnn ``SpyreCausalLM``).
     """
     logprobs_mode = vllm_config.model_config.logprobs_mode
+    if not envs.SPYRE_USE_SPYRE_SAMPLER:
+        return Sampler(logprobs_mode=logprobs_mode)
     if not SpyreSampler.is_vllm_config_compatible(vllm_config):
         warnings.warn(
             "The provided vllm_config is not compatible with SpyreSampler. "

@@ -46,6 +46,26 @@ ported from [sendnn-inference#1046](https://github.com/torch-spyre/sendnn-infere
 If `vllm_config` lacks `max_num_seqs` or vocab size, the runner falls back to
 vLLM's default `Sampler` (same as sendnn). Sampling still runs on the **CPU**.
 
+### Configuration (`spyre_inference.envs`)
+
+All host-sampler knobs live in `spyre_inference/envs.py` (vLLM-style lazy
+module with defaults, docs, optional `enable_envs_cache()`, and `is_set()` for
+override detection). Prefer `import spyre_inference.envs as envs` over
+scattered `os.environ.get` calls.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPYRE_USE_SPYRE_SAMPLER` | `1` | Set to `0` to force upstream `Sampler` |
+| `SPYRE_ASYNC_NOISE_SCALE` | `4` | Ring depth = scale × `max_num_seqs` (must be ≥ 2) |
+
+Do **not** inject sampler timing into the production path. Measure with the
+[Kineto / Spyre profiler](kineto_profiling.md) instead.
+
+```bash
+SPYRE_ASYNC_NOISE_SCALE=8 \
+  python examples/offline_inference/torch_spyre_inference.py
+```
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:
