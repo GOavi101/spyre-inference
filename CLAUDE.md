@@ -67,6 +67,10 @@ For questions about Spyre architecture, the PyTorch/vLLM stack, or hardware inte
 - **Prefer simplicity** and match existing patterns/architecture when uncertain.
 - Assume general vLLM familiarity in the reader.
 
+## Opening a PR
+
+Always use the `prepare-pull-request` skill to clean up the current branch and open a pull request.
+
 ## DCO (Developer Certificate of Origin)
 
 All commits must include a `Signed-off-by` line. Use the `-s` flag or append manually:
