@@ -49,7 +49,6 @@ from torch.utils._pytree import tree_map
 import numpy as np
 
 from vllm.config import VllmConfig, CompilationMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
@@ -65,7 +64,6 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -226,13 +224,10 @@ class _SpyreModelWrapper:
         Convert them to int64 and provide them to the model.
 
     Output conversion (Spyre → CPU):
-        Generative: D2H for logits/sampling. Pooling: keep on Spyre
-        (``keep_outputs_on_device``); ``_pool`` D2Hs pooled vectors only.
-
-    RoPE priming (per forward pass):
-        Gather each RoPE module's per-token rotation slice on the host (no D2H)
-        and stash it in the forward context; forward_oot reads it back, shared
-        across all attention layers.
+        The model's final hidden_states come out on Spyre. Downstream
+        operations (indexing via logits_indices, sampling) run on CPU.
+        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
+        which handles H2D/D2H for the sample_hidden_states subset.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -243,19 +238,14 @@ class _SpyreModelWrapper:
         self,
         model: nn.Module,
         spyre_device: torch.device,
-        rope_modules: list[_SpyreRotaryMixin] | None = None,
         keep_outputs_on_device: bool = False,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
-        object.__setattr__(self, "_rope_modules", rope_modules or [])
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
 
     def __call__(self, *args, **kwargs):
-        # Prime RoPE while positions are still on the host (no D2H).
-        self._prime_rope_rotation(kwargs.get("positions"))
-
         # Convert integer tensor inputs to Spyre int64
         def _convert_int(t):
             if (
@@ -291,23 +281,6 @@ class _SpyreModelWrapper:
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
-
-    def _prime_rope_rotation(self, positions: torch.Tensor | None) -> None:
-        """Pre-gather each RoPE module's per-token rotation slice into the forward
-        context. Modules with no Spyre path return None from gather_rotation."""
-        if positions is None or not self._rope_modules or not is_forward_context_available():
-            return
-        # vLLM's positions buffer is int64; downcast on the host (free, and positions are
-        # always < max_model_len) so the on-device gather uses int32 indices directly and
-        # skips torch-spyre's internal int64 downcast.
-        positions = positions.to(torch.int32)
-        rope_rot = {}
-        for rope in self._rope_modules:
-            rot = rope.gather_rotation(positions, self._spyre_device)
-            if rot is not None:
-                rope_rot[rope._rope_key] = rot
-        if rope_rot:
-            get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -442,10 +415,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
-        # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
-        # a shared instance by identity).
-        rope_modules = [m for m in self.model.modules() if isinstance(m, _SpyreRotaryMixin)]
-
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
@@ -453,7 +422,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model = _SpyreModelWrapper(
             self.model,
             self._spyre_device,
-            rope_modules,
             keep_outputs_on_device=self._pooling_on_spyre,
         )
 

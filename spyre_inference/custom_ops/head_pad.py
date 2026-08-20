@@ -312,7 +312,9 @@ def fix_padded_rope(model, hf_config) -> None:
     seen: set[int] = set()
     n = 0
     for module in model.modules():
-        if not hasattr(module, "_rope_key") or id(module) in seen:
+        # Duck-type on an attribute only _SpyreRotaryMixin sets, not isinstance: keeps
+        # `module` typed as nn.Module so the RotaryEmbedding attribute reads below type-check.
+        if not hasattr(module, "_rotation_cache") or id(module) in seen:
             continue
         seen.add(id(module))
         ref = get_rope(
