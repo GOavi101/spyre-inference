@@ -455,3 +455,38 @@ def test_enforce_eager_is_the_only_eager_switch():
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
     assert vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+
+
+def test_raise_dynamo_recompile_limits_survives_a_clobber():
+    """torch_spyre's autoload lowers cache_size_limit to 1024; re-asserting must win."""
+    import torch._dynamo
+
+    from spyre_inference.platform import _raise_dynamo_recompile_limits
+
+    saved = (
+        torch._dynamo.config.cache_size_limit,
+        torch._dynamo.config.accumulated_recompile_limit,
+    )
+    try:
+        torch._dynamo.config.cache_size_limit = 1024
+        torch._dynamo.config.accumulated_recompile_limit = 256
+
+        _raise_dynamo_recompile_limits()
+
+        assert torch._dynamo.config.cache_size_limit == 100000
+        assert torch._dynamo.config.accumulated_recompile_limit == 100000
+    finally:
+        (
+            torch._dynamo.config.cache_size_limit,
+            torch._dynamo.config.accumulated_recompile_limit,
+        ) = saved
+
+
+def test_worker_reasserts_recompile_limits_after_autoload():
+    """The re-assert must come *after* torch_spyre._autoload(), or it is undone."""
+    import inspect
+
+    from spyre_inference.v1.worker import spyre_worker
+
+    src = inspect.getsource(spyre_worker.TorchSpyreWorker.init_device)
+    assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")

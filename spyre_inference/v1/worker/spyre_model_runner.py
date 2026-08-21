@@ -38,6 +38,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 from typing import cast
@@ -53,6 +54,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -84,7 +86,6 @@ logger = init_logger(__name__)
 
 # Eager pooling warmup: one short sequence so the dummy stays compile-cheap.
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
-
 
 # Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
 # (unavailable with VLLM_TARGET_DEVICE=empty).
@@ -213,6 +214,52 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
         # If the copy_to_cpu also becomes required, override it here with
         # spyre-specific aspects.
         raise NotImplementedError("SpyreCpuGpuBuffer.copy_to_cpu is not implemented")
+
+
+SPYRE_COMPILE_GRANULARITIES = ("block", "model")
+
+
+def _compile_granularity() -> str:
+    granularity = os.environ.get("SPYRE_COMPILE_GRANULARITY") or "block"
+    if granularity not in SPYRE_COMPILE_GRANULARITIES:
+        raise ValueError(
+            f"Unsupported SPYRE_COMPILE_GRANULARITY={granularity!r}. "
+            f"Expected one of {SPYRE_COMPILE_GRANULARITIES}."
+        )
+    return granularity
+
+
+def _block_sharing_defeated_by() -> str | None:
+    """Sharing needs vLLM to hoist layer names out of the graph; report when it cannot."""
+    try:
+        from vllm.utils.torch_utils import _USE_LAYERNAME
+    except ImportError:
+        return None
+    if not _USE_LAYERNAME:
+        return (
+            "vLLM is not hoisting per-layer attention names (needs torch >= 2.11 and "
+            "VLLM_USE_LAYERNAME=1), so each block compiles separately"
+        )
+    return None
+
+
+def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
+    block_lists = []
+    for module in model.modules():
+        if not isinstance(module, nn.ModuleList):
+            continue
+        blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
+        if not blocks:
+            continue
+        # nn.Module.modules() yields the module itself, so a list of bare Attention
+        # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
+        if any(isinstance(b, Attention) for b in blocks):
+            continue
+        # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
+        # each class shares a forward code object, so compiles scale per class, not depth.
+        if any(isinstance(m, Attention) for b in blocks for m in b.modules()):
+            block_lists.append(module)
+    return block_lists
 
 
 class _SpyreModelWrapper:
@@ -426,15 +473,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     def _compile_for_spyre(self) -> None:
-        """Apply torch.compile for Spyre with static shapes.
+        """Install torch.compile wrappers; tracing happens on the first forward.
 
-        Spyre requires static shapes — dynamic shapes (SymInt) are not yet supported.
-        We therefore pass `dynamic=False` to torch.compile(...).
-
-        Supported modes:
-
-        - CompilationMode.NONE: eager execution
-        - CompilationMode.STOCK_TORCH_COMPILE: whole-model torch.compile
+        `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
         """
         mode = self.compilation_config.mode
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
@@ -444,24 +485,62 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 f"are supported."
             )
 
+        # Validated before the eager short-circuit so a typo is not silently ignored.
+        # Per-block is the default: identical blocks share a ``forward`` code object,
+        # so the backend compiles one block rather than a program that grows with depth.
+        granularity = _compile_granularity()
+
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        # Trigger whole-model compile:
-        # a single fullgraph over the entire model using dynamic=False.
-        t0 = time.time()
+        model_name = type(self.model).__name__
+
+        if granularity == "block":
+            defeated_by = _block_sharing_defeated_by()
+            if defeated_by:
+                logger.warning(
+                    "SPYRE_COMPILE_GRANULARITY=block will not share one artifact across "
+                    "blocks: %s. Expect compile time to grow with layer count; "
+                    "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
+                    defeated_by,
+                )
+            num_blocks = self._compile_blocks()
+            if num_blocks:
+                logger.info(
+                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre. "
+                    "Embeddings and the final norm stay eager.",
+                    num_blocks,
+                    model_name,
+                )
+                return
+            logger.warning(
+                "Found no attention-bearing block ModuleList in %s; falling back to a "
+                "whole-model graph. Models whose attention is not a vLLM Attention "
+                "(MLA, encoder-only vision towers) take this path.",
+                model_name,
+            )
+
         self.model = torch.compile(
             self.model,
             backend="inductor",
             fullgraph=True,
             dynamic=False,
         )
-        logger.info(
-            "Compiled model %s as a single graph for Spyre in %.3fs.",
-            type(self.get_model()).__name__,
-            time.time() - t0,
-        )
+        logger.info("Wrapped %s as a single graph for Spyre.", model_name)
+
+    def _compile_blocks(self) -> int:
+        num_blocks = 0
+        for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
+            for block in blocks:
+                if isinstance(block, PPMissingLayer):
+                    continue
+                # In place: rebinding blocks[i] to the returned OptimizedModule reparents
+                # the block under `_orig_mod`, renaming every parameter and breaking
+                # reload_weights and save_sharded_state.
+                block.compile(backend="inductor", fullgraph=True, dynamic=False)
+                num_blocks += 1
+        return num_blocks
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.
@@ -764,6 +843,14 @@ def _set_spyre_compilation_settings(config: VllmConfig):
     freezing_value = torch_inductor_config.freezing
     try:
         if inductor_config.get("max_autotune", False):
+            # Freezing folds per-block weights into each block's graph, defeating
+            # artifact sharing. Warn rather than override an explicit max_autotune.
+            if _compile_granularity() == "block" and not config.model_config.enforce_eager:
+                logger.warning(
+                    "max_autotune enables Inductor freezing, which folds per-block "
+                    "weights into each block's graph and defeats per-block artifact "
+                    "sharing. Compile time will grow with layer count."
+                )
             torch_inductor_config.freezing = True
         yield
     finally:

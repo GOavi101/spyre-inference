@@ -91,6 +91,45 @@ so that pass is gone. The remaining slicing constraint is narrower than it was a
 in the attention backend, where offset > 0 views still corrupt on transfer (see
 [Attention Backend](#attention-backend)).
 
+## Compilation Granularity
+
+Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
+the model's block `ModuleList` in place via `block.compile(backend="inductor",
+fullgraph=True, dynamic=False)`. In place matters: rebinding the list entry to the
+`OptimizedModule` that `torch.compile` returns would re-parent the block under an
+`_orig_mod` child and rename every parameter, breaking weight save/reload.
+
+Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entries own an
+`Attention` somewhere, and are not themselves `Attention` layers — so decoder stacks
+(`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as are
+hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
+`Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack.
+Models whose attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi), vision-tower
+attention — match nothing and fall back to a whole-model graph.
+
+Blocks of one class share one `forward` code object, so Dynamo traces the first and the
+rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
+backend compile count is independent of depth, but it is not 1: layer 0 specializes
+separately because `residual is None` there, so a Llama-shaped stack yields two
+artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
+and full attention, giving four. A fresh `num_tokens` tier then costs one block recompile
+rather than a whole-model one. Note that `num_tokens` is the block graph's *only* shape
+dependence: kv-cache length and the `KV_LENGTH_ALIGNMENT` tiers live inside
+`unified_attention_with_output`, which is opaque to this graph and compiles its own
+kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)).
+
+Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
+which needs torch >= 2.11 and `VLLM_USE_LAYERNAME=1`. Without it each block bakes in its
+own layer name and compiles separately, which is worse than the whole-model graph; the
+runner logs a warning when it detects this. Inductor freezing (enabled by `max_autotune`)
+defeats sharing the same way, by folding each block's weights into its own graph.
+
+Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
+never in the compiled region; `compute_logits` is a separate call on the wrapper.
+
+`SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
+grows with layer count.
+
 ## Attention Backend
 
 The `SpyreAttentionBackend` implements paged attention using pure PyTorch operations
