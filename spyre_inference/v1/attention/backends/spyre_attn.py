@@ -334,6 +334,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
 
+    # Device mirror of attention_mask_tiles, filled once per step by forward().
+    attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+
     @property
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
@@ -914,6 +917,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.slot_mapping_device = convert(
                 attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
             )
+        if attn_metadata.attention_mask_tiles_device is None:
+            tiles_cpu = attn_metadata.attention_mask_tiles
+            assert tiles_cpu is not None, (
+                "attention_mask_tiles must be precomputed by the metadata builder"
+            )
+            attn_metadata.attention_mask_tiles_device = [
+                [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
+            ]
 
         # Step 1: Reshape and cache — scatter new tokens into their slots
         self._reshape_and_cache(
@@ -996,12 +1007,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_seqs = attn_metadata.num_seqs
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
-        mask_tiles_all = attn_metadata.attention_mask_tiles
+        mask_tiles_all = attn_metadata.attention_mask_tiles_device
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
         assert mask_tiles_all is not None, (
-            "attention_mask_tiles must be precomputed by the metadata builder"
+            "attention_mask_tiles_device must be mirrored by forward()"
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
@@ -1069,10 +1080,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             page_index_table = page_index_tables[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
-            mask_tiles = [
-                convert(mask_tiles_all[seq_idx][i], device=_target_device)
-                for i in range(len(active_bs))
-            ]
+            mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
