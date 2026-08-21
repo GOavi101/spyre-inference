@@ -424,6 +424,11 @@ jobs:
           HF_HUB_OFFLINE: '0'
         run: uv run .github/cache_config/manage_cache.py --public
 
+      - name: Use a job-scoped torch inductor compile cache dir
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
+        run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ strategy.job-index }}-${{ github.run_id }}" >> "$GITHUB_ENV"
+
       - name: Run tests
         if: ${{ steps.gate.outputs.run == 'true' }}
         # Marker expression and coverage wiring both live in the Makefile
@@ -608,7 +613,7 @@ jobs:
           # Echo the exact runner-label selectors this job's runs-on used
           # (mirrors the perf runs-on expression: the fixed pool labels plus
           # the per-PR runner_label override, or the standing image label).
-          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
+          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
 
       - name: Build spyre-inference
         env:
