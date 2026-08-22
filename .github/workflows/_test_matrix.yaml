@@ -391,8 +391,9 @@ jobs:
         run: |
           find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
 
+      # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
       - name: Build spyre-inference
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
         run: |
@@ -411,6 +412,15 @@ jobs:
           # Print the resolved torch install for log visibility.
           uv pip show torch
           uv pip freeze
+
+      # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
+      - name: Activate the freshly-built venv
+        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
+        # Ephemeral -dev-image runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv (an ancestor of the checkout); repoint AND remove it so `uv run --active` (Makefile:153) can't find or use anything but the venv just built here.
+        run: |
+          rm -rf /home/senuser/.venv
+          echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
 
       # Slim the cache for setup-uv's post-job save without discarding the
       # compiled torch-spyre/vllm wheels. Must run after the build's uv sync.
