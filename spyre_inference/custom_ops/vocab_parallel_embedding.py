@@ -27,7 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert
+from .utils import convert, place_row_gathered
 
 logger = init_logger(__name__)
 
@@ -43,6 +43,16 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+
+    def _apply(self, fn, recurse=True):
+        weight = self._parameters.get("weight")
+
+        def place(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor is weight:
+                return place_row_gathered(tensor.data, fn, "vocab table")
+            return fn(tensor)
+
+        return super()._apply(place, recurse)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
