@@ -1108,11 +1108,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
 
             assert result.dtype == output.dtype
-            if query_len < aligned_max_query_len:
-                # Writing a prefix view copies its whole extent and overruns the
-                # destination (torch-spyre#3826), so copy it first.
-                output[q_start:q_end] = result[:query_len].clone()
-            else:
-                output[q_start:q_end] = result
+            output[q_start:q_end] = result[:query_len]
 
         return output
