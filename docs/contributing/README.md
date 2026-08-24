@@ -67,7 +67,7 @@ pytest -m "attention"
 
 #### Upstream Test Integration
 
-Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor` set automatically. See `tests/plugin/spyre_testing_plugin/pytest_plugin.py` for implementation details.
+Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference,spyre_inference_ops` set automatically. See `tests/plugin/spyre_testing_plugin/pytest_plugin.py` for implementation details.
 
 !!! tip
     To force a re-clone, remove `~/.cache/vllm-upstream-tests`.
