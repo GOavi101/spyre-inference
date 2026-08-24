@@ -55,8 +55,11 @@ class AsyncRingBuffer(ABC):
         self._B = max_batch_size
         self._S = scale * max_batch_size
 
-        # buffer allocation
-        self._buf = torch.empty(self._S, self._V, dtype=torch.float32)
+        # Host-side noise only. Pin CPU explicitly: under the Spyre plugin the
+        # process default device may be Spyre, and refill from the background
+        # thread then hangs (Spyre runtime is not safe for this path), which
+        # deadlocks borrow_rows after the first wrap.
+        self._buf = torch.empty(self._S, self._V, dtype=torch.float32, device="cpu")
 
         # first-time buffer initialization
         self._refill_slice(0, self._S)
