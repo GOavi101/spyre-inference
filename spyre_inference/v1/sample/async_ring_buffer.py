@@ -18,13 +18,14 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 
+import numpy as np
 import torch
 
 
 class AsyncRingBuffer(ABC):
     """Pre-generates data rows on a background thread via a ring buffer.
 
-    Maintains a contiguous ``(S, V)`` tensor (``S = scale * max_batch_size``)
+    Maintains a contiguous ``(S, V)`` buffer (``S = scale * max_batch_size``)
     and two shared counters:
 
     * ``_read_pos`` — next row index the consumer will read from.
@@ -35,6 +36,11 @@ class AsyncRingBuffer(ABC):
     advances ``_read_pos`` after each call; when it approaches the end of the
     buffer it wraps back to 0.  Each consumed segment is enqueued for the
     background thread to refill, which increments ``_tail`` once done.
+
+    Storage is a NumPy array shared with a Torch CPU view.  The producer
+    thread must not call Torch ops: under the Spyre plugin, background-thread
+    Torch tensor mutations can abort the producer, which then deadlocks
+    ``borrow_rows`` after the first wrap.
 
     Args:
         vocab_size: Number of columns ``V``.
@@ -55,11 +61,12 @@ class AsyncRingBuffer(ABC):
         self._B = max_batch_size
         self._S = scale * max_batch_size
 
-        # Host-side noise only. Pin CPU explicitly: under the Spyre plugin the
-        # process default device may be Spyre, and refill from the background
-        # thread then hangs (Spyre runtime is not safe for this path), which
-        # deadlocks borrow_rows after the first wrap.
-        self._buf = torch.empty(self._S, self._V, dtype=torch.float32, device="cpu")
+        # NumPy backing store; Torch view shares the same memory for zero-copy
+        # borrows. Producer refills via NumPy only (see class docstring).
+        self._np = np.empty((self._S, self._V), dtype=np.float32)
+        self._buf = torch.from_numpy(self._np)
+
+        self._error: BaseException | None = None
 
         # first-time buffer initialization
         self._refill_slice(0, self._S)
@@ -72,17 +79,28 @@ class AsyncRingBuffer(ABC):
         # Refill requests: (start, end, wrap)
         self._refill_q: queue.Queue[tuple[int, int, bool] | None] = queue.Queue()
 
-        self._thread = threading.Thread(target=self._produce, daemon=True)
+        self._thread = threading.Thread(
+            target=self._produce,
+            name="async-ring-buffer",
+            daemon=True,
+        )
         self._thread.start()
 
     @abstractmethod
     def _refill_slice(self, start: int, end: int) -> None:
-        """Fill ``self._buf[start:end]`` with fresh values in-place."""
+        """Fill ``self._np[start:end]`` with fresh values in-place (NumPy only)."""
         ...
 
     @property
     def vocab_size(self) -> int:
         return self._V
+
+    def _raise_if_producer_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("async ring buffer producer failed") from self._error
+        if not self._thread.is_alive() and self._error is None:
+            # Thread exited without recording an error (e.g. unexpected break).
+            raise RuntimeError("async ring buffer producer thread is not alive")
 
     @contextlib.contextmanager
     def borrow_rows(self, n: int) -> Generator[torch.Tensor, None, None]:
@@ -109,11 +127,14 @@ class AsyncRingBuffer(ABC):
         start = self._read_pos
         end = start + n
 
-        # wait for the consumer to fill up at least n many values ahead
+        # wait for the producer to fill up at least n many values ahead
         with self._cond:
-            self._cond.wait_for(lambda: self._tail >= end)
+            while self._tail < end:
+                self._raise_if_producer_failed()
+                self._cond.wait(timeout=1.0)
+            self._raise_if_producer_failed()
 
-        # get view (zero-copy)
+        # get view (zero-copy into the shared Torch/NumPy buffer)
         view = self._buf[start:end]
 
         wrap: bool = end > self._S - self._B
@@ -133,21 +154,27 @@ class AsyncRingBuffer(ABC):
             self._refill_q.put((start, end, wrap))
 
     def _produce(self) -> None:
-        while True:
-            req = self._refill_q.get()
+        try:
+            while True:
+                req = self._refill_q.get()
 
-            # handle termination signal
-            if req is None:
-                break
+                # handle termination signal
+                if req is None:
+                    break
 
-            # refill buffer
-            start, end, wrap = req
-            self._refill_slice(start, end)
+                # refill buffer (NumPy only — see class docstring)
+                start, end, wrap = req
+                self._refill_slice(start, end)
 
-            increment = (self._S - start) if wrap else (end - start)
+                increment = (self._S - start) if wrap else (end - start)
+                with self._cond:
+                    self._tail += increment
+                    self._cond.notify_all()
+        except BaseException as exc:
+            self._error = exc
             with self._cond:
-                self._tail += increment
                 self._cond.notify_all()
+            raise
 
     def shutdown(self) -> None:
         """Signal the background thread to stop and wait for it to exit."""
@@ -156,10 +183,14 @@ class AsyncRingBuffer(ABC):
 
 
 class AsyncExponential_RingBuffer(AsyncRingBuffer):
-    """Ring buffer that pre-generates exponential log noise via ``exponential_().log_()``."""
+    """Ring buffer that pre-generates exponential log noise via Exp(1) then log."""
 
     def _refill_slice(self, start: int, end: int) -> None:
-        self._buf[start:end].exponential_().log_()
+        # Match torch.Tensor.exponential_() default (rate=1) then log_().
+        n = end - start
+        out = self._np[start:end]
+        out[:] = np.random.exponential(scale=1.0, size=(n, self._V))
+        np.log(out, out=out)
 
 
 class _AsyncCounterRingBuffer(AsyncRingBuffer):
@@ -176,5 +207,5 @@ class _AsyncCounterRingBuffer(AsyncRingBuffer):
     def _refill_slice(self, start: int, end: int) -> None:
         n = end - start
         for i in range(n):
-            self._buf[start + i].fill_(self._total_generated)
+            self._np[start + i, :] = self._total_generated
             self._total_generated += 1
