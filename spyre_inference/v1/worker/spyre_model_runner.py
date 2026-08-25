@@ -53,6 +53,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig, CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
+from vllm.utils.math_utils import round_up
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
@@ -88,7 +89,6 @@ from spyre_inference.v1.pool import (
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     EncoderBucketPad,
     SpyreShapeBucketer,
-    align_num_tokens_to_tp,
     encoder_bucket_valid_row_indices,
     expand_packed_to_encoder_bucket,
     pooling_warmup_pad_query_lens,
@@ -711,9 +711,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.model_config.runner_type == "pooling":
             if self._encoder_bucket is not None:
                 return BatchDescriptor(
-                    num_tokens=self._tokens_after_encoder_bucket_and_tp(
-                        self._encoder_bucket.num_tokens
-                    ),
+                    num_tokens=self._encoder_bucket.num_tokens,
                     num_reqs=self._encoder_bucket.batch_bucket,
                 )
             max_query_len = (
@@ -731,7 +729,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if desc is None:
                 return None
             return BatchDescriptor(
-                num_tokens=self._tokens_after_encoder_bucket_and_tp(desc.padded_num_tokens),
+                num_tokens=desc.padded_num_tokens,
                 num_reqs=desc.batch_bucket,
             )
 
@@ -742,15 +740,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return None
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
 
-    def _tokens_after_encoder_bucket_and_tp(self, padded: int) -> int:
-        """Must align to TP after bucket padding."""
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        return align_num_tokens_to_tp(padded, tp_size)
-
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         if self._encoder_bucket is None:
             return super()._pad_for_sequence_parallelism(num_scheduled_tokens)
-        return self._tokens_after_encoder_bucket_and_tp(self._encoder_bucket.num_tokens)
+        # Must align to TP after bucket padding
+        padded = self._encoder_bucket.num_tokens
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if tp_size > 1:
+            padded = round_up(padded, tp_size)
+        return padded
 
     def _warmup_pooling_bucket_shapes(self) -> None:
         """Dummy each ``(B, L)`` at full size, then ``L-2`` / ``L-1`` pad leftovers."""
@@ -930,7 +928,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         runtime batch is padded the same way. Attention still masks with the
         original lengths (kept in ``seq_lens``).
         """
-        self._encoder_bucket = None
         if self.model_config.runner_type != "pooling":
             return
 

@@ -27,7 +27,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from vllm.config import get_current_vllm_config
 from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference.custom_ops.utils import convert
@@ -37,20 +36,13 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
 )
-from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    ENCODER_SEQ_ALIGNMENT,
-    encoder_batch_bucket,
-    encoder_len_bucket,
-)
 from spyre_inference.v1.pool import select_rows
 
-
-def _scheduler_max_num_seqs(num_seqs: int) -> int:
-    """Serve ``max_num_seqs`` when a vLLM config is active; else ``num_seqs``."""
-    try:
-        return get_current_vllm_config().scheduler_config.max_num_seqs
-    except Exception:
-        return num_seqs
+# Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
+# L-aligned keeps P·V's K stick-aligned; D-aligned keeps QKᵀ's K stick-aligned
+# so Inductor never enters insert_bmm_padding (torch-spyre KeyError: 'val' on
+# FX nodes missing meta["val"] when padding MiniLM's head_size=32).
+ENCODER_SEQ_ALIGNMENT = 64
 
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
@@ -62,14 +54,9 @@ def host_pack_indices(
     lengths: list[int],
     aligned_len: int,
     pad_row: int,
-    batch_size: int | None = None,
 ) -> torch.Tensor:
-    """Build ``[B, L]`` int64 row indices; pad slots point at ``pad_row``.
-
-    ``batch_size`` may exceed ``len(q_starts)`` so extra rows stay on ``pad_row``
-    and SDPA reuses the warmed batch bucket.
-    """
-    batch = len(q_starts) if batch_size is None else batch_size
+    """Build ``[B, L]`` int64 row indices; pad slots point at ``pad_row``."""
+    batch = len(q_starts)
     indices = torch.full((batch, aligned_len), pad_row, dtype=torch.int64)
     for s, (start, length) in enumerate(zip(q_starts, lengths)):
         if length > 0:
@@ -236,9 +223,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
 
         max_len = max(query_lens, default=0)
-        # Next compile bucket, not just stick-align: 30-token seqs reuse L=64.
-        aligned_len = encoder_len_bucket(max_len)
-        packed_seqs = encoder_batch_bucket(num_seqs, _scheduler_max_num_seqs(num_seqs))
+        aligned_len = _align_up(max_len)
 
         target_device = output.device
         # Keep activations on the SDPA device; pack/unpack via index_select.
@@ -248,26 +233,21 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             value = convert(value, target_device.type)
 
         pad_row = n  # index of the appended zero row in gather_pack
-        q_pack_idx = host_pack_indices(
-            q_starts, query_lens, aligned_len, pad_row, batch_size=packed_seqs
-        )
+        q_pack_idx = host_pack_indices(q_starts, query_lens, aligned_len, pad_row)
         # K/V may be shorter than Q when seq_lens < query_lens; still use q_starts.
         kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
-        kv_pack_idx = host_pack_indices(
-            q_starts, kv_pack_lens, aligned_len, pad_row, batch_size=packed_seqs
-        )
+        kv_pack_idx = host_pack_indices(q_starts, kv_pack_lens, aligned_len, pad_row)
         unpack_idx = host_unpack_indices(q_starts, query_lens, aligned_len, n)
 
         q_batched = gather_pack(query, q_pack_idx, head_size_padded)
         k_batched = gather_pack(key, kv_pack_idx, head_size_padded)
         v_batched = gather_pack(value, kv_pack_idx, head_size_padded)
 
-        pad_n = packed_seqs - num_seqs
         mask = build_attention_mask(
-            packed_seqs,
+            num_seqs,
             aligned_len,
-            query_lens + [0] * pad_n,
-            kv_lens + [0] * pad_n,
+            query_lens,
+            kv_lens,
             dtype=query.dtype,
             device=target_device,
         )
@@ -276,7 +256,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if num_kv_heads != num_heads:
             sdpa_kwargs["enable_gqa"] = True
 
-        # Single on-device SDPA: [B_bucket, H, L_bucket, D_padded].
+        # Single on-device SDPA: [num_seqs, H, L_aligned, D_padded].
         attn_out = F.scaled_dot_product_attention(
             q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
         )

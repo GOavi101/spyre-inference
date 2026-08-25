@@ -259,7 +259,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
                 max_model_len = vllm_config.model_config.max_model_len
                 compile_sizes = default_encoder_len_buckets(max_model_len)
-                vllm_config.compilation_config.compile_sizes = compile_sizes  # ty: ignore[invalid-assignment]
+                vllm_config.compilation_config.compile_sizes = compile_sizes
                 logger.info(
                     "Encoder length buckets from max_model_len=%d: %s",
                     max_model_len,

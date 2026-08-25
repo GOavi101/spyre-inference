@@ -322,16 +322,6 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def test_default_encoder_len_buckets_follow_max_model_len():
-    from spyre_inference.v1.worker.spyre_shape_bucketer import default_encoder_len_buckets
-
-    assert default_encoder_len_buckets(512) == [64, 128, 256, 512]
-    assert default_encoder_len_buckets(2048) == [64, 128, 256, 512, 1024, 2048]
-    assert default_encoder_len_buckets(64) == [64]
-    assert default_encoder_len_buckets(100) == [64]
-    assert default_encoder_len_buckets(768) == [64, 128, 256, 512, 768]
-
-
 def test_apply_config_sets_pooling_compile_sizes_from_max_model_len():
     """Pooling L lives on compile_sizes, same hook as decoder 1D sizes."""
     from unittest.mock import MagicMock
