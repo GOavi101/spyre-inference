@@ -85,7 +85,6 @@ from spyre_inference.v1.encoder_buckets import (
     expand_packed_to_encoder_bucket,
     pooling_warmup_pad_query_lens,
     pooling_warmup_shapes,
-    runtime_encoder_bucket,
 )
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -512,18 +511,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.spyre_shape_bucketer = self._create_shape_bucketer()
 
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
-        """Create SpyreShapeBucketer if compilation with bucketing is active.
+        """Create SpyreShapeBucketer for decoder 1D sizes or pooling 2D cells.
 
-        Returns None when enforce_eager=True, mode is NONE, or no
-        compile_sizes are configured (e.g. pooling models skip bucketing
-        because their token counts depend on variable input sequence lengths).
+        Decoder uses ``compile_sizes`` from the graph recorder (#480).
+        Pooling uses encoder ``(B, L)`` shapes; it does not reuse the 1D token
+        ladder. Eager pooling still gets a bucketer so runtime pad lands on
+        the same cells.
         """
+        if self.model_config.runner_type == "pooling":
+            return SpyreShapeBucketer.for_pooling(self.vllm_config)
+
         if self.vllm_config.model_config.enforce_eager:
-            logger.info("Grarph Recorder disabled (enforce_eager=True)")
+            logger.info("Graph Recorder disabled (enforce_eager=True)")
             return None
 
         if not self.compilation_config.compile_sizes:
-            logger.info("Grarph Recorder disabled (no compile_sizes configured)")
+            logger.info("Graph Recorder disabled (no compile_sizes configured)")
             return None
 
         return SpyreShapeBucketer(self.vllm_config)
@@ -623,6 +626,28 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
+        if is_pooling:
+            logger.info("Running single warmup pass (graph manager Disabled)...")
+            t0 = time.time()
+            num_tokens = min(
+                SPYRE_ENCODER_WARMUP_MAX_TOKENS,
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            with _set_spyre_compilation_settings(self.vllm_config):
+                saved_max_num_seqs = self.scheduler_config.max_num_seqs
+                try:
+                    self.scheduler_config.max_num_seqs = 1
+                    logger.info(
+                        "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
+                        num_tokens,
+                        saved_max_num_seqs,
+                    )
+                    self._dummy_run(num_tokens)
+                finally:
+                    self.scheduler_config.max_num_seqs = saved_max_num_seqs
+            logger.info("Warmup done in %.3fs.", time.time() - t0)
+            return
+
         if self.spyre_shape_bucketer is None:
             logger.info("Running single warmup pass (graph manager Disabled)...")
             t0 = time.time()
@@ -631,21 +656,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 self.scheduler_config.max_num_batched_tokens,
             )
             with _set_spyre_compilation_settings(self.vllm_config):
-                if is_pooling:
-                    num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
-                    saved_max_num_seqs = self.scheduler_config.max_num_seqs
-                    try:
-                        self.scheduler_config.max_num_seqs = 1
-                        logger.info(
-                            "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
-                            num_tokens,
-                            saved_max_num_seqs,
-                        )
-                        self._dummy_run(num_tokens)
-                    finally:
-                        self.scheduler_config.max_num_seqs = saved_max_num_seqs
-                else:
-                    self._dummy_run(num_tokens)
+                self._dummy_run(num_tokens)
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -733,11 +744,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _warmup_pooling_bucket_shapes(self) -> None:
         """Dummy each ``(B, L)`` at full size, then ``L-2`` / ``L-1`` pad leftovers."""
-        shapes = pooling_warmup_shapes(
-            max_num_seqs=self.scheduler_config.max_num_seqs,
-            max_model_len=self.model_config.max_model_len,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-        )
+        if self.spyre_shape_bucketer is not None:
+            shapes = self.spyre_shape_bucketer.encoder_shapes
+        else:
+            shapes = pooling_warmup_shapes(
+                max_num_seqs=self.scheduler_config.max_num_seqs,
+                max_model_len=self.model_config.max_model_len,
+                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            )
         if not shapes:
             logger.warning("No pooling warmup shapes; falling back to a single dummy run")
             self._dummy_run(
@@ -785,12 +799,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return 0 if pad_token_id is None else int(pad_token_id)
 
     def _write_encoder_bucket_inputs(self, padded_ids: list[int], padded_pos: list[int]) -> None:
+        """Copy packed ``B × L`` ids and positions into the runner buffers.
+
+        ``padded_ids`` / ``padded_pos`` are flat ``[B*L]`` lists from
+        ``expand_packed_to_encoder_bucket``. ``input_ids`` is int32, so Spyre
+        aliases ``.gpu`` to ``.cpu``; there is no H2D here. The model wrapper
+        converts ids to Spyre int64 at the forward boundary.
+        """
         num_tokens = len(padded_ids)
         self.input_ids.cpu[:num_tokens].copy_(
             torch.tensor(padded_ids, dtype=self.input_ids.cpu.dtype)
         )
-        if self.input_ids.gpu is not self.input_ids.cpu:
-            self.input_ids.copy_to_gpu(num_tokens)
         self.positions[:num_tokens].copy_(
             torch.tensor(
                 padded_pos,
@@ -907,16 +926,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if orig_tokens <= 0:
             return
 
-        bucket = runtime_encoder_bucket(
+        if self.spyre_shape_bucketer is None:
+            return
+        desc = self.spyre_shape_bucketer.dispatch_encoder(
             num_seqs=num_reqs,
             max_query_len=max(orig_lens),
             max_num_seqs=self.scheduler_config.max_num_seqs,
             max_model_len=self.model_config.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
         )
-        if bucket is None:
+        if desc is None:
             return
-        batch_bucket, len_bucket = bucket
+        batch_bucket, len_bucket = desc.batch_bucket, desc.len_bucket
         if (
             batch_bucket == num_reqs
             and orig_tokens == batch_bucket * len_bucket
@@ -980,6 +1001,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return super()._build_attention_metadata(*args, **kwargs)
 
     def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
+        """Keep encoder-bucket pad positions through upstream preprocess.
+
+        Upstream zeroes ``positions[num_scheduled_tokens:num_input_tokens]``
+        when the batch is padded. Encoder buckets already wrote those slots
+        (real tokens, then continued pad positions so ``T = B × L``). Restore
+        that tensor and return it in the preprocess tuple so embed / RoPE see
+        the warmed shape, not a ragged prefix plus zeros.
+        """
         bucket = self._encoder_bucket
         saved_pos = None
         if bucket is not None:

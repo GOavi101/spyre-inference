@@ -27,6 +27,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vllm.config import get_current_vllm_config
 from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference.custom_ops.utils import convert
@@ -47,8 +48,6 @@ from spyre_inference.v1.pool import select_rows
 def _scheduler_max_num_seqs(num_seqs: int) -> int:
     """Serve ``max_num_seqs`` when a vLLM config is active; else ``num_seqs``."""
     try:
-        from vllm.config import get_current_vllm_config
-
         return get_current_vllm_config().scheduler_config.max_num_seqs
     except Exception:
         return num_seqs

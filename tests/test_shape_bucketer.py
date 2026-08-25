@@ -14,11 +14,13 @@
 
 """Unit tests for SpyreShapeBucketer."""
 
-import pytest
 from dataclasses import FrozenInstanceError
 from unittest.mock import MagicMock
 
+import pytest
+
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    EncoderBucketDescriptor,
     SpyreShapeBucketer,
 )
 
@@ -116,3 +118,106 @@ class TestEdgeCases:
         config.compilation_config.compile_sizes = [16, 2, 8, 1, 4]
         b = SpyreShapeBucketer(config)
         assert b.bucket_sizes == [1, 2, 4, 8, 16]
+
+
+def _pooling_vllm_config(
+    *,
+    max_num_seqs: int = 4,
+    max_model_len: int = 128,
+    max_num_batched_tokens: int = 512,
+    runner_type: str = "pooling",
+) -> MagicMock:
+    config = MagicMock()
+    config.model_config.runner_type = runner_type
+    config.model_config.max_model_len = max_model_len
+    config.scheduler_config.max_num_seqs = max_num_seqs
+    config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    config.compilation_config.compile_sizes = []
+    return config
+
+
+class TestEncoderDispatch:
+    def test_for_pooling_loads_warmup_shapes(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "64,128")
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+        b = SpyreShapeBucketer.for_pooling(_pooling_vllm_config())
+        assert b is not None
+        assert b.encoder_shapes == [(1, 64), (1, 128), (4, 64), (4, 128)]
+        assert b.bucket_sizes == [64, 128, 256, 512]
+
+    def test_for_pooling_skips_non_pooling(self):
+        assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
+
+    def test_for_pooling_none_when_no_shapes(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "256")
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
+        b = SpyreShapeBucketer.for_pooling(
+            _pooling_vllm_config(max_model_len=64, max_num_batched_tokens=128)
+        )
+        assert b is None
+
+    def test_dispatch_encoder_pads_to_warmed_cell(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "64,128")
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+        b = SpyreShapeBucketer.for_pooling(_pooling_vllm_config())
+        assert b is not None
+        desc = b.dispatch_encoder(
+            num_seqs=3,
+            max_query_len=30,
+            max_num_seqs=4,
+            max_model_len=128,
+            max_num_batched_tokens=512,
+        )
+        assert desc is not None
+        assert (desc.batch_bucket, desc.len_bucket) == (4, 64)
+        assert desc.padded_num_tokens == 256
+        assert desc.actual_num_seqs == 3
+        assert desc.actual_max_len == 30
+
+    def test_dispatch_encoder_stays_on_warmed_shapes(self):
+        config = MagicMock()
+        config.compilation_config.compile_sizes = []
+        b = SpyreShapeBucketer(config, encoder_shapes=[(4, 64)])
+        desc = b.dispatch_encoder(
+            num_seqs=1,
+            max_query_len=30,
+            max_num_seqs=4,
+            max_model_len=128,
+            max_num_batched_tokens=512,
+        )
+        assert desc is not None
+        assert (desc.batch_bucket, desc.len_bucket) == (4, 64)
+
+    def test_dispatch_encoder_none_when_over_token_budget(self):
+        config = MagicMock()
+        config.compilation_config.compile_sizes = []
+        b = SpyreShapeBucketer(config, encoder_shapes=[(4, 64)])
+        assert (
+            b.dispatch_encoder(
+                num_seqs=3,
+                max_query_len=30,
+                max_num_seqs=4,
+                max_model_len=2048,
+                max_num_batched_tokens=200,
+            )
+            is None
+        )
+
+    def test_dispatch_encoder_none_on_1d_bucketer(self, bucketer):
+        assert (
+            bucketer.dispatch_encoder(
+                num_seqs=1,
+                max_query_len=8,
+                max_num_seqs=4,
+                max_model_len=128,
+                max_num_batched_tokens=512,
+            )
+            is None
+        )
+
+    def test_encoder_descriptor_is_frozen(self):
+        desc = EncoderBucketDescriptor(
+            batch_bucket=4, len_bucket=64, actual_num_seqs=3, actual_max_len=30
+        )
+        with pytest.raises(FrozenInstanceError):
+            desc.batch_bucket = 1

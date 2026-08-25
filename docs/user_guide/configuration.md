@@ -47,6 +47,11 @@ A 30-token, 3-seq request with `--max-num-seqs 4` is padded to `(B=4, L=64)`
 (`T=256`) and reuses that warmed graph. If `(B, L)` would exceed
 `--max-num-batched-tokens`, the batch is left unpadded (a new compile).
 
+Those `(B, L)` cells live on `SpyreShapeBucketer` (2D encoder dispatch; the
+same class as decoder 1D `compile_sizes` from the graph recorder). Warmup
+dummies the list; runtime pads onto a warmed cell so SDPA stays `[B, H, L, D]`.
+Encoder attention is part of the compiled graph — it is not skipped.
+
 Compiled pooling warmup dummies each `(B, L)` three ways: full `B × L`, then
 `L-2` and `L-1` padded onto `T = B × L`. (`--random-input-len L` subtracts
 tokenizer specials, often 2.) Eager pooling (`--enforce-eager`) still uses one

@@ -23,6 +23,10 @@ Pad each sequence to the next length bucket ``L`` and the batch to ``B`` so
 graph for attention **and** Linear/LN. Attention still masks to the real
 lengths so pad tokens do not mix into embeddings.
 
+The pooling runner stores that ladder on ``SpyreShapeBucketer`` (2D dispatch,
+same class as decoder 1D ``compile_sizes``). ``pooling_warmup_shapes`` is the
+source of truth; runtime pad only lands on a cell that warmup compiled.
+
 Env:
     SPYRE_ENCODER_BUCKET_LENS          CSV of prompt-length buckets
                                        (default ``64,128,256,512,1024,2048``).
