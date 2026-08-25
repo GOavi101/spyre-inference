@@ -37,7 +37,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
 )
-from spyre_inference.v1.encoder_buckets import (
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
     ENCODER_SEQ_ALIGNMENT,
     encoder_batch_bucket,
     encoder_len_bucket,

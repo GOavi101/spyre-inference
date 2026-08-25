@@ -227,9 +227,8 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Build bucket sizes for pre-compilation warmup.
-            # Pooling models skip bucketing (their token counts depend on
-            # variable input sequence lengths, not the decode heuristic).
+            # Decoder: 1D compile_sizes (packed token counts).
+            # Pooling: compile_sizes are prompt lengths L from max_model_len.
             if vllm_config.model_config.runner_type != "pooling":
                 # max_capture_size is the largest bucket we compile for.
                 # Bounded by max_num_batched_tokens (scheduler limit) and
@@ -252,6 +251,19 @@ class TorchSpyrePlatform(CpuPlatform):
                 logger.warning(
                     "Capping max_num_batched_tokens to %d ",
                     max_capture_size,
+                )
+            else:
+                from spyre_inference.v1.worker.spyre_shape_bucketer import (
+                    default_encoder_len_buckets,
+                )
+
+                max_model_len = vllm_config.model_config.max_model_len
+                compile_sizes = default_encoder_len_buckets(max_model_len)
+                vllm_config.compilation_config.compile_sizes = compile_sizes
+                logger.info(
+                    "Encoder length buckets from max_model_len=%d: %s",
+                    max_model_len,
+                    compile_sizes,
                 )
 
         # In check_and_update_config we assert this must be float16 for spyre.

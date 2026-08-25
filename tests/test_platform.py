@@ -322,18 +322,32 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def test_compilation_disabled_reason_does_not_blame_enforce_eager():
-    """Unset compile mode is NONE, not enforce_eager=True."""
+def test_default_encoder_len_buckets_follow_max_model_len():
+    from spyre_inference.v1.worker.spyre_shape_bucketer import default_encoder_len_buckets
+
+    assert default_encoder_len_buckets(512) == [64, 128, 256, 512]
+    assert default_encoder_len_buckets(2048) == [64, 128, 256, 512, 1024, 2048]
+    assert default_encoder_len_buckets(64) == [64]
+    assert default_encoder_len_buckets(100) == [64]
+    assert default_encoder_len_buckets(768) == [64, 128, 256, 512, 768]
+
+
+def test_apply_config_sets_pooling_compile_sizes_from_max_model_len():
+    """Pooling L lives on compile_sizes, same hook as decoder 1D sizes."""
+    from unittest.mock import MagicMock
+
     from vllm.config import CompilationMode
 
-    from spyre_inference.v1.worker.spyre_model_runner import compilation_disabled_reason
+    from spyre_inference.platform import TorchSpyrePlatform
 
-    assert compilation_disabled_reason(True, CompilationMode.NONE) == "enforce_eager=True"
-    reason = compilation_disabled_reason(False, CompilationMode.NONE)
-    assert reason is not None
-    assert "enforce_eager=True" not in reason
-    assert "NONE" in reason
-    assert compilation_disabled_reason(False, CompilationMode.STOCK_TORCH_COMPILE) is None
+    vllm_config = MagicMock()
+    vllm_config.model_config.enforce_eager = False
+    vllm_config.model_config.runner_type = "pooling"
+    vllm_config.model_config.max_model_len = 512
+    vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    vllm_config.compilation_config.custom_ops = ["all"]
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [64, 128, 256, 512]
 
 
 def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):

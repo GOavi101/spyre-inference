@@ -138,9 +138,10 @@ def _pooling_vllm_config(
 
 class TestEncoderDispatch:
     def test_for_pooling_loads_warmup_shapes(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "64,128")
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
-        b = SpyreShapeBucketer.for_pooling(_pooling_vllm_config())
+        cfg = _pooling_vllm_config()
+        cfg.compilation_config.compile_sizes = [64, 128]
+        b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
         assert b.encoder_shapes == [(1, 64), (1, 128), (4, 64), (4, 128)]
         assert b.bucket_sizes == [64, 128, 256, 512]
@@ -149,17 +150,16 @@ class TestEncoderDispatch:
         assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
 
     def test_for_pooling_none_when_no_shapes(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "256")
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
-        b = SpyreShapeBucketer.for_pooling(
-            _pooling_vllm_config(max_model_len=64, max_num_batched_tokens=128)
-        )
-        assert b is None
+        cfg = _pooling_vllm_config(max_model_len=64, max_num_batched_tokens=128)
+        cfg.compilation_config.compile_sizes = [256]
+        assert SpyreShapeBucketer.for_pooling(cfg) is None
 
     def test_dispatch_encoder_pads_to_warmed_cell(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_LENS", "64,128")
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
-        b = SpyreShapeBucketer.for_pooling(_pooling_vllm_config())
+        cfg = _pooling_vllm_config()
+        cfg.compilation_config.compile_sizes = [64, 128]
+        b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
         desc = b.dispatch_encoder(
             num_seqs=3,
@@ -173,6 +173,31 @@ class TestEncoderDispatch:
         assert desc.padded_num_tokens == 256
         assert desc.actual_num_seqs == 3
         assert desc.actual_max_len == 30
+
+    def test_pooling_2d_not_1d_token_ladder(self, monkeypatch):
+        """Pooling must pad to (B, L), not the decoder 1D compile_sizes ladder.
+
+        3 seqs × 30 tokens is 90 packed tokens. 1D dispatch would pick 128;
+        encoder SDPA needs (4, 64) so T = 256.
+        """
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+        cfg = _pooling_vllm_config()
+        cfg.compilation_config.compile_sizes = [64, 128]
+        b = SpyreShapeBucketer.for_pooling(cfg)
+        assert b is not None
+        one_d = b.dispatch(90)
+        assert one_d is not None
+        assert one_d.padded_num_tokens == 128
+        two_d = b.dispatch_encoder(
+            num_seqs=3,
+            max_query_len=30,
+            max_num_seqs=4,
+            max_model_len=128,
+            max_num_batched_tokens=512,
+        )
+        assert two_d is not None
+        assert (two_d.batch_bucket, two_d.len_bucket) == (4, 64)
+        assert two_d.padded_num_tokens == 256
 
     def test_dispatch_encoder_stays_on_warmed_shapes(self):
         config = MagicMock()

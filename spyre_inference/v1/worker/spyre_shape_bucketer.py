@@ -21,20 +21,206 @@ Pooling / encoder (2D): warmed ``(B, L)`` cells with ``T = B × L``. SDPA
 compiles on ``[B, H, L, D]``; Linear / LN compile on ``[T, …]``. Dispatch
 picks a warmed cell that covers ``(num_seqs, max_query_len)``. Do not reuse
 the decoder's 1D token ladder for encoder attention.
+
+``L`` is ``compilation_config.compile_sizes`` (set from ``max_model_len`` in
+``platform.py``, same hook as decoder 1D sizes). Batch buckets:
+
+    SPYRE_ENCODER_BUCKET_BATCH_SIZES   CSV of batch buckets. Default: ``1, 2,
+                                       4, …, max_num_seqs``.
 """
 
 from __future__ import annotations
 
 import bisect
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from spyre_inference.v1.encoder_buckets import pooling_warmup_shapes
-
 logger = init_logger(__name__)
+
+# Spyre stick (64 fp16 elements). Length buckets and MiniLM head-dim padding
+# both align to this so Inductor never enters insert_bmm_padding.
+ENCODER_SEQ_ALIGNMENT = 64
+
+
+def default_encoder_len_buckets(max_model_len: int) -> list[int]:
+    """Stick-aligned prompt-length buckets from 64 up to ``max_model_len``.
+
+    Powers of two through the last value that still fits, then ``max_model_len``
+    rounded down to a stick if that is not already on the ladder.
+    """
+    cap = max(1, int(max_model_len))
+    buckets: list[int] = []
+    size = ENCODER_SEQ_ALIGNMENT
+    while size < cap:
+        buckets.append(size)
+        size *= 2
+    aligned_cap = max(
+        ENCODER_SEQ_ALIGNMENT, (cap // ENCODER_SEQ_ALIGNMENT) * ENCODER_SEQ_ALIGNMENT
+    )
+    if aligned_cap <= cap and aligned_cap not in buckets:
+        buckets.append(aligned_cap)
+    return buckets or [ENCODER_SEQ_ALIGNMENT]
+
+
+def parse_csv_ints(env_name: str, default: list[int]) -> list[int]:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return list(default)
+    values = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    return values or list(default)
+
+
+def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
+    return max(align, (n + align - 1) // align * align)
+
+
+def next_bucket(n: int, buckets: list[int]) -> int:
+    """Smallest bucket ``>= n``. If ``n`` exceeds the ladder, stick-align ``n``."""
+    if n < 1:
+        n = 1
+    ordered = sorted({b for b in buckets if b > 0})
+    for bucket in ordered:
+        if bucket >= n:
+            return bucket
+    return _align_up(n)
+
+
+def len_buckets(
+    max_model_len: int,
+    compile_sizes: Sequence[int] | None = None,
+) -> list[int]:
+    """Length ladder: ``compile_sizes`` from the platform hook, else ``max_model_len``."""
+    if compile_sizes:
+        aligned = sorted({_align_up(int(v)) for v in compile_sizes if int(v) > 0})
+        fitted = [v for v in aligned if v <= max_model_len]
+        if fitted:
+            return fitted
+    return default_encoder_len_buckets(max_model_len)
+
+
+def batch_buckets(max_num_seqs: int) -> list[int]:
+    """Configured batch ladder, clipped to ``[1, max_num_seqs]``."""
+    cap = max(1, max_num_seqs)
+    env = parse_csv_ints("SPYRE_ENCODER_BUCKET_BATCH_SIZES", [])
+    if env:
+        values = sorted({b for b in env if 1 <= b <= cap})
+        return values or [cap]
+    out: list[int] = []
+    size = 1
+    while size < cap:
+        out.append(size)
+        size *= 2
+    if cap not in out:
+        out.append(cap)
+    return out
+
+
+def encoder_len_bucket(max_len: int, buckets: list[int] | None = None) -> int:
+    """Nearest length bucket for encoder SDPA ``L`` (always ≥ stick size)."""
+    return next_bucket(max(max_len, 1), buckets or [])
+
+
+def encoder_batch_bucket(num_seqs: int, max_num_seqs: int) -> int:
+    """Nearest batch bucket for encoder SDPA ``B`` (≤ ``max_num_seqs``)."""
+    cap = max(1, max_num_seqs)
+    n = min(max(num_seqs, 1), cap)
+    return min(next_bucket(n, batch_buckets(cap)), cap)
+
+
+def pooling_warmup_pad_query_lens(prompt_len: int) -> list[int]:
+    """Unpadded dummy lengths (``L-2``, ``L-1``) so pad leftovers compile.
+
+    vLLM ``--random-input-len L`` samples ``L`` minus tokenizer specials (often 2).
+    """
+    lens = {max(1, prompt_len - 1)}
+    if prompt_len > 2:
+        lens.add(prompt_len - 2)
+    return sorted(length for length in lens if length < prompt_len)
+
+
+def pooling_warmup_shapes(
+    max_num_seqs: int,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    len_ladder: Sequence[int] | None = None,
+) -> list[tuple[int, int]]:
+    """``(batch_size, prompt_len)`` pairs to dummy at serve start."""
+    shapes: list[tuple[int, int]] = []
+    for batch_size in batch_buckets(max_num_seqs):
+        for prompt_len in len_buckets(max_model_len, len_ladder):
+            if prompt_len > max_model_len:
+                continue
+            if batch_size * prompt_len > max_num_batched_tokens:
+                continue
+            shapes.append((batch_size, prompt_len))
+    return shapes
+
+
+class EncoderBucketPad(NamedTuple):
+    """Runtime pad of a pooling batch onto a warmed ``(B, L)`` shape."""
+
+    batch_bucket: int
+    len_bucket: int
+    orig_query_lens: list[int]
+    orig_num_tokens: int
+    orig_num_reqs: int
+
+    @property
+    def num_tokens(self) -> int:
+        return self.batch_bucket * self.len_bucket
+
+
+def expand_packed_to_encoder_bucket(
+    input_ids: list[int],
+    positions: list[int],
+    query_lens: list[int],
+    batch_bucket: int,
+    len_bucket: int,
+    pad_token_id: int = 0,
+) -> tuple[list[int], list[int]]:
+    """Pad each sequence to ``L`` and the batch to ``B``; return ``[B*L]`` lists.
+
+    Real pad tokens continue positions from the true length. Dummy sequences
+    (batch pad) are ``pad_token_id`` with positions ``0 .. L-1``.
+    """
+    if len(query_lens) > batch_bucket:
+        raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
+    if any(length > len_bucket for length in query_lens):
+        raise ValueError(f"a query length exceeds len_bucket={len_bucket}: {query_lens}")
+
+    total = batch_bucket * len_bucket
+    padded_ids = [int(pad_token_id)] * total
+    padded_pos = [0] * total
+    src = 0
+    for seq_idx, length in enumerate(query_lens):
+        dst = seq_idx * len_bucket
+        padded_ids[dst : dst + length] = list(input_ids[src : src + length])
+        padded_pos[dst : dst + length] = list(positions[src : src + length])
+        for offset in range(length, len_bucket):
+            padded_pos[dst + offset] = offset
+        src += length
+    for seq_idx in range(len(query_lens), batch_bucket):
+        dst = seq_idx * len_bucket
+        for offset in range(len_bucket):
+            padded_pos[dst + offset] = offset
+    return padded_ids, padded_pos
+
+
+def encoder_bucket_valid_row_indices(
+    orig_query_lens: list[int],
+    len_bucket: int,
+) -> list[int]:
+    """Row indices of real tokens inside a ``B×L`` packed hidden state."""
+    indices: list[int] = []
+    for seq_idx, length in enumerate(orig_query_lens):
+        start = seq_idx * len_bucket
+        indices.extend(range(start, start + length))
+    return indices
 
 
 @dataclass(frozen=True)
@@ -106,10 +292,14 @@ class SpyreShapeBucketer:
         if getattr(model_config, "runner_type", None) != "pooling":
             return None
         scheduler = vllm_config.scheduler_config
+        compile_sizes = [
+            int(s) for s in (vllm_config.compilation_config.compile_sizes or [])
+        ]
         shapes = pooling_warmup_shapes(
             max_num_seqs=scheduler.max_num_seqs,
             max_model_len=model_config.max_model_len,
             max_num_batched_tokens=scheduler.max_num_batched_tokens,
+            len_ladder=compile_sizes or None,
         )
         if not shapes:
             return None
