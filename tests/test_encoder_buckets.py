@@ -15,6 +15,7 @@
 """CPU tests for encoder compile-shape buckets. No Spyre device required."""
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    align_num_tokens_to_tp,
     batch_buckets,
     default_encoder_len_buckets,
     encoder_batch_bucket,
@@ -131,3 +132,13 @@ def test_expand_packed_to_encoder_bucket_pads_seq_and_batch():
 def test_encoder_bucket_valid_row_indices_skips_pads():
     indices = encoder_bucket_valid_row_indices([3, 2], len_bucket=4)
     assert indices == [0, 1, 2, 4, 5]
+
+
+def test_align_num_tokens_to_tp_after_bucket_padding():
+    # TP=1 and even TP leave B×L (e.g. 4×64) unchanged.
+    assert align_num_tokens_to_tp(256, 1) == 256
+    assert align_num_tokens_to_tp(256, 2) == 256
+    assert align_num_tokens_to_tp(256, 4) == 256
+    # Odd TP rounds T up so every rank gets an even token split.
+    assert align_num_tokens_to_tp(64, 3) == 66
+    assert align_num_tokens_to_tp(65, 4) == 68

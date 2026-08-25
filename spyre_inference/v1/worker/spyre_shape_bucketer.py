@@ -59,9 +59,7 @@ def default_encoder_len_buckets(max_model_len: int) -> list[int]:
     while size < cap:
         buckets.append(size)
         size *= 2
-    aligned_cap = max(
-        ENCODER_SEQ_ALIGNMENT, (cap // ENCODER_SEQ_ALIGNMENT) * ENCODER_SEQ_ALIGNMENT
-    )
+    aligned_cap = max(ENCODER_SEQ_ALIGNMENT, (cap // ENCODER_SEQ_ALIGNMENT) * ENCODER_SEQ_ALIGNMENT)
     if aligned_cap <= cap and aligned_cap not in buckets:
         buckets.append(aligned_cap)
     return buckets or [ENCODER_SEQ_ALIGNMENT]
@@ -130,6 +128,13 @@ def encoder_batch_bucket(num_seqs: int, max_num_seqs: int) -> int:
     cap = max(1, max_num_seqs)
     n = min(max(num_seqs, 1), cap)
     return min(next_bucket(n, batch_buckets(cap)), cap)
+
+
+def align_num_tokens_to_tp(num_tokens: int, tp_size: int) -> int:
+    """Round padded token count up to ``tp_size`` when TP>1."""
+    if tp_size > 1:
+        return (num_tokens + tp_size - 1) // tp_size * tp_size
+    return num_tokens
 
 
 def pooling_warmup_pad_query_lens(prompt_len: int) -> list[int]:
@@ -292,9 +297,7 @@ class SpyreShapeBucketer:
         if getattr(model_config, "runner_type", None) != "pooling":
             return None
         scheduler = vllm_config.scheduler_config
-        compile_sizes = [
-            int(s) for s in (vllm_config.compilation_config.compile_sizes or [])
-        ]
+        compile_sizes = [int(s) for s in (vllm_config.compilation_config.compile_sizes or [])]
         shapes = pooling_warmup_shapes(
             max_num_seqs=scheduler.max_num_seqs,
             max_model_len=model_config.max_model_len,

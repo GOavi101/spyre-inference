@@ -88,6 +88,7 @@ from spyre_inference.v1.pool import (
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     EncoderBucketPad,
     SpyreShapeBucketer,
+    align_num_tokens_to_tp,
     encoder_bucket_valid_row_indices,
     expand_packed_to_encoder_bucket,
     pooling_warmup_pad_query_lens,
@@ -672,9 +673,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         rewrites the packed layout; this method is what execute_model /
         dummy_run use for the padded counts.
         """
-        pad = self._spyre_bucket_batch_descriptor(
-            num_tokens, num_reqs, num_scheduled_tokens_np
-        )
+        pad = self._spyre_bucket_batch_descriptor(num_tokens, num_reqs, num_scheduled_tokens_np)
         if pad is not None:
             return CUDAGraphMode.NONE, pad, False, None, None
 
@@ -712,7 +711,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.model_config.runner_type == "pooling":
             if self._encoder_bucket is not None:
                 return BatchDescriptor(
-                    num_tokens=self._encoder_bucket.num_tokens,
+                    num_tokens=self._tokens_after_encoder_bucket_and_tp(
+                        self._encoder_bucket.num_tokens
+                    ),
                     num_reqs=self._encoder_bucket.batch_bucket,
                 )
             max_query_len = (
@@ -730,7 +731,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if desc is None:
                 return None
             return BatchDescriptor(
-                num_tokens=desc.padded_num_tokens,
+                num_tokens=self._tokens_after_encoder_bucket_and_tp(desc.padded_num_tokens),
                 num_reqs=desc.batch_bucket,
             )
 
@@ -740,6 +741,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if desc is None:
             return None
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
+
+    def _tokens_after_encoder_bucket_and_tp(self, padded: int) -> int:
+        """Must align to TP after bucket padding."""
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        return align_num_tokens_to_tp(padded, tp_size)
+
+    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
+        if self._encoder_bucket is None:
+            return super()._pad_for_sequence_parallelism(num_scheduled_tokens)
+        return self._tokens_after_encoder_bucket_and_tp(self._encoder_bucket.num_tokens)
 
     def _warmup_pooling_bucket_shapes(self) -> None:
         """Dummy each ``(B, L)`` at full size, then ``L-2`` / ``L-1`` pad leftovers."""
