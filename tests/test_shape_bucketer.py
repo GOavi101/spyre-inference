@@ -22,6 +22,16 @@ import pytest
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     EncoderBucketDescriptor,
     SpyreShapeBucketer,
+    batch_buckets,
+    default_encoder_len_buckets,
+    encoder_batch_bucket,
+    encoder_bucket_valid_row_indices,
+    encoder_len_bucket,
+    expand_packed_to_encoder_bucket,
+    len_buckets,
+    next_bucket,
+    pooling_warmup_pad_query_lens,
+    pooling_warmup_shapes,
 )
 
 
@@ -246,3 +256,86 @@ class TestEncoderDispatch:
         )
         with pytest.raises(FrozenInstanceError):
             desc.batch_bucket = 1
+
+
+class TestEncoderBuckets:
+    def test_next_bucket_picks_smallest_fit(self):
+        assert next_bucket(30, [64, 128, 256]) == 64
+        assert next_bucket(64, [64, 128, 256]) == 64
+        assert next_bucket(65, [64, 128, 256]) == 128
+
+    def test_next_bucket_overflow_stick_aligns(self):
+        assert next_bucket(3000, [64, 128]) == 3008  # 3000 → 47*64 = 3008
+
+    def test_len_bucket_stick_aligns_when_ladder_unset(self):
+        assert encoder_len_bucket(1) == 64
+        assert encoder_len_bucket(32) == 64
+        assert encoder_len_bucket(65) == 128
+
+    def test_len_buckets_from_max_model_len(self):
+        assert len_buckets(512) == [64, 128, 256, 512]
+        assert default_encoder_len_buckets(2048) == [64, 128, 256, 512, 1024, 2048]
+        assert len_buckets(100) == [64]
+        assert len_buckets(768) == [64, 128, 256, 512, 768]
+
+    def test_len_buckets_prefer_compile_sizes(self):
+        assert len_buckets(512, compile_sizes=[128, 512]) == [128, 512]
+        assert encoder_len_bucket(30, [128, 512]) == 128
+        assert encoder_len_bucket(200, [128, 512]) == 512
+
+    def test_len_buckets_stick_align_compile_sizes(self):
+        assert len_buckets(512, compile_sizes=[100, 200]) == [128, 256]
+
+    def test_default_batch_buckets_are_powers_of_two(self):
+        assert batch_buckets(4) == [1, 2, 4]
+        assert batch_buckets(3) == [1, 2, 3]
+
+    def test_batch_bucket_pads_to_next_power(self):
+        assert encoder_batch_bucket(1, 4) == 1
+        assert encoder_batch_bucket(3, 4) == 4
+        assert encoder_batch_bucket(4, 4) == 4
+
+    def test_custom_batch_buckets(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+        assert encoder_batch_bucket(2, 4) == 4
+        assert batch_buckets(4) == [1, 4]
+
+    def test_warmup_pad_query_lens_include_random_dataset_specials(self):
+        assert pooling_warmup_pad_query_lens(64) == [62, 63]
+        assert pooling_warmup_pad_query_lens(2) == [1]
+        assert pooling_warmup_pad_query_lens(1) == []
+
+    def test_warmup_shapes_use_max_model_len(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+        assert pooling_warmup_shapes(
+            max_num_seqs=4,
+            max_model_len=128,
+            max_num_batched_tokens=512,
+        ) == [(1, 64), (1, 128), (4, 64), (4, 128)]
+
+    def test_warmup_shapes_skip_over_token_budget(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
+        # 4*256 = 1024 > 300 tokens; 4*64 = 256 still fits.
+        assert pooling_warmup_shapes(
+            max_num_seqs=4,
+            max_model_len=2048,
+            max_num_batched_tokens=300,
+            len_ladder=[64, 256],
+        ) == [(4, 64)]
+
+    def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):
+        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
+            input_ids=[1, 2, 3, 4, 5],
+            positions=[0, 1, 2, 0, 1],
+            query_lens=[3, 2],
+            batch_bucket=4,
+            len_bucket=4,
+            pad_token_id=9,
+        )
+        # seq0, seq1, then two dummy rows
+        assert padded_ids == [1, 2, 3, 9, 4, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+        assert padded_pos == list(range(4)) * 4
+
+    def test_encoder_bucket_valid_row_indices_skips_pads(self):
+        indices = encoder_bucket_valid_row_indices([3, 2], len_bucket=4)
+        assert indices == [0, 1, 2, 4, 5]

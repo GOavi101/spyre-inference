@@ -591,12 +591,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
-        compiled = (
-            not self.vllm_config.model_config.enforce_eager
-            and self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE
-        )
 
-        if is_pooling and compiled:
+        if is_pooling and not self.vllm_config.model_config.enforce_eager:
             logger.info("Warming up model...")
             t0 = time.time()
             with _set_spyre_compilation_settings(self.vllm_config):
@@ -615,6 +611,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
+            if is_pooling and self.spyre_shape_bucketer is not None:
+                self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -702,7 +700,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Pooling must not use the decoder 1D token ladder: SDPA compiles on
         ``[B, H, L, D]``. Prefer an already-expanded ``_encoder_bucket``
         (runtime ``_prepare_inputs`` / warmup L-2 dummy), else 2D dispatch on
-        ``(num_reqs, max seq len)``. Decoder waits until warmup is marked.
+        ``(num_reqs, max seq len)``. Both paths wait until warmup is marked,
+        except an already-seeded ``_encoder_bucket`` (L-2 / L-1 dummy).
         """
         bucketer = self.spyre_shape_bucketer
         if bucketer is None:
@@ -714,6 +713,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     num_tokens=self._encoder_bucket.num_tokens,
                     num_reqs=self._encoder_bucket.batch_bucket,
                 )
+            if not bucketer.is_warmed_up:
+                return None
             max_query_len = (
                 int(num_scheduled_tokens_np[:num_reqs].max())
                 if num_reqs and num_scheduled_tokens_np.size
@@ -906,17 +907,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Expand pooling packs to ``(B, L)``. Drop leftover pad on the way in.
 
         ``_encoder_bucket`` stays set after this returns so determine / attn /
-        pool see the cell. Clear on a failed prepare so dummy_run is not stuck
-        on a half-built pad (same role as the old ``execute_model`` wrapper).
+        pool see the cell.
         """
-        self._encoder_bucket = None
-        try:
-            result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
-            self._maybe_expand_pooling_inputs_to_encoder_bucket(num_scheduled_tokens)
-            return result
-        except Exception:
-            self._encoder_bucket = None
-            raise
+        self._encoder_bucket = None  # reset before each step
+        result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        self._maybe_expand_pooling_inputs_to_encoder_bucket(num_scheduled_tokens)
+        return result
 
     def _maybe_expand_pooling_inputs_to_encoder_bucket(
         self, num_scheduled_tokens: np.ndarray
