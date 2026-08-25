@@ -447,9 +447,10 @@ class TorchSpyrePlatform(CpuPlatform):
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
                 max_model_len = vllm_config.model_config.max_model_len
                 blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+                # +1 for BlockPool's reserved null block, which is never allocatable.
+                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq + 1
                 logger.info(
-                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq + 1 null block)",
                     cache_config.num_gpu_blocks_override,
                     max_num_seqs,
                     blocks_per_seq,
