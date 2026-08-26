@@ -597,9 +597,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             t0 = time.time()
             with _set_spyre_compilation_settings(self.vllm_config):
                 if self.spyre_shape_bucketer is not None:
-                    for size in sorted(
-                        self.spyre_shape_bucketer.bucket_sizes, reverse=True
-                    ):
+                    for size in sorted(self.spyre_shape_bucketer.bucket_sizes, reverse=True):
                         self._dummy_run(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
