@@ -229,31 +229,35 @@ class TorchSpyrePlatform(CpuPlatform):
 
             # Body: 1D compile_sizes (packed token counts). Attention (B, L)
             # is independent — see SpyreEncoderAttentionImpl gather-pack.
-            max_capture_size = min(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                512,
-            )
-            if vllm_config.model_config.runner_type != "pooling":
-                compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
-                if max_capture_size >= 8:
-                    compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
-                if max_capture_size >= 256:
-                    compile_sizes += list(range(256, max_capture_size + 1, 16))
+            # Honor a user-set list (#638); otherwise generate defaults.
+            if vllm_config.compilation_config.compile_sizes:
+                compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
-                from spyre_inference.v1.worker.spyre_shape_bucketer import (
-                    default_encoder_len_buckets,
+                # Largest default bucket: scheduler limit and 512 (Spyre max).
+                max_capture_size = min(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    512,
                 )
+                if vllm_config.model_config.runner_type != "pooling":
+                    compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
+                    if max_capture_size >= 8:
+                        compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
+                    if max_capture_size >= 256:
+                        compile_sizes += list(range(256, max_capture_size + 1, 16))
+                else:
+                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
+                        default_encoder_len_buckets,
+                    )
 
-                compile_sizes = [*default_encoder_len_buckets(max_capture_size)]
-                logger.info(
-                    "Pooling body token buckets (1D compile_sizes): %s",
-                    compile_sizes,
-                )
+                    compile_sizes = [*default_encoder_len_buckets(max_capture_size)]
+                    logger.info(
+                        "Pooling body token buckets (1D compile_sizes): %s",
+                        compile_sizes,
+                    )
+                vllm_config.compilation_config.compile_sizes = compile_sizes
 
-            vllm_config.compilation_config.compile_sizes = compile_sizes
-
-            # Ensure the scheduler never sends more tokens than the
-            # largest compiled body bucket to avoid runtime recompilation.
+            max_capture_size = max(int(s) for s in compile_sizes)
+            # Scheduler must not send more tokens than the largest body bucket.
             vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
             logger.warning(
                 "Capping max_num_batched_tokens to %d ",
@@ -453,9 +457,10 @@ class TorchSpyrePlatform(CpuPlatform):
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
                 max_model_len = vllm_config.model_config.max_model_len
                 blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+                # +1 for BlockPool's reserved null block, which is never allocatable.
+                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq + 1
                 logger.info(
-                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq + 1 null block)",
                     cache_config.num_gpu_blocks_override,
                     max_num_seqs,
                     blocks_per_seq,
