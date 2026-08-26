@@ -14,16 +14,14 @@
 
 """Spyre shape bucketer for compilation warmup and runtime dispatch.
 
-Decoder (1D): sorted ``compile_sizes`` token counts; pad the packed batch to
-the nearest bucket ``>=`` actual ``num_tokens``.
+Body (1D, decoder and pooling): sorted ``compile_sizes`` token counts; pad the
+packed batch to the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN
+compile on ``[T, …]``.
 
-Pooling / encoder (2D): warmed ``(B, L)`` cells with ``T = B × L``. SDPA
-compiles on ``[B, H, L, D]``; Linear / LN compile on ``[T, …]``. Dispatch
-picks a warmed cell that covers ``(num_seqs, max_query_len)``. Do not reuse
-the decoder's 1D token ladder for encoder attention.
-
-``L`` is ``compilation_config.compile_sizes`` (set from ``max_model_len`` in
-``platform.py``, same hook as decoder 1D sizes). Batch buckets:
+Attention (encoder only): warmed ``(B, L)`` cells for SDPA ``[B, H, L, D]``.
+The attention backend gathers rows into that grid; the body is not rewritten
+to ``T = B × L``. ``L`` is the ``max_model_len`` ladder, not ``compile_sizes``.
+Batch buckets:
 
     SPYRE_ENCODER_BUCKET_BATCH_SIZES   CSV of batch buckets. Default: ``1, 2,
                                        4, …, max_num_seqs``.
@@ -92,7 +90,11 @@ def len_buckets(
     max_model_len: int,
     compile_sizes: Sequence[int] | None = None,
 ) -> list[int]:
-    """Length ladder: ``compile_sizes`` from the platform hook, else ``max_model_len``."""
+    """Attention ``L`` ladder from ``max_model_len``.
+
+    Optional ``compile_sizes`` overrides ``L`` in tests. Platform
+    ``compile_sizes`` are body token counts and must not be passed here.
+    """
     if compile_sizes:
         aligned = sorted({_align_up(int(v)) for v in compile_sizes if int(v) > 0})
         fitted = [v for v in aligned if v <= max_model_len]
@@ -121,6 +123,34 @@ def batch_buckets(max_num_seqs: int) -> list[int]:
 def encoder_len_bucket(max_len: int, buckets: list[int] | None = None) -> int:
     """Nearest length bucket for encoder SDPA ``L`` (always ≥ stick size)."""
     return next_bucket(max(max_len, 1), buckets or [])
+
+
+def pick_encoder_attention_shape(
+    num_seqs: int,
+    max_query_len: int,
+    encoder_shapes: Sequence[tuple[int, int]],
+    max_num_seqs: int,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+) -> tuple[int, int] | None:
+    """Smallest warmed ``(B, L)`` covering the batch, or None.
+
+    Prefer smallest ``T = B × L``, then smallest ``B``, then smallest ``L``.
+    """
+    if num_seqs < 1 or max_query_len < 1 or not encoder_shapes:
+        return None
+    candidates = [
+        (batch, length)
+        for batch, length in encoder_shapes
+        if batch >= num_seqs
+        and length >= max_query_len
+        and batch <= max_num_seqs
+        and length <= max_model_len
+        and batch * length <= max_num_batched_tokens
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda pair: (pair[0] * pair[1], pair[0], pair[1]))
 
 
 def encoder_batch_bucket(num_seqs: int, max_num_seqs: int) -> int:
@@ -246,8 +276,8 @@ class EncoderBucketDescriptor:
 class SpyreShapeBucketer:
     """Dispatches runtime batches to pre-compiled bucket sizes.
 
-    1D (``compile_sizes``): nearest token count ``>=`` actual ``num_tokens``.
-    2D (``encoder_shapes``): nearest warmed ``(B, L)`` covering the batch.
+    1D (``compile_sizes``): body token count ``>=`` actual ``num_tokens``.
+    2D (``encoder_shapes``): attention ``(B, L)`` covering the batch.
     """
 
     def __init__(
@@ -285,7 +315,7 @@ class SpyreShapeBucketer:
 
     @classmethod
     def for_pooling(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
-        """Build a 2D encoder bucketer from the pooling warmup ladder, or None."""
+        """Pooling bucketer: 1D body ``compile_sizes`` plus attention ``(B, L)``."""
         model_config = vllm_config.model_config
         if getattr(model_config, "runner_type", None) != "pooling":
             return None
@@ -295,11 +325,15 @@ class SpyreShapeBucketer:
             max_num_seqs=scheduler.max_num_seqs,
             max_model_len=model_config.max_model_len,
             max_num_batched_tokens=scheduler.max_num_batched_tokens,
-            len_ladder=compile_sizes or None,
+            len_ladder=default_encoder_len_buckets(model_config.max_model_len),
         )
-        if not shapes:
+        if not shapes and not compile_sizes:
             return None
-        return cls(vllm_config, encoder_shapes=shapes)
+        inst = cls(vllm_config, encoder_shapes=shapes or None)
+        if compile_sizes:
+            inst._bucket_sizes = sorted(set(compile_sizes))
+            inst._max_bucket_size = inst._bucket_sizes[-1] if inst._bucket_sizes else 0
+        return inst
 
     @property
     def bucket_sizes(self) -> list[int]:
@@ -354,26 +388,15 @@ class SpyreShapeBucketer:
         max_model_len: int,
         max_num_batched_tokens: int,
     ) -> tuple[int, int] | None:
-        """Smallest warmed ``(B, L)`` that covers the batch, or None.
-
-        Only cells in ``encoder_shapes`` are eligible, so runtime pad lands on
-        a graph warmup already compiled. Prefer smallest ``T = B × L``, then
-        smallest ``B``, then smallest ``L``.
-        """
-        if num_seqs < 1 or max_query_len < 1 or not self._encoder_shapes:
-            return None
-        candidates = [
-            (batch, length)
-            for batch, length in self._encoder_shapes
-            if batch >= num_seqs
-            and length >= max_query_len
-            and batch <= max_num_seqs
-            and length <= max_model_len
-            and batch * length <= max_num_batched_tokens
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda pair: (pair[0] * pair[1], pair[0], pair[1]))
+        """Smallest warmed attention ``(B, L)`` that covers the batch, or None."""
+        return pick_encoder_attention_shape(
+            num_seqs,
+            max_query_len,
+            self._encoder_shapes,
+            max_num_seqs,
+            max_model_len,
+            max_num_batched_tokens,
+        )
 
     def dispatch_encoder(
         self,

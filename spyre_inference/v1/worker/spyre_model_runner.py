@@ -53,7 +53,6 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig, CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
-from vllm.utils.math_utils import round_up
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
@@ -87,10 +86,7 @@ from spyre_inference.v1.pool import (
     select_rows,
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    EncoderBucketPad,
     SpyreShapeBucketer,
-    encoder_bucket_valid_row_indices,
-    expand_packed_to_encoder_bucket,
     pooling_warmup_pad_query_lens,
     pooling_warmup_shapes,
 )
@@ -379,8 +375,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
-        # Set in pooling ``_prepare_inputs``; cleared after ``_pool`` (or dummy).
-        self._encoder_bucket: EncoderBucketPad | None = None
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -492,12 +486,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.spyre_shape_bucketer = self._create_shape_bucketer()
 
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
-        """Create SpyreShapeBucketer for decoder 1D sizes or pooling 2D cells.
+        """Create SpyreShapeBucketer for 1D body sizes and pooling attention cells.
 
-        Decoder uses ``compile_sizes`` from the graph recorder (#480).
-        Pooling uses encoder ``(B, L)`` shapes; it does not reuse the 1D token
-        ladder. Eager pooling still gets a bucketer so runtime pad lands on
-        the same cells.
+        Decoder and pooling body share 1D ``compile_sizes``. Pooling also
+        keeps attention ``(B, L)`` shapes on the same bucketer; SDPA gather
+        uses those cells, the body does not.
+
+        Pooling keeps a bucketer in eager *and* compile so *runtime* always
+        1D-pads the body. Warmup still differs: compile dummies 1D sizes then
+        each attention cell; eager does one dummy then ``mark_warmed_up()``.
+        Decoder skips a bucketer when eager because 1D pad exists only to hit
+        compiled graphs.
         """
         if self.model_config.runner_type == "pooling":
             return SpyreShapeBucketer.for_pooling(self.vllm_config)
@@ -586,8 +585,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Warm kernels / compile.
 
         Decoder: dummy each 1D ``compile_sizes`` bucket (largest first).
-        Compiled pooling: dummy each encoder ``(B, L)`` at full size, then
-        ``L-2`` / ``L-1``. Eager pooling: one short dummy.
+        Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
+        attention ``(B, L)`` at full size and ``L-2`` / ``L-1`` (body 1D-pads).
+        Eager pooling: one short dummy, then ``mark_warmed_up()``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
@@ -596,6 +596,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Warming up model...")
             t0 = time.time()
             with _set_spyre_compilation_settings(self.vllm_config):
+                if self.spyre_shape_bucketer is not None:
+                    for size in sorted(
+                        self.spyre_shape_bucketer.bucket_sizes, reverse=True
+                    ):
+                        self._dummy_run(size)
+                    self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
@@ -665,11 +671,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         handles padded vs unpadded counts correctly without mutating
         scheduler_output.total_num_scheduled_tokens.
 
-        Decoder: 1D ``compile_sizes`` after warmup.
-        Pooling: 2D ``(B, L)`` so ``num_tokens`` / ``num_reqs`` match the warmed
-        encoder cell. ``_maybe_expand_pooling_inputs_to_encoder_bucket`` still
-        rewrites the packed layout; this method is what execute_model /
-        dummy_run use for the padded counts.
+        Decoder and pooling body: 1D ``compile_sizes`` after warmup.
+        Attention ``(B, L)`` is applied in ``SpyreEncoderAttentionImpl``.
         """
         pad = self._spyre_bucket_batch_descriptor(num_tokens, num_reqs, num_scheduled_tokens_np)
         if pad is not None:
@@ -695,64 +698,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_reqs: int,
         num_scheduled_tokens_np: np.ndarray,
     ) -> BatchDescriptor | None:
-        """Padded ``BatchDescriptor`` for a warmed Spyre bucket, or None.
+        """Padded ``BatchDescriptor`` for a warmed 1D body bucket, or None.
 
-        Pooling must not use the decoder 1D token ladder: SDPA compiles on
-        ``[B, H, L, D]``. Prefer an already-expanded ``_encoder_bucket``
-        (runtime ``_prepare_inputs`` / warmup L-2 dummy), else 2D dispatch on
-        ``(num_reqs, max seq len)``. Both paths wait until warmup is marked,
-        except an already-seeded ``_encoder_bucket`` (L-2 / L-1 dummy).
+        Decoder and pooling body share this path. Encoder SDPA ``(B, L)`` is
+        applied in ``SpyreEncoderAttentionImpl``, not here.
         """
+        del num_reqs, num_scheduled_tokens_np
         bucketer = self.spyre_shape_bucketer
-        if bucketer is None:
-            return None
-
-        if self.model_config.runner_type == "pooling":
-            if self._encoder_bucket is not None:
-                return BatchDescriptor(
-                    num_tokens=self._encoder_bucket.num_tokens,
-                    num_reqs=self._encoder_bucket.batch_bucket,
-                )
-            if not bucketer.is_warmed_up:
-                return None
-            max_query_len = (
-                int(num_scheduled_tokens_np[:num_reqs].max())
-                if num_reqs and num_scheduled_tokens_np.size
-                else 0
-            )
-            desc = bucketer.dispatch_encoder(
-                num_seqs=num_reqs,
-                max_query_len=max_query_len,
-                max_num_seqs=self.scheduler_config.max_num_seqs,
-                max_model_len=self.model_config.max_model_len,
-                max_num_batched_tokens=self.max_num_tokens,
-            )
-            if desc is None:
-                return None
-            return BatchDescriptor(
-                num_tokens=desc.padded_num_tokens,
-                num_reqs=desc.batch_bucket,
-            )
-
-        if not bucketer.is_warmed_up:
+        if bucketer is None or not bucketer.is_warmed_up:
             return None
         desc = bucketer.dispatch(num_tokens)
         if desc is None:
             return None
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
 
-    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
-        if self._encoder_bucket is None:
-            return super()._pad_for_sequence_parallelism(num_scheduled_tokens)
-        # Must align to TP after bucket padding
-        padded = self._encoder_bucket.num_tokens
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if tp_size > 1:
-            padded = round_up(padded, tp_size)
-        return padded
-
     def _warmup_pooling_bucket_shapes(self) -> None:
-        """Dummy each ``(B, L)`` at full size, then ``L-2`` / ``L-1`` pad leftovers."""
+        """Dummy each attention ``(B, L)``. Body already 1D-pads after warmup."""
         if self.spyre_shape_bucketer is not None:
             shapes = self.spyre_shape_bucketer.encoder_shapes
         else:
@@ -775,7 +736,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 self.scheduler_config.max_num_seqs = batch_size
                 num_tokens = batch_size * prompt_len
                 logger.info(
-                    "Pooling warmup: batch_size=%d prompt_len=%d (%d tokens)",
+                    "Pooling attention warmup: batch_size=%d prompt_len=%d (%d tokens)",
                     batch_size,
                     prompt_len,
                     num_tokens,
@@ -785,93 +746,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 for orig_len in pooling_warmup_pad_query_lens(prompt_len):
                     orig_tokens = batch_size * orig_len
                     logger.info(
-                        "Pooling warmup: batch_size=%d prompt_len=%d "
-                        "(dummy %d seqs × %d tokens, pad to %d)",
+                        "Pooling attention warmup: batch_size=%d prompt_len=%d "
+                        "(dummy %d seqs × %d tokens)",
                         batch_size,
                         prompt_len,
                         batch_size,
                         orig_len,
-                        num_tokens,
                     )
-                    self._seed_pooling_bucket_dummy(batch_size, prompt_len, orig_len)
-                    try:
-                        hidden_states, _ = self._dummy_run(orig_tokens, force_attention=True)
-                        hidden_states = self._unpad_encoder_hidden(hidden_states, orig_tokens)
-                        self._dummy_pooler_run(hidden_states)
-                    finally:
-                        self._encoder_bucket = None
+                    hidden_states, _ = self._dummy_run(orig_tokens, force_attention=True)
+                    hidden_states = self._unpad_encoder_hidden(hidden_states, orig_tokens)
+                    self._dummy_pooler_run(hidden_states)
         finally:
             self.scheduler_config.max_num_seqs = saved_max_num_seqs
-
-    def _encoder_pad_token_id(self) -> int:
-        pad_token_id = getattr(self.model_config.hf_config, "pad_token_id", None)
-        return 0 if pad_token_id is None else int(pad_token_id)
-
-    def _write_encoder_bucket_inputs(self, padded_ids: list[int], padded_pos: list[int]) -> None:
-        """Copy packed ``B × L`` ids and positions into the runner buffers.
-
-        ``padded_ids`` / ``padded_pos`` are flat ``[B*L]`` lists from
-        ``expand_packed_to_encoder_bucket``. ``input_ids`` is int32, so Spyre
-        aliases ``.gpu`` to ``.cpu``; there is no H2D here. The model wrapper
-        converts ids to Spyre int64 at the forward boundary.
-        """
-        num_tokens = len(padded_ids)
-        self.input_ids.cpu[:num_tokens].copy_(
-            torch.tensor(padded_ids, dtype=self.input_ids.cpu.dtype)
-        )
-        self.positions[:num_tokens].copy_(
-            torch.tensor(
-                padded_pos,
-                dtype=self.positions.dtype,
-                device=self.positions.device,
-            )
-        )
-
-    def _seed_pooling_bucket_dummy(self, batch_size: int, prompt_len: int, orig_len: int) -> None:
-        orig_lens = [orig_len] * batch_size
-        orig_tokens = orig_len * batch_size
-        positions = [offset for _ in range(batch_size) for offset in range(orig_len)]
-        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
-            [0] * orig_tokens,
-            positions,
-            orig_lens,
-            batch_size,
-            prompt_len,
-            pad_token_id=self._encoder_pad_token_id(),
-        )
-        self._write_encoder_bucket_inputs(padded_ids, padded_pos)
-        self._encoder_bucket = EncoderBucketPad(
-            batch_bucket=batch_size,
-            len_bucket=prompt_len,
-            orig_query_lens=orig_lens,
-            orig_num_tokens=orig_tokens,
-            orig_num_reqs=batch_size,
-        )
-        self._apply_encoder_bucket_attn_layout(self._encoder_bucket)
-
-    def _apply_encoder_bucket_attn_layout(self, bucket: EncoderBucketPad) -> None:
-        """Packed ``query_start_loc`` is ``B`` rows of ``L``; ``seq_lens`` stay real."""
-        num_tokens = bucket.num_tokens
-        batch_bucket = bucket.batch_bucket
-        len_bucket = bucket.len_bucket
-        num_reqs = bucket.orig_num_reqs
-        qsl = np.arange(0, num_tokens + 1, len_bucket, dtype=self.query_start_loc.np.dtype)
-        self.query_start_loc.np[: batch_bucket + 1] = qsl
-        self.query_start_loc.np[batch_bucket + 1 :].fill(num_tokens)
-        self.query_start_loc.copy_to_gpu()
-
-        orig = torch.tensor(bucket.orig_query_lens, dtype=self.optimistic_seq_lens_cpu.dtype)
-        self.optimistic_seq_lens_cpu[:num_reqs] = orig
-        self.seq_lens[:num_reqs] = orig.to(device=self.seq_lens.device)
-        dummy = torch.full(
-            (batch_bucket - num_reqs,),
-            len_bucket,
-            dtype=self.optimistic_seq_lens_cpu.dtype,
-        )
-        self.optimistic_seq_lens_cpu[num_reqs:batch_bucket] = dummy
-        self.seq_lens[num_reqs:batch_bucket] = dummy.to(device=self.seq_lens.device)
-        self.optimistic_seq_lens_cpu[batch_bucket:].fill_(0)
-        self.seq_lens[batch_bucket:].fill_(0)
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
@@ -903,155 +789,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             hidden_states = convert(hidden_states, self._spyre_device)
         return hidden_states, last_hidden_states
 
-    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
-        """Expand pooling packs to ``(B, L)``. Drop leftover pad on the way in.
-
-        ``_encoder_bucket`` stays set after this returns so determine / attn /
-        pool see the cell.
-        """
-        self._encoder_bucket = None  # reset before each step
-        result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
-        self._maybe_expand_pooling_inputs_to_encoder_bucket(num_scheduled_tokens)
-        return result
-
-    def _maybe_expand_pooling_inputs_to_encoder_bucket(
-        self, num_scheduled_tokens: np.ndarray
-    ) -> None:
-        """Rewrite packed inputs to ``B`` sequences of length ``L`` (``T = B×L``).
-
-        Linear/LN compile on the flat token count; attention compiles on
-        ``[B, H, L, D]``. One warmup per ``(B, L)`` covers both when the
-        runtime batch is padded the same way. Attention still masks with the
-        original lengths (kept in ``seq_lens``).
-        """
-        if self.model_config.runner_type != "pooling":
-            return
-
-        num_reqs = self.input_batch.num_reqs
-        orig_lens = [int(n) for n in num_scheduled_tokens[:num_reqs]]
-        orig_tokens = int(sum(orig_lens))
-        if orig_tokens <= 0:
-            return
-
-        if self.spyre_shape_bucketer is None:
-            return
-        desc = self.spyre_shape_bucketer.dispatch_encoder(
-            num_seqs=num_reqs,
-            max_query_len=max(orig_lens),
-            max_num_seqs=self.scheduler_config.max_num_seqs,
-            max_model_len=self.model_config.max_model_len,
-            max_num_batched_tokens=self.max_num_tokens,
-        )
-        if desc is None:
-            return
-        batch_bucket, len_bucket = desc.batch_bucket, desc.len_bucket
-        if (
-            batch_bucket == num_reqs
-            and orig_tokens == batch_bucket * len_bucket
-            and all(length == len_bucket for length in orig_lens)
-        ):
-            return
-
-        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
-            self.input_ids.cpu[:orig_tokens].tolist(),
-            self.positions[:orig_tokens].detach().cpu().tolist(),
-            orig_lens,
-            batch_bucket,
-            len_bucket,
-            pad_token_id=self._encoder_pad_token_id(),
-        )
-        self._write_encoder_bucket_inputs(padded_ids, padded_pos)
-        self._encoder_bucket = EncoderBucketPad(
-            batch_bucket=batch_bucket,
-            len_bucket=len_bucket,
-            orig_query_lens=orig_lens,
-            orig_num_tokens=orig_tokens,
-            orig_num_reqs=num_reqs,
-        )
-        self._apply_encoder_bucket_attn_layout(self._encoder_bucket)
-
-    def _build_attention_metadata(
-        self,
-        num_tokens: int,
-        num_reqs: int,
-        max_query_len: int,
-        num_tokens_padded: int | None = None,
-        num_reqs_padded: int | None = None,
-        ubatch_slices=None,
-        logits_indices: torch.Tensor | None = None,
-        use_spec_decode: bool = False,
-        for_cudagraph_capture: bool = False,
-        num_scheduled_tokens: dict[str, int] | None = None,
-        cascade_attn_prefix_lens: list[list[int]] | None = None,
-        slot_mappings: dict[int, torch.Tensor] | None = None,
-    ):
-        bucket = self._encoder_bucket
-        if bucket is not None:
-            # dummy_run overwrites query_start_loc / seq_lens; restore (B, L).
-            self._apply_encoder_bucket_attn_layout(bucket)
-            num_tokens = bucket.num_tokens
-            num_reqs = bucket.batch_bucket
-            max_query_len = bucket.len_bucket
-            num_tokens_padded = bucket.num_tokens
-            num_reqs_padded = bucket.batch_bucket
-        return super()._build_attention_metadata(
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            max_query_len=max_query_len,
-            num_tokens_padded=num_tokens_padded,
-            num_reqs_padded=num_reqs_padded,
-            ubatch_slices=ubatch_slices,
-            logits_indices=logits_indices,
-            use_spec_decode=use_spec_decode,
-            for_cudagraph_capture=for_cudagraph_capture,
-            num_scheduled_tokens=num_scheduled_tokens,
-            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-            slot_mappings=slot_mappings,
-        )
-
-    def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
-        """Keep encoder-bucket pad positions through upstream preprocess.
-
-        Upstream zeroes ``positions[num_scheduled_tokens:num_input_tokens]``
-        when the batch is padded. Encoder buckets already wrote those slots
-        (real tokens, then continued pad positions so ``T = B × L``). Restore
-        that tensor and return it in the preprocess tuple so embed / RoPE see
-        the warmed shape, not a ragged prefix plus zeros.
-        """
-        bucket = self._encoder_bucket
-        saved_pos = None
-        if bucket is not None:
-            saved_pos = self.positions[: bucket.num_tokens].clone()
-        result = super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
-        if saved_pos is None:
-            return result
-        self.positions[: saved_pos.shape[0]].copy_(saved_pos)
-        input_ids, inputs_embeds, _positions, *rest = result
-        return (input_ids, inputs_embeds, self.positions[:num_input_tokens], *rest)
-
     def _unpad_encoder_hidden(
         self, hidden_states: torch.Tensor, num_scheduled_tokens: int
     ) -> torch.Tensor:
-        """Gather real tokens out of a ``B×L`` packed hidden state."""
-        bucket = self._encoder_bucket
-        if bucket is None:
-            if hidden_states.shape[0] != num_scheduled_tokens:
-                hidden_states = select_rows(
-                    hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
-                )
-            return hidden_states
-        indices = encoder_bucket_valid_row_indices(bucket.orig_query_lens, bucket.len_bucket)
-        return select_rows(hidden_states, torch.tensor(indices, dtype=torch.int64))
-
-    def _restore_orig_query_start_loc(self) -> None:
-        bucket = self._encoder_bucket
-        if bucket is None:
-            return
-        cu = np.cumsum([0, *bucket.orig_query_lens], dtype=self.query_start_loc.np.dtype)
-        num_reqs = bucket.orig_num_reqs
-        self.query_start_loc.np[: num_reqs + 1] = cu
-        self.query_start_loc.np[num_reqs + 1 :].fill(cu[-1])
-        self.query_start_loc.copy_to_gpu()
+        """Drop 1D body pad tokens before pooling."""
+        if hidden_states.shape[0] != num_scheduled_tokens:
+            hidden_states = select_rows(
+                hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
+            )
+        return hidden_states
 
     def _dummy_pooler_run_task(
         self,
@@ -1134,7 +880,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             hidden_states = self._unpad_encoder_hidden(
                 convert(hidden_states, "cpu"), num_scheduled_tokens
             )
-            self._restore_orig_query_start_loc()
             return super()._pool(
                 hidden_states,
                 num_scheduled_tokens,
@@ -1158,7 +903,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Crop via index_select — Spyre dim-0 slice views are unsafe.
         hidden_states = convert(hidden_states, self._spyre_device)
         hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
-        self._restore_orig_query_start_loc()
 
         # Mirror GPUModelRunner._pool after crop. Build the cursor on CPU:
         # upstream does ``cumsum[1:] - 1`` for last_token_indices; that offset-1

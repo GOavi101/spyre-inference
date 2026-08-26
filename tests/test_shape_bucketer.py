@@ -154,7 +154,7 @@ class TestEncoderDispatch:
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
         assert b.encoder_shapes == [(1, 64), (1, 128), (4, 64), (4, 128)]
-        assert b.bucket_sizes == [64, 128, 256, 512]
+        assert b.bucket_sizes == [64, 128]
 
     def test_for_pooling_skips_non_pooling(self):
         assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
@@ -162,8 +162,17 @@ class TestEncoderDispatch:
     def test_for_pooling_none_when_no_shapes(self, monkeypatch):
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
         cfg = _pooling_vllm_config(max_model_len=64, max_num_batched_tokens=128)
-        cfg.compilation_config.compile_sizes = [256]
+        cfg.compilation_config.compile_sizes = []
         assert SpyreShapeBucketer.for_pooling(cfg) is None
+
+    def test_for_pooling_1d_only_when_no_attention_shapes(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
+        cfg = _pooling_vllm_config(max_model_len=64, max_num_batched_tokens=128)
+        cfg.compilation_config.compile_sizes = [256]
+        b = SpyreShapeBucketer.for_pooling(cfg)
+        assert b is not None
+        assert b.encoder_shapes == []
+        assert b.bucket_sizes == [256]
 
     def test_dispatch_encoder_pads_to_warmed_cell(self, monkeypatch):
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
@@ -185,10 +194,10 @@ class TestEncoderDispatch:
         assert desc.actual_max_len == 30
 
     def test_pooling_2d_not_1d_token_ladder(self, monkeypatch):
-        """Pooling must pad to (B, L), not the decoder 1D compile_sizes ladder.
+        """Body 1D pad and attention (B, L) are independent.
 
-        3 seqs × 30 tokens is 90 packed tokens. 1D dispatch would pick 128;
-        encoder SDPA needs (4, 64) so T = 256.
+        3 seqs × 30 tokens is 90 packed tokens. Body picks T=128; SDPA
+        still gathers to (4, 64).
         """
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
         cfg = _pooling_vllm_config()

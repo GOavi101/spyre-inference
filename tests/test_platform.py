@@ -322,8 +322,8 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def test_apply_config_sets_pooling_compile_sizes_from_max_model_len():
-    """Pooling L lives on compile_sizes, same hook as decoder 1D sizes."""
+def test_apply_config_sets_pooling_compile_sizes_from_token_cap():
+    """Pooling body T lives on compile_sizes; attention L is independent."""
     from unittest.mock import MagicMock
 
     from vllm.config import CompilationMode
@@ -334,10 +334,12 @@ def test_apply_config_sets_pooling_compile_sizes_from_max_model_len():
     vllm_config.model_config.enforce_eager = False
     vllm_config.model_config.runner_type = "pooling"
     vllm_config.model_config.max_model_len = 512
+    vllm_config.scheduler_config.max_num_batched_tokens = 512
     vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
     vllm_config.compilation_config.custom_ops = ["all"]
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.compilation_config.compile_sizes == [64, 128, 256, 512]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
 
 
 def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):

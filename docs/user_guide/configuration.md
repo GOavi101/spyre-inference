@@ -30,35 +30,27 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 ## Encoder / pooling compile buckets
 
 Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
-`--enforce-eager` to disable it. Each new encoder shape is a new graph (~60s):
-SDPA specializes `[B, H, L, D]`, and Linear / LN specialize the flat token
-count `[T, …]`.
+`--enforce-eager` to disable it. Body and attention are bucketed independently:
 
-At runtime the plugin pads **each sequence** to the next length bucket `L` and
-the **batch** to `B`, so `T = B × L`. Attention still masks to the real prompt
-lengths; pooling gathers the real tokens before CLS / LAST / MEAN.
+- **Body** (Linear / LN): pad the packed token count to the next 1D
+  `compile_sizes` bucket `T` (same dispatch as the decoder).
+- **Attention** (SDPA): gather into a dense `(B, L)` grid. This is the Spyre
+  workaround until flash-style attention lands; the body is not rewritten to
+  `T = B × L`.
 
-`L` is `compilation_config.compile_sizes`, filled from `--max-model-len`
-(`64, 128, …` up to that cap) in the same platform hook as decoder 1D sizes.
+`compile_sizes` for pooling is the body `T` ladder (`64, 128, …` up to the
+token cap). Attention `L` comes from `--max-model-len` (`64, 128, …`).
 
 | Env | Default | Meaning |
 |---|---|---|
-| `SPYRE_ENCODER_BUCKET_BATCH_SIZES` | `1, 2, 4, …, max_num_seqs` | Batch ladder |
+| `SPYRE_ENCODER_BUCKET_BATCH_SIZES` | `1, 2, 4, …, max_num_seqs` | Attention batch ladder |
 
-A 30-token, 3-seq request with `--max-num-seqs 4` is padded to `(B=4, L=64)`
-(`T=256`) and reuses that warmed graph. If `(B, L)` would exceed
-`--max-num-batched-tokens`, the batch is left unpadded (a new compile).
+A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`
+and attention to `(B=4, L=64)`. Masks and pooling still use the real lengths.
 
-Those `(B, L)` cells live on `SpyreShapeBucketer` (2D encoder dispatch; the
-same class as decoder 1D `compile_sizes` from the graph recorder). Warmup
-dummies the list; runtime pads onto a warmed cell (not the decoder 1D token
-ladder) so SDPA stays `[B, H, L, D]`. Encoder attention is part of the
-compiled graph — it is not skipped.
-
-Compiled pooling warmup dummies each `(B, L)` three ways: full `B × L`, then
-`L-2` and `L-1` padded onto `T = B × L`. (`--random-input-len L` subtracts
-tokenizer specials, often 2.) Eager pooling (`--enforce-eager`) uses one short
-dummy, same as a decoder with compile off.
+Compiled pooling warmup dummies 1D body sizes, then each attention `(B, L)`
+at full size and `L-2` / `L-1`. Eager pooling uses one short dummy, then
+runtime still 1D-pads the body.
 
 Example:
 

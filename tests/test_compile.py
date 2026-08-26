@@ -67,8 +67,9 @@ def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compiled pooling pads to ``(B, L)`` and matches cached HF refs.
 
-    Two prompts at ``max_num_seqs=2`` / ``max_model_len=64`` warmup ``(1, 64)``
-    and ``(2, 64)``, then runtime pads the batch onto ``(2, 64)``.
+    Two prompts at ``max_num_seqs=2`` / ``max_model_len=64`` warmup body ``T``
+    and attention ``(1, 64)`` / ``(2, 64)``. Runtime 1D-pads the body; SDPA
+    gathers onto ``(2, 64)``.
     """
     from vllm import LLM
 

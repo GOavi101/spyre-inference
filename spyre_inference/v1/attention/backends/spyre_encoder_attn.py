@@ -27,6 +27,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vllm.config import get_current_vllm_config
 from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference.custom_ops.utils import convert
@@ -37,6 +38,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
 )
 from spyre_inference.v1.pool import select_rows
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    default_encoder_len_buckets,
+    pick_encoder_attention_shape,
+    pooling_warmup_shapes,
+)
 
 # Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
 # L-aligned keeps P·V's K stick-aligned; D-aligned keeps QKᵀ's K stick-aligned
@@ -47,6 +53,38 @@ ENCODER_SEQ_ALIGNMENT = 64
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
     return max(align, (n + align - 1) // align * align)
+
+
+def _attention_sdpa_shape(num_seqs: int, max_len: int) -> tuple[int, int]:
+    """Warmed ``(B, L)`` for SDPA, else stick-aligned ``(S, L)``.
+
+    Body token pad is 1D and lives on the runner. This grid is the Spyre
+    SDPA workaround; flash attention can drop it later.
+    """
+    try:
+        cfg = get_current_vllm_config()
+        max_num_seqs = cfg.scheduler_config.max_num_seqs
+        max_model_len = cfg.model_config.max_model_len
+        max_num_batched_tokens = cfg.scheduler_config.max_num_batched_tokens
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            len_ladder=default_encoder_len_buckets(max_model_len),
+        )
+    except Exception:
+        return num_seqs, _align_up(max_len)
+    pair = pick_encoder_attention_shape(
+        num_seqs,
+        max_len,
+        shapes,
+        max_num_seqs,
+        max_model_len,
+        max_num_batched_tokens,
+    )
+    if pair is None:
+        return num_seqs, _align_up(max_len)
+    return pair
 
 
 def host_pack_indices(
@@ -223,7 +261,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
 
         max_len = max(query_lens, default=0)
-        aligned_len = _align_up(max_len)
+        batch_bucket, aligned_len = _attention_sdpa_shape(num_seqs, max_len)
+        orig_q_starts = q_starts
+        orig_query_lens = query_lens
+        if batch_bucket > num_seqs:
+            q_starts = q_starts + [n] * (batch_bucket - num_seqs)
+            query_lens = query_lens + [0] * (batch_bucket - num_seqs)
+            kv_lens = kv_lens + [0] * (batch_bucket - num_seqs)
 
         target_device = output.device
         # Keep activations on the SDPA device; pack/unpack via index_select.
@@ -237,14 +281,14 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # K/V may be shorter than Q when seq_lens < query_lens; still use q_starts.
         kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
         kv_pack_idx = host_pack_indices(q_starts, kv_pack_lens, aligned_len, pad_row)
-        unpack_idx = host_unpack_indices(q_starts, query_lens, aligned_len, n)
+        unpack_idx = host_unpack_indices(orig_q_starts, orig_query_lens, aligned_len, n)
 
         q_batched = gather_pack(query, q_pack_idx, head_size_padded)
         k_batched = gather_pack(key, kv_pack_idx, head_size_padded)
         v_batched = gather_pack(value, kv_pack_idx, head_size_padded)
 
         mask = build_attention_mask(
-            num_seqs,
+            batch_bucket,
             aligned_len,
             query_lens,
             kv_lens,
@@ -256,7 +300,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if num_kv_heads != num_heads:
             sdpa_kwargs["enable_gqa"] = True
 
-        # Single on-device SDPA: [num_seqs, H, L_aligned, D_padded].
+        # Single on-device SDPA: [B, H, L, D_padded] (attention bucket).
         attn_out = F.scaled_dot_product_attention(
             q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
         )
