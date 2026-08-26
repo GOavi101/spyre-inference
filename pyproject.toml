@@ -238,6 +238,9 @@ skip_gitignore = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Scopes spyre-testing-plugin to this repo; a pytest11 entry point would also load it
+# into unrelated pytest runs sharing the venv (e.g. a sibling torch-spyre checkout).
+addopts = ["-p", "spyre_testing_plugin.pytest_plugin"]
 asyncio_default_fixture_loop_scope = "function"
 # A card acquisition that blocks in the kernel yields no output, so the test
 # must be cut off from outside. "thread" dumps every thread's stack on expiry,
