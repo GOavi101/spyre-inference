@@ -535,8 +535,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = self._compile_blocks()
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre. "
-                    "Embeddings and the final norm stay eager.",
+                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre.",
                     num_blocks,
                     model_name,
                 )
