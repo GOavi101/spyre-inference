@@ -79,6 +79,7 @@ from spyre_inference.custom_ops.head_pad import (
     verify_padded_head_dim,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -769,9 +770,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         metadata unless that flag or a FULL cudagraph is set; encoder impl
         then does ``if attn_metadata is None: return output`` and never
         compiles pack/SDPA. Real ``execute_model`` always has metadata.
+
+        Decoder warmup also publishes null KV slots so the scatter-in-graph
+        path (#610) sees the same binding as a real step.
         """
         if self.model_config.runner_type == "pooling":
             kwargs.setdefault("force_attention", True)
+        # Read out of the passthrough rather than named in the signature, which would
+        # pin this override to upstream's parameter order across vLLM bumps.
+        num_tokens = kwargs.get("num_tokens", args[0] if args else None)
+        if num_tokens is not None:
+            attn_layer.publish_null_slots(num_tokens)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:
