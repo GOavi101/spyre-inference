@@ -30,7 +30,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     expand_packed_to_encoder_bucket,
     len_buckets,
     next_bucket,
-    pooling_warmup_pad_query_lens,
     pooling_warmup_shapes,
 )
 
@@ -308,11 +307,6 @@ class TestEncoderBuckets:
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
         assert encoder_batch_bucket(2, 4) == 4
         assert batch_buckets(4) == [1, 4]
-
-    def test_warmup_pad_query_lens_include_random_dataset_specials(self):
-        assert pooling_warmup_pad_query_lens(64) == [62, 63]
-        assert pooling_warmup_pad_query_lens(2) == [1]
-        assert pooling_warmup_pad_query_lens(1) == []
 
     def test_warmup_shapes_use_max_model_len(self, monkeypatch):
         monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")

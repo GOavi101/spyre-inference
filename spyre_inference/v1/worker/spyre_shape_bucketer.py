@@ -160,17 +160,6 @@ def encoder_batch_bucket(num_seqs: int, max_num_seqs: int) -> int:
     return min(next_bucket(n, batch_buckets(cap)), cap)
 
 
-def pooling_warmup_pad_query_lens(prompt_len: int) -> list[int]:
-    """Unpadded dummy lengths (``L-2``, ``L-1``) so pad leftovers compile.
-
-    vLLM ``--random-input-len L`` samples ``L`` minus tokenizer specials (often 2).
-    """
-    lens = {max(1, prompt_len - 1)}
-    if prompt_len > 2:
-        lens.add(prompt_len - 2)
-    return sorted(length for length in lens if length < prompt_len)
-
-
 def pooling_warmup_shapes(
     max_num_seqs: int,
     max_model_len: int,

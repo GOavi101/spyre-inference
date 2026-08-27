@@ -87,7 +87,6 @@ from spyre_inference.v1.pool import (
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
-    pooling_warmup_pad_query_lens,
     pooling_warmup_shapes,
 )
 
@@ -586,7 +585,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Decoder: dummy each 1D ``compile_sizes`` bucket (largest first).
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
-        attention ``(B, L)`` at full size and ``L-2`` / ``L-1`` (body 1D-pads).
+        attention ``(B, L)`` at its full size.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
@@ -741,19 +740,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
                 hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
                 self._dummy_pooler_run(hidden_states)
-                for orig_len in pooling_warmup_pad_query_lens(prompt_len):
-                    orig_tokens = batch_size * orig_len
-                    logger.info(
-                        "Pooling attention warmup: batch_size=%d prompt_len=%d "
-                        "(dummy %d seqs × %d tokens)",
-                        batch_size,
-                        prompt_len,
-                        batch_size,
-                        orig_len,
-                    )
-                    hidden_states, _ = self._dummy_run(orig_tokens, force_attention=True)
-                    hidden_states = self._unpad_encoder_hidden(hidden_states, orig_tokens)
-                    self._dummy_pooler_run(hidden_states)
         finally:
             self.scheduler_config.max_num_seqs = saved_max_num_seqs
 
@@ -866,9 +852,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         MEAN / FP32 heads keep the pooler on CPU — delegate to
         ``GPUModelRunner._pool``. On-Spyre CLS/LAST still overrides the private
-        hook: dim-0 crop must use ``index_select`` (not ``[:n]``), and pooled
-        D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU). Drop this once
-        those ops are safe (fallback probes / #3507–#3508).
+        hook: pooled D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU).
+        Drop this once that op is safe (fallback probes / #3507–#3508).
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"
@@ -898,14 +883,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     "runs on Spyre."
                 )
 
-        # Crop via index_select — Spyre dim-0 slice views are unsafe.
+        # Unlike upstream's cheap [:num_scheduled_tokens] slice, cropping here
+        # would need index_select (Spyre dim-0 slice views are unsafe) and
+        # would make its shape vary with real content on every request.
+        # Skip it: CLS/LAST read rows via cursor_row_indices_cpu, which never
+        # depends on hidden_states' own length.
         hidden_states = convert(hidden_states, self._spyre_device)
-        hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
 
-        # Mirror GPUModelRunner._pool after crop. Build the cursor on CPU:
-        # upstream does ``cumsum[1:] - 1`` for last_token_indices; that offset-1
-        # view is not stick-aligned on Spyre (copy_from_d2d fails). SpyreCLS/Last
-        # only read host ``num_scheduled_tokens_cpu`` via cursor_row_indices_cpu.
+        # Build the cursor on CPU: upstream does ``cumsum[1:] - 1`` for
+        # last_token_indices; that offset-1 view is not stick-aligned on
+        # Spyre (copy_from_d2d fails). SpyreCLS/Last only read host
+        # ``num_scheduled_tokens_cpu`` via cursor_row_indices_cpu.
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
