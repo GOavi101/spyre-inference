@@ -733,8 +733,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for batch_size, prompt_len in shapes:
                 self.scheduler_config.max_num_seqs = batch_size
                 num_tokens = batch_size * prompt_len
+                # Exact (B, L) compile first, then shorter L that pad up to this
+                # bucket — same log prefix would make those two look identical.
                 logger.info(
-                    "Pooling attention warmup: batch_size=%d prompt_len=%d (%d tokens)",
+                    "Pooling attention warmup: exact bucket "
+                    "batch_size=%d prompt_len=%d (%d tokens)",
                     batch_size,
                     prompt_len,
                     num_tokens,
@@ -744,12 +747,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 for orig_len in pooling_warmup_pad_query_lens(prompt_len):
                     orig_tokens = batch_size * orig_len
                     logger.info(
-                        "Pooling attention warmup: batch_size=%d prompt_len=%d "
-                        "(dummy %d seqs × %d tokens)",
+                        "Pooling attention warmup: pad path into bucket "
+                        "batch_size=%d prompt_len=%d from unpadded_len=%d "
+                        "(%d tokens)",
                         batch_size,
                         prompt_len,
-                        batch_size,
                         orig_len,
+                        orig_tokens,
                     )
                     hidden_states, _ = self._dummy_run(orig_tokens, force_attention=True)
                     hidden_states = self._unpad_encoder_hidden(hidden_states, orig_tokens)
