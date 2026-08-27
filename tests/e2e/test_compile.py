@@ -27,7 +27,7 @@ import torch.nn.functional as F
 pytestmark = pytest.mark.compile
 
 _POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
-_POOLING_REFS = Path(__file__).parent / "data" / "encoder_embed_refs.json"
+_POOLING_REFS = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _COSINE_MIN = 0.99
 
 
