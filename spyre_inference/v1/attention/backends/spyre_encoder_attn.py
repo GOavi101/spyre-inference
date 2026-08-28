@@ -55,38 +55,6 @@ def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
     return max(align, (n + align - 1) // align * align)
 
 
-def _attention_sdpa_shape(num_seqs: int, max_len: int) -> tuple[int, int]:
-    """Warmed ``(B, L)`` for SDPA, else stick-aligned ``(S, L)``.
-
-    Body token pad is 1D and lives on the runner. This grid is the Spyre
-    SDPA workaround; flash attention can drop it later.
-    """
-    try:
-        cfg = get_current_vllm_config()
-        max_num_seqs = cfg.scheduler_config.max_num_seqs
-        max_model_len = cfg.model_config.max_model_len
-        max_num_batched_tokens = cfg.scheduler_config.max_num_batched_tokens
-        shapes = pooling_warmup_shapes(
-            max_num_seqs=max_num_seqs,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
-            len_ladder=default_encoder_len_buckets(max_model_len),
-        )
-    except Exception:
-        return num_seqs, _align_up(max_len)
-    pair = pick_encoder_attention_shape(
-        num_seqs,
-        max_len,
-        shapes,
-        max_num_seqs,
-        max_model_len,
-        max_num_batched_tokens,
-    )
-    if pair is None:
-        return num_seqs, _align_up(max_len)
-    return pair
-
-
 def host_pack_indices(
     q_starts: list[int],
     lengths: list[int],
@@ -108,8 +76,12 @@ def host_unpack_indices(
     aligned_len: int,
     num_tokens: int,
 ) -> torch.Tensor:
-    """Build ``[T]`` int64 indices from flat padded ``[B*L]`` back to tokens."""
-    indices = torch.empty(num_tokens, dtype=torch.int64)
+    """Build ``[T]`` int64 indices from flat padded ``[B*L]`` back to tokens.
+
+    ``num_tokens`` may exceed the real count; unfilled entries stay ``0``
+    (a safe row to read — nothing downstream reads those output rows).
+    """
+    indices = torch.zeros(num_tokens, dtype=torch.int64)
     for s, (start, length) in enumerate(zip(q_starts, query_lens)):
         if length > 0:
             base = s * aligned_len
@@ -218,6 +190,21 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     unpacks with gather.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # get_current_vllm_config() only works at construction time; forward()
+        # runs through a custom-op boundary that loses the context.
+        cfg = get_current_vllm_config()
+        self._cached_max_num_seqs = cfg.scheduler_config.max_num_seqs
+        self._cached_max_model_len = cfg.model_config.max_model_len
+        self._cached_max_num_batched_tokens = cfg.scheduler_config.max_num_batched_tokens
+        self._cached_encoder_shapes = pooling_warmup_shapes(
+            max_num_seqs=self._cached_max_num_seqs,
+            max_model_len=self._cached_max_model_len,
+            max_num_batched_tokens=self._cached_max_num_batched_tokens,
+            len_ladder=default_encoder_len_buckets(self._cached_max_model_len),
+        )
+
     def forward(  # ty: ignore[invalid-method-override]
         self,
         layer: AttentionLayer,
@@ -234,11 +221,11 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if attn_metadata is None:
             return output
 
+        # query/key/value/output are padded to the runner's warmed body-bucket
+        # size, not num_actual_tokens. Keep that shape or index_select
+        # recompiles per request.
         n = attn_metadata.num_actual_tokens
-        query = query[:n]
-        key = key[:n]
-        value = value[:n]
-        output = output[:n]
+        padded_tokens = query.shape[0]
 
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
@@ -261,7 +248,17 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
 
         max_len = max(query_lens, default=0)
-        batch_bucket, aligned_len = _attention_sdpa_shape(num_seqs, max_len)
+        pair = pick_encoder_attention_shape(
+            num_seqs,
+            max_len,
+            self._cached_encoder_shapes,
+            self._cached_max_num_seqs,
+            self._cached_max_model_len,
+            self._cached_max_num_batched_tokens,
+        )
+        batch_bucket, aligned_len = (
+            pair if pair is not None else (num_seqs, _align_up(max_len))
+        )
         orig_q_starts = q_starts
         orig_query_lens = query_lens
         if batch_bucket > num_seqs:
@@ -276,12 +273,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
-        pad_row = n  # index of the appended zero row in gather_pack
+        pad_row = padded_tokens  # index of the appended zero row in gather_pack
         q_pack_idx = host_pack_indices(q_starts, query_lens, aligned_len, pad_row)
         # K/V may be shorter than Q when seq_lens < query_lens; still use q_starts.
         kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
         kv_pack_idx = host_pack_indices(q_starts, kv_pack_lens, aligned_len, pad_row)
-        unpack_idx = host_unpack_indices(orig_q_starts, orig_query_lens, aligned_len, n)
+        unpack_idx = host_unpack_indices(orig_q_starts, orig_query_lens, aligned_len, padded_tokens)
 
         q_batched = gather_pack(query, q_pack_idx, head_size_padded)
         k_batched = gather_pack(key, kv_pack_idx, head_size_padded)
@@ -314,8 +311,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if use_flat_write:
             if result.device.type == "spyre":
                 result = convert(result, "cpu")
-            src = convert(result.reshape(n, -1).contiguous(), target_device.type, output.dtype)
-            output.reshape(n, -1).copy_(src)
+            src = convert(
+                result.reshape(padded_tokens, -1).contiguous(), target_device.type, output.dtype
+            )
+            output.reshape(padded_tokens, -1).copy_(src)
         else:
             if result.device.type != output.device.type:
                 result = convert(result, output.device)

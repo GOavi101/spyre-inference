@@ -49,8 +49,8 @@ A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`
 and attention to `(B=4, L=64)`. Masks and pooling still use the real lengths.
 
 Compiled pooling warmup dummies 1D body sizes, then each attention `(B, L)`
-at full size and `L-2` / `L-1`. Eager pooling uses one short dummy, then
-runtime still 1D-pads the body.
+at full size. Eager pooling uses one short dummy, then runtime still
+1D-pads the body.
 
 Example:
 
