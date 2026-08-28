@@ -256,9 +256,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._cached_max_model_len,
             self._cached_max_num_batched_tokens,
         )
-        batch_bucket, aligned_len = (
-            pair if pair is not None else (num_seqs, _align_up(max_len))
-        )
+        batch_bucket, aligned_len = pair if pair is not None else (num_seqs, _align_up(max_len))
         orig_q_starts = q_starts
         orig_query_lens = query_lens
         if batch_bucket > num_seqs:
