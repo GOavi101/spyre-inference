@@ -183,6 +183,8 @@ select = [
     "E",
     # Pyflakes
     "F",
+    # isort
+    "I",
     # pyupgrade
     "UP",
     # flake8-bugbear
