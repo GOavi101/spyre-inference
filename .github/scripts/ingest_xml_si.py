@@ -223,7 +223,7 @@ def insert_run(client, run_id: str, run: dict, args):
             "branch",
             "commit_sha",
             "pr_number",
-            "gha_run_id",
+            "runner_run_id",
             "triggered_at",
             "total_tests",
             "passed",
@@ -434,8 +434,8 @@ def main():
             # run id to keep that path idempotent.
             existing = client.query(
                 "SELECT count() FROM si_test_runs WHERE "
-                "gha_run_id = {gha_run_id:UInt64} AND filename = {filename:String}",
-                parameters={"gha_run_id": gha_run_id, "filename": run["filename"]},
+                "runner_run_id = {runner_run_id:UInt64} AND filename = {filename:String}",
+                parameters={"runner_run_id": gha_run_id, "filename": run["filename"]},
             )
         if existing.result_rows[0][0] > 0:
             print(f"  Already ingested — skipping {run['filename']}")
