@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-
 from vllm.config import get_current_vllm_config
 from vllm.v1.attention.backend import AttentionLayer
 

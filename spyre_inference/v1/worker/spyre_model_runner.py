@@ -43,18 +43,16 @@ import time
 from contextlib import contextmanager
 from typing import cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_map
-
-import numpy as np
-
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import VllmConfig, CompilationMode, CUDAGraphMode
+from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
@@ -90,7 +88,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     pooling_warmup_shapes,
 )
-
 
 logger = init_logger(__name__)
 
@@ -547,8 +544,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = self._compile_blocks()
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre. "
-                    "Embeddings and the final norm stay eager.",
+                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre.",
                     num_blocks,
                     model_name,
                 )
@@ -957,6 +953,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         one-element device tensor, so the page read is a real indirect access.
         """
         from vllm.v1.worker.utils import bind_kv_cache
+
         from spyre_inference.v1.attention.backends.spyre_attn import (
             SpyrePagedKVCache,
             slot_major_kv_layout,
