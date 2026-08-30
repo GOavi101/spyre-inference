@@ -28,6 +28,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     build_attention_mask,
+    encoder_workspace,
 )
 
 # extra `encoder_attention` mark so CI can split this into its own job
@@ -458,3 +459,26 @@ def test_spyre_encoder_attn(
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
     )
+
+
+def test_encoder_workspace_reused_across_layers():
+    """Pack indices and the L×L mask are built once per step, not per layer."""
+
+    class _Meta:
+        num_seqs = 2
+        query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32)
+        seq_lens = torch.tensor([3, 2], dtype=torch.int32)
+
+    meta = _Meta()
+    kwargs = dict(
+        n=5,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        head_size_padded=64,
+    )
+    first = encoder_workspace(meta, **kwargs)
+    second = encoder_workspace(meta, **kwargs)
+    assert first is second
+    assert first.mask is second.mask
+    assert first.q_pack_idx is second.q_pack_idx
+    assert first.aligned_len == 64

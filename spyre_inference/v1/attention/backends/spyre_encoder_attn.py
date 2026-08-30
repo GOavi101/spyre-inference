@@ -19,10 +19,13 @@ layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
 Ragged→dense packing uses host-built indices + ``index_select`` (gather).
 Pad slots gather a trailing zero row so the dense batch stays zeros in the
-padding region.
+padding region. Pack indices and the ``[B,1,L,L]`` pad mask are built once
+per step and reused by every encoder layer.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -169,6 +172,69 @@ def build_attention_mask(
     return mask.to(device)
 
 
+@dataclass
+class EncoderAttnWorkspace:
+    """Pack indices + pad mask, shared by every encoder layer in one step.
+
+    ``query_start_loc`` / ``seq_lens`` do not change across layers. Rebuilding
+    the ``[B, 1, L, L]`` mask and H2D'ing it 12–24 times is pure overhead
+    versus sendnn, which materializes the mask once.
+    """
+
+    q_pack_idx: torch.Tensor
+    kv_pack_idx: torch.Tensor
+    unpack_idx: torch.Tensor
+    mask: torch.Tensor
+    aligned_len: int
+    head_size_padded: int
+
+
+def encoder_workspace(
+    attn_metadata: SpyreAttentionMetadata,
+    *,
+    n: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    head_size_padded: int,
+) -> EncoderAttnWorkspace:
+    """Return the per-step workspace, building it on the first layer only."""
+    cached = getattr(attn_metadata, "_encoder_workspace", None)
+    if (
+        isinstance(cached, EncoderAttnWorkspace)
+        and cached.head_size_padded == head_size_padded
+        and cached.mask.dtype == dtype
+        and cached.mask.device.type == device.type
+        and cached.unpack_idx.numel() == n
+    ):
+        return cached
+
+    qsl = attn_metadata.query_start_loc.cpu()
+    q_starts = qsl[:-1].tolist()
+    query_lens = torch.diff(qsl).tolist()
+    kv_lens = attn_metadata.seq_lens.cpu().tolist()
+    aligned_len = _align_up(max(query_lens, default=0))
+    pad_row = n
+    kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
+
+    ws = EncoderAttnWorkspace(
+        q_pack_idx=host_pack_indices(q_starts, query_lens, aligned_len, pad_row),
+        kv_pack_idx=host_pack_indices(q_starts, kv_pack_lens, aligned_len, pad_row),
+        unpack_idx=host_unpack_indices(q_starts, query_lens, aligned_len, n),
+        mask=build_attention_mask(
+            attn_metadata.num_seqs,
+            aligned_len,
+            query_lens,
+            kv_lens,
+            dtype=dtype,
+            device=device,
+        ),
+        aligned_len=aligned_len,
+        head_size_padded=head_size_padded,
+    )
+    attn_metadata._encoder_workspace = ws
+    return ws
+
+
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     """Bidirectional encoder self-attention (no KV cache).
 
@@ -201,18 +267,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         value = value[:n]
         output = output[:n]
 
-        query_start_loc = attn_metadata.query_start_loc
-        seq_lens = attn_metadata.seq_lens
-        num_seqs = attn_metadata.num_seqs
         scale = self.scale
-
-        qsl = query_start_loc.cpu()
-        # query_start_loc is a cumulative offset array of length num_seqs + 1;
-        # diff() yields the num_seqs per-sequence query lengths in one pass.
-        q_starts = qsl[:-1].tolist()
-        query_lens = torch.diff(qsl).tolist()
-        kv_lens = seq_lens.cpu().tolist()
-
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
         head_size = query.shape[2]
@@ -221,9 +276,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # output drops the zero V channels. Keeps self.scale = 1/sqrt(real D).
         head_size_padded = _align_up(head_size)
 
-        max_len = max(query_lens, default=0)
-        aligned_len = _align_up(max_len)
-
         target_device = output.device
         # Keep activations on the SDPA device; pack/unpack via index_select.
         if query.device.type != target_device.type:
@@ -231,25 +283,19 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
-        pad_row = n  # index of the appended zero row in gather_pack
-        q_pack_idx = host_pack_indices(q_starts, query_lens, aligned_len, pad_row)
-        # K/V may be shorter than Q when seq_lens < query_lens; still use q_starts.
-        kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
-        kv_pack_idx = host_pack_indices(q_starts, kv_pack_lens, aligned_len, pad_row)
-        unpack_idx = host_unpack_indices(q_starts, query_lens, aligned_len, n)
-
-        q_batched = gather_pack(query, q_pack_idx, head_size_padded)
-        k_batched = gather_pack(key, kv_pack_idx, head_size_padded)
-        v_batched = gather_pack(value, kv_pack_idx, head_size_padded)
-
-        mask = build_attention_mask(
-            num_seqs,
-            aligned_len,
-            query_lens,
-            kv_lens,
+        # First layer in this step builds pack indices + mask; later layers reuse.
+        ws = encoder_workspace(
+            attn_metadata,
+            n=n,
             dtype=query.dtype,
             device=target_device,
+            head_size_padded=head_size_padded,
         )
+
+        q_batched = gather_pack(query, ws.q_pack_idx, head_size_padded)
+        k_batched = gather_pack(key, ws.kv_pack_idx, head_size_padded)
+        v_batched = gather_pack(value, ws.kv_pack_idx, head_size_padded)
+        mask = ws.mask
 
         sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
         if num_kv_heads != num_heads:
@@ -260,7 +306,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
         )
 
-        result = gather_unpack(attn_out, unpack_idx, head_size)
+        result = gather_unpack(attn_out, ws.unpack_idx, head_size)
         if result.dtype != output.dtype:
             result = convert(result, dtype=output.dtype)
 
