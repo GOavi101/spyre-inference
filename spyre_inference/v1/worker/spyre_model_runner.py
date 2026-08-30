@@ -76,6 +76,7 @@ from spyre_inference.custom_ops.head_pad import (
 )
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import maybe_pack_encoder_step
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -294,6 +295,11 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
 
     def __call__(self, *args, **kwargs):
+        # Pack encoder tokens to [B, L] slots once so every layer can reshape.
+        unpack_idx = None
+        if self._keep_outputs_on_device:
+            unpack_idx = maybe_pack_encoder_step(kwargs)
+
         # Convert integer tensor inputs to Spyre int64
         def _convert_int(t):
             if (
@@ -315,6 +321,9 @@ class _SpyreModelWrapper:
 
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
+
+        if unpack_idx is not None and isinstance(result, torch.Tensor):
+            result = select_rows(result, unpack_idx)
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:

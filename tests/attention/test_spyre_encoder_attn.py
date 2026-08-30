@@ -29,6 +29,12 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     build_attention_mask,
     encoder_workspace,
+    expand_varlen_to_slots,
+    host_pack_indices,
+    host_unpack_indices,
+    is_dense_slot_layout,
+    reshape_pack,
+    reshape_unpack,
 )
 
 # extra `encoder_attention` mark so CI can split this into its own job
@@ -482,3 +488,31 @@ def test_encoder_workspace_reused_across_layers():
     assert first.mask is second.mask
     assert first.q_pack_idx is second.q_pack_idx
     assert first.aligned_len == 64
+    assert first.dense is False
+
+
+def test_dense_slot_layout_and_expand_roundtrip():
+    """Packed [T] tokens expand to [B·L] slots and unpack back."""
+    q_starts = [0, 3]
+    query_lens = [3, 2]
+    aligned_len = 8
+    n = 5
+    x = torch.arange(n, dtype=torch.float32).unsqueeze(1).expand(n, 2).contiguous()
+    pack = host_pack_indices(q_starts, query_lens, aligned_len, pad_row=n)
+    unpack = host_unpack_indices(q_starts, query_lens, aligned_len, n)
+    dense = expand_varlen_to_slots(x, pack)
+    assert dense.shape == (2 * aligned_len, 2)
+    assert not is_dense_slot_layout(
+        torch.tensor([0, 3, 5], dtype=torch.int32), num_tokens=n, aligned_len=aligned_len
+    )
+    dense_qsl = torch.tensor([0, aligned_len, 2 * aligned_len], dtype=torch.int32)
+    assert is_dense_slot_layout(dense_qsl, num_tokens=2 * aligned_len, aligned_len=aligned_len)
+    torch.testing.assert_close(dense[unpack], x)
+
+
+def test_reshape_pack_unpack_roundtrip():
+    batch, aligned_len, heads, dim = 2, 8, 4, 8
+    flat = torch.randn(batch * aligned_len, heads, dim)
+    packed = reshape_pack(flat, batch, aligned_len, dim)
+    assert packed.shape == (batch, heads, aligned_len, dim)
+    torch.testing.assert_close(reshape_unpack(packed, dim), flat)
