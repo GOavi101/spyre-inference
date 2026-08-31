@@ -71,8 +71,11 @@ from spyre_inference.custom_ops.head_pad import (
     fix_padded_rope,
     install_head_pad_weight_loader,
     install_padded_head_dim,
-    reject_padded_qk_norm,
     verify_padded_head_dim,
+)
+from spyre_inference.custom_ops.mlp_pad import (
+    install_mlp_pad_weight_loader,
+    verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
@@ -421,11 +424,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         self._install_pooling_model_patches(self.model_config)
 
-        # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
-        # stream in, when the platform overrode head_dim (e.g. head_size=64).
+        # Pad attention weights (q/k/v/o, and QK-norm) to the stick-aligned head_dim
+        # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
         # Must run before load_model builds+loads the (now 128-wide) params.
         install_padded_head_dim(self.model_config)
         install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
+        install_mlp_pad_weight_loader(model_loader, self.model_config.hf_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -446,7 +450,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Restore original RoPE frequencies and attention scale corrupted by the
         # head_dim width override (no-op unless the platform padded head_dim).
         verify_padded_head_dim(self.model, self.model_config.hf_config)
-        reject_padded_qk_norm(self.model, self.model_config.hf_config)
+        verify_padded_intermediate_size(self.model, self.model_config.hf_config)
         fix_padded_rope(self.model, self.model_config.hf_config)
         fix_padded_attention_scale(self.model, self.model_config.hf_config)
 
