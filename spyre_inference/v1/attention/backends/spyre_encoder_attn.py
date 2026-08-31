@@ -179,6 +179,16 @@ class EncoderAttnWorkspace:
     ``query_start_loc`` / ``seq_lens`` do not change across layers. Rebuilding
     the ``[B, 1, L, L]`` mask and H2D'ing it 12–24 times is pure overhead
     versus sendnn, which materializes the mask once.
+
+    ``source_query_start_loc`` / ``source_seq_lens`` are the exact tensors the
+    indices and mask were derived from, and a hit requires those same objects.
+    Comparing contents instead would mean reading them back from the device —
+    the blocking D2H this cache exists to remove. Identity is sound because
+    ``SpyreAttentionMetadataBuilder.build`` returns a fresh metadata instance
+    per step, so a later step arrives with new tensors and cannot inherit a
+    stale mask, while a single forward never reassigns them between layers.
+    Holding the references also keeps ``is`` meaningful: a freed tensor could
+    otherwise be replaced at the same address by a later allocation.
     """
 
     q_pack_idx: torch.Tensor
@@ -187,6 +197,30 @@ class EncoderAttnWorkspace:
     mask: torch.Tensor
     aligned_len: int
     head_size_padded: int
+    source_query_start_loc: torch.Tensor
+    source_seq_lens: torch.Tensor
+    num_seqs: int
+    num_actual_tokens: int
+
+    def matches(
+        self,
+        attn_metadata: SpyreAttentionMetadata,
+        *,
+        n: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        head_size_padded: int,
+    ) -> bool:
+        """True when this workspace was built for exactly this step."""
+        return (
+            self.source_query_start_loc is attn_metadata.query_start_loc
+            and self.source_seq_lens is attn_metadata.seq_lens
+            and self.num_seqs == attn_metadata.num_seqs
+            and self.num_actual_tokens == n
+            and self.head_size_padded == head_size_padded
+            and self.mask.dtype == dtype
+            and self.mask.device.type == device.type
+        )
 
 
 def encoder_workspace(
@@ -199,12 +233,12 @@ def encoder_workspace(
 ) -> EncoderAttnWorkspace:
     """Return the per-step workspace, building it on the first layer only."""
     cached = getattr(attn_metadata, "_encoder_workspace", None)
-    if (
-        isinstance(cached, EncoderAttnWorkspace)
-        and cached.head_size_padded == head_size_padded
-        and cached.mask.dtype == dtype
-        and cached.mask.device.type == device.type
-        and cached.unpack_idx.numel() == n
+    if isinstance(cached, EncoderAttnWorkspace) and cached.matches(
+        attn_metadata,
+        n=n,
+        dtype=dtype,
+        device=device,
+        head_size_padded=head_size_padded,
     ):
         return cached
 
@@ -230,6 +264,10 @@ def encoder_workspace(
         ),
         aligned_len=aligned_len,
         head_size_padded=head_size_padded,
+        source_query_start_loc=attn_metadata.query_start_loc,
+        source_seq_lens=attn_metadata.seq_lens,
+        num_seqs=int(attn_metadata.num_seqs),
+        num_actual_tokens=int(n),
     )
     attn_metadata._encoder_workspace = ws
     return ws

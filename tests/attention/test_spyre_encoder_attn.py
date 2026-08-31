@@ -482,3 +482,52 @@ def test_encoder_workspace_reused_across_layers():
     assert first.mask is second.mask
     assert first.q_pack_idx is second.q_pack_idx
     assert first.aligned_len == 64
+
+
+def _workspace_meta():
+    class _Meta:
+        num_seqs = 2
+
+    meta = _Meta()
+    meta.query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32)
+    meta.seq_lens = torch.tensor([3, 2], dtype=torch.int32)
+    return meta
+
+
+_WORKSPACE_KWARGS = dict(
+    n=5,
+    dtype=torch.float16,
+    device=torch.device("cpu"),
+    head_size_padded=64,
+)
+
+
+def test_encoder_workspace_rebuilds_when_query_boundaries_change():
+    """A new step with the same token count must not inherit the old mask.
+
+    ``num_seqs`` and the total token count are identical here, so a cache keyed
+    on sizes alone would hit and silently attend over the wrong split.
+    """
+    meta = _workspace_meta()
+    first = encoder_workspace(meta, **_WORKSPACE_KWARGS)
+
+    meta.query_start_loc = torch.tensor([0, 1, 5], dtype=torch.int32)
+    meta.seq_lens = torch.tensor([1, 4], dtype=torch.int32)
+    second = encoder_workspace(meta, **_WORKSPACE_KWARGS)
+
+    assert second is not first
+    assert not torch.equal(second.mask, first.mask)
+    assert not torch.equal(second.q_pack_idx, first.q_pack_idx)
+
+
+def test_encoder_workspace_rebuilds_when_only_kv_lens_change():
+    """``seq_lens`` alone drives the KV half of the mask, so it must be keyed on."""
+    meta = _workspace_meta()
+    first = encoder_workspace(meta, **_WORKSPACE_KWARGS)
+
+    meta.seq_lens = torch.tensor([1, 2], dtype=torch.int32)
+    second = encoder_workspace(meta, **_WORKSPACE_KWARGS)
+
+    assert second is not first
+    assert not torch.equal(second.mask, first.mask)
+    assert not torch.equal(second.kv_pack_idx, first.kv_pack_idx)
