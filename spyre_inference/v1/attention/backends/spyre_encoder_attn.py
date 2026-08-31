@@ -19,11 +19,8 @@ layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
 Ragged→dense packing uses host-built indices + ``index_select`` (gather).
 Pad slots gather a trailing zero row so the dense batch stays zeros in the
-padding region.
-
-When the runner expands tokens to ``[B, L]`` slots once per step, Q/K/V are
-already ``[B·L, H, D]`` and pack/unpack are a reshape — no per-layer gather.
-The ``[B,1,L,L]`` pad mask is still built once and reused by every layer.
+padding region. Pack indices and the ``[B,1,L,L]`` pad mask are built once
+per step and reused by every encoder layer.
 """
 
 from __future__ import annotations
@@ -52,39 +49,6 @@ ENCODER_SEQ_ALIGNMENT = 64
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
     return max(align, (n + align - 1) // align * align)
-
-
-def is_dense_slot_layout(
-    query_start_loc: torch.Tensor,
-    *,
-    num_tokens: int,
-    aligned_len: int,
-) -> bool:
-    """True when tokens already occupy ``[B, L]`` slots (``T = B·L``)."""
-    if aligned_len <= 0 or query_start_loc.numel() < 2:
-        return False
-    starts = query_start_loc[:-1]
-    widths = query_start_loc[1:] - query_start_loc[:-1]
-    return (
-        int(num_tokens) == int(starts.numel()) * aligned_len
-        and int(starts[0]) == 0
-        and bool((widths == aligned_len).all().item())
-    )
-
-
-def dense_slot_query_start_loc(num_seqs: int, aligned_len: int) -> torch.Tensor:
-    """``[0, L, 2L, …, B·L]`` for a dense ``[B, L]`` token layout."""
-    return torch.arange(num_seqs + 1, dtype=torch.int32) * aligned_len
-
-
-def expand_varlen_to_slots(
-    x: torch.Tensor,
-    pack_idx: torch.Tensor,
-    pad_value: int | float = 0,
-) -> torch.Tensor:
-    """Scatter packed ``[T, …]`` into dense ``[B·L, …]`` via ``pack_idx``."""
-    pad = x.new_full((1, *x.shape[1:]), pad_value)
-    return select_rows(torch.cat([x, pad], dim=0), pack_idx)
 
 
 def host_pack_indices(
@@ -148,31 +112,6 @@ def gather_pack(
     gathered = select_rows(flat_ext, pack_indices)  # [B*L, H, Dp]
     packed = gathered.view(batch, aligned_len, num_heads, head_size_padded)
     return packed.permute(0, 2, 1, 3).contiguous()
-
-
-def reshape_pack(
-    flat: torch.Tensor,
-    batch: int,
-    aligned_len: int,
-    head_size_padded: int,
-) -> torch.Tensor:
-    """Dense ``[B·L, H, D]`` → ``[B, H, L, Dp]`` (no gather)."""
-    flat = _pad_head_dim_to_stick(flat, head_size_padded)
-    _t, num_heads, _d = flat.shape
-    packed = flat.view(batch, aligned_len, num_heads, head_size_padded)
-    return packed.permute(0, 2, 1, 3).contiguous()
-
-
-def reshape_unpack(attn_out: torch.Tensor, head_size: int) -> torch.Tensor:
-    """Dense ``[B, H, L, Dp]`` → ``[B·L, H, D]`` (no gather)."""
-    batch, num_heads, aligned_len, head_size_padded = attn_out.shape
-    flat = attn_out.permute(0, 2, 1, 3).contiguous()
-    flat = flat.reshape(batch * aligned_len, num_heads, head_size_padded)
-    if flat.shape[-1] == head_size:
-        return flat
-    if flat.device.type == "spyre":
-        flat = convert(flat, "cpu")
-    return flat[..., :head_size].contiguous()
 
 
 def gather_unpack(
@@ -248,7 +187,6 @@ class EncoderAttnWorkspace:
     mask: torch.Tensor
     aligned_len: int
     head_size_padded: int
-    dense: bool
 
 
 def encoder_workspace(
@@ -272,15 +210,9 @@ def encoder_workspace(
 
     qsl = attn_metadata.query_start_loc.cpu()
     q_starts = qsl[:-1].tolist()
-    stored_lens = getattr(attn_metadata, "_encoder_real_query_lens", None)
-    query_lens = (
-        list(stored_lens) if stored_lens is not None else torch.diff(qsl).tolist()
-    )
+    query_lens = torch.diff(qsl).tolist()
     kv_lens = attn_metadata.seq_lens.cpu().tolist()
     aligned_len = _align_up(max(query_lens, default=0))
-    dense = is_dense_slot_layout(
-        attn_metadata.query_start_loc, num_tokens=n, aligned_len=aligned_len
-    )
     pad_row = n
     kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
 
@@ -298,83 +230,9 @@ def encoder_workspace(
         ),
         aligned_len=aligned_len,
         head_size_padded=head_size_padded,
-        dense=dense,
     )
     attn_metadata._encoder_workspace = ws
     return ws
-
-
-def _iter_encoder_metadata(raw) -> list[SpyreAttentionMetadata]:
-    if raw is None:
-        return []
-    values: list = []
-    if isinstance(raw, dict):
-        values = list(raw.values())
-    elif isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, dict):
-                values.extend(item.values())
-    else:
-        values = [raw]
-    seen: set[int] = set()
-    out: list[SpyreAttentionMetadata] = []
-    for meta in values:
-        if not isinstance(meta, SpyreAttentionMetadata) or id(meta) in seen:
-            continue
-        seen.add(id(meta))
-        out.append(meta)
-    return out
-
-
-def maybe_pack_encoder_step(
-    tensors: dict[str, torch.Tensor | None],
-) -> torch.Tensor | None:
-    """Expand varlen encoder inputs to ``[B, L]`` slots once per step.
-
-    Rewrites ``query_start_loc`` / ``num_actual_tokens`` so every layer sees
-    dense ``[B·L, H, D]`` and can reshape instead of gather. Returns the
-    unpack index that maps hidden states back to packed ``[T]``, or ``None``
-    when the step is already dense / not an encoder forward.
-    """
-    from vllm.forward_context import get_forward_context, is_forward_context_available
-
-    if not is_forward_context_available():
-        return None
-    metas = _iter_encoder_metadata(get_forward_context().attn_metadata)
-    if not metas:
-        return None
-
-    meta = metas[0]
-    qsl = meta.query_start_loc.cpu()
-    query_lens = torch.diff(qsl).tolist()
-    aligned_len = _align_up(max(query_lens, default=0))
-    n = int(meta.num_actual_tokens)
-    if n <= 0 or aligned_len <= 0:
-        return None
-    if is_dense_slot_layout(qsl, num_tokens=n, aligned_len=aligned_len):
-        return None
-
-    q_starts = qsl[:-1].tolist()
-    pack_idx = host_pack_indices(q_starts, query_lens, aligned_len, pad_row=n)
-    unpack_idx = host_unpack_indices(q_starts, query_lens, aligned_len, n)
-    dense_qsl = dense_slot_query_start_loc(meta.num_seqs, aligned_len).to(
-        device=meta.query_start_loc.device, dtype=meta.query_start_loc.dtype
-    )
-    dense_n = meta.num_seqs * aligned_len
-
-    for key, val in list(tensors.items()):
-        if val is None or not isinstance(val, torch.Tensor) or val.shape[0] < n:
-            continue
-        tensors[key] = expand_varlen_to_slots(val[:n], pack_idx)
-
-    for item in metas:
-        item._encoder_real_query_lens = query_lens
-        item.query_start_loc = dense_qsl
-        item.num_actual_tokens = dense_n
-        if getattr(item, "_encoder_workspace", None) is not None:
-            delattr(item, "_encoder_workspace")
-
-    return unpack_idx
 
 
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
@@ -383,8 +241,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     The platform selects this impl for ENCODER/ENCODER_ONLY layers (see
     ``TorchSpyrePlatform.get_attn_backend_cls``), so there is no per-call
     ``attn_type`` branch. Setup is shared with the paged decoder impl; forward
-    packs with gather (``index_select``) unless the step is already dense
-    ``[B, L]`` slots (reshape only). Then one batched SDPA, then unpack.
+    packs with gather (``index_select``), runs one batched SDPA on Spyre, then
+    unpacks with gather.
     """
 
     def forward(  # ty: ignore[invalid-method-override]
@@ -404,11 +262,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             return output
 
         n = attn_metadata.num_actual_tokens
-        if query.shape[0] != n:
-            query = query[:n]
-            key = key[:n]
-            value = value[:n]
-            output = output[:n]
+        query = query[:n]
+        key = key[:n]
+        value = value[:n]
+        output = output[:n]
 
         scale = self.scale
         num_heads = query.shape[1]
@@ -435,15 +292,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             head_size_padded=head_size_padded,
         )
 
-        if ws.dense:
-            batch = ws.q_pack_idx.shape[0]
-            q_batched = reshape_pack(query, batch, ws.aligned_len, head_size_padded)
-            k_batched = reshape_pack(key, batch, ws.aligned_len, head_size_padded)
-            v_batched = reshape_pack(value, batch, ws.aligned_len, head_size_padded)
-        else:
-            q_batched = gather_pack(query, ws.q_pack_idx, head_size_padded)
-            k_batched = gather_pack(key, ws.kv_pack_idx, head_size_padded)
-            v_batched = gather_pack(value, ws.kv_pack_idx, head_size_padded)
+        q_batched = gather_pack(query, ws.q_pack_idx, head_size_padded)
+        k_batched = gather_pack(key, ws.kv_pack_idx, head_size_padded)
+        v_batched = gather_pack(value, ws.kv_pack_idx, head_size_padded)
         mask = ws.mask
 
         sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
@@ -455,11 +306,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
         )
 
-        result = (
-            reshape_unpack(attn_out, head_size)
-            if ws.dense
-            else gather_unpack(attn_out, ws.unpack_idx, head_size)
-        )
+        result = gather_unpack(attn_out, ws.unpack_idx, head_size)
         if result.dtype != output.dtype:
             result = convert(result, dtype=output.dtype)
 
