@@ -407,6 +407,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"(got {parallel_config.data_parallel_size})."
             )
 
+        # Clamp CPU threading env vars before workers fork so they inherit the
+        # corrected values. DP is rejected above, so world_size is the worker count.
+        from spyre_inference.threading_config import configure_threading
+
+        configure_threading(parallel_config.world_size)
+
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
             worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"

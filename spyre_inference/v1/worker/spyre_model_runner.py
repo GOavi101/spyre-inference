@@ -38,7 +38,6 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 
 from __future__ import annotations
 
-import os
 import time
 from contextlib import contextmanager
 from typing import cast
@@ -66,6 +65,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -221,7 +221,7 @@ SPYRE_COMPILE_GRANULARITIES = ("block", "model")
 
 
 def _compile_granularity() -> str:
-    granularity = os.environ.get("SPYRE_COMPILE_GRANULARITY") or "block"
+    granularity = envs.SPYRE_COMPILE_GRANULARITY
     if granularity not in SPYRE_COMPILE_GRANULARITIES:
         raise ValueError(
             f"Unsupported SPYRE_COMPILE_GRANULARITY={granularity!r}. "
