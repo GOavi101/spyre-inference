@@ -558,17 +558,27 @@ def test_worker_reasserts_recompile_limits_after_autoload():
 
 
 def test_compile_sizes_default_generated():
-    """When user doesn't set compile_sizes, the platform generates default buckets."""
+    """Defaults are powers of two up to max_num_seqs, plus one prefill bucket."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_seqs = 4
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    sizes = vllm_config.compilation_config.compile_sizes
-    assert sizes, "compile_sizes should not be empty"
-    assert sizes == sorted(sizes), "compile_sizes should be sorted ascending"
-    assert sizes[0] == 1, "smallest bucket should be 1"
-    assert max(sizes) <= 512
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512]
+
+
+def test_compile_sizes_default_includes_non_power_of_two_max_num_seqs():
+    """A max_num_seqs that is not a power of two still gets its own bucket."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_seqs = 6
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 6, 512]
 
 
 def test_compile_sizes_user_provided_respected():
@@ -603,13 +613,13 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
     vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_seqs = 4
     vllm_config.scheduler_config.max_num_batched_tokens = 32
 
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    sizes = vllm_config.compilation_config.compile_sizes
-    assert max(sizes) <= 32
-    assert vllm_config.scheduler_config.max_num_batched_tokens == max(sizes)
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 32
 
 
 def test_compile_sizes_not_set_when_eager():

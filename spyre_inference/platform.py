@@ -251,11 +251,15 @@ class TorchSpyrePlatform(CpuPlatform):
                     512,
                 )
                 if vllm_config.model_config.runner_type != "pooling":
-                    compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
-                    if max_capture_size >= 8:
-                        compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
-                    if max_capture_size >= 256:
-                        compile_sizes += list(range(256, max_capture_size + 1, 16))
+                    # Decode packs one token per running sequence; prefill lands on
+                    # the single largest bucket. Denser sizes only cost warmup time.
+                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
+                    sizes = {max_capture_size, num_seqs}
+                    size = 1
+                    while size < num_seqs:
+                        sizes.add(size)
+                        size *= 2
+                    compile_sizes = sorted(sizes)
                 else:
                     from spyre_inference.v1.worker.spyre_shape_bucketer import (
                         default_encoder_len_buckets,
