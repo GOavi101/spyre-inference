@@ -206,13 +206,12 @@ def _create_compilable_page_attn(
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
     store_mode: str = "none",
-    store_len: int = 0,
     needs_gather: bool = True,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
     Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
-    logits_soft_cap, store_mode, store_len, and needs_gather are closure constants.
+    logits_soft_cap, store_mode, and needs_gather are closure constants.
     """
 
     num_queries_per_kv = num_heads // num_kv_heads
@@ -321,13 +320,17 @@ def _create_compilable_page_attn(
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
         attn = attn.reshape(padded_query_len, num_heads, head_size)
         if store_mode == "copy":
+            # Always a single-row destination
             assert out is not None
-            out.copy_(attn[:store_len])
+            out.copy_(attn)
             return out
         if store_mode == "index":
-            # `out` and `query` are both indexed by absolute token row.
+            # `out` and `query` are both indexed by absolute token row. Storing the
+            # full padded extent keeps query_len out of the closure; rows past it
+            # duplicate the sequence's last row, so index_copy_'s undefined write
+            # order for duplicate indices is harmless.
             assert out is not None and query_row_index is not None
-            out.index_copy_(0, query_row_index[:store_len], attn[:store_len])
+            out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
             return out
         return attn
 
@@ -594,7 +597,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         seq_lens: torch.Tensor,
         query_start_loc: torch.Tensor,
         apply_causal_mask: bool,
-        max_query_len: int,
         aligned_max_query_len: int,
         aligned_max_seq_len: int,
         device: torch.device,
@@ -613,36 +615,27 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         """
         assert self.sliding_window is None
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        num_seqs = len(seq_lens)
 
-        q_pos = torch.arange(max_query_len, device=device)
+        q_pos = torch.arange(aligned_max_query_len, device=device)
         kv_pos = torch.arange(aligned_max_seq_len, device=device)
 
-        # Padding mask: valid positions are within actual sequence/query lengths
-        q_valid = q_pos.unsqueeze(0) < query_lens.unsqueeze(1)
+        # Padded query rows are clamped to query_len - 1 rather than masked out, so
+        # they reproduce the last real row. _build_query_row_tables clamps the gather
+        # identically, so they also receive the same query vector.
+        q_pos = torch.minimum(q_pos.unsqueeze(0), (query_lens - 1).clamp(min=0).unsqueeze(1))
         kv_valid = kv_pos.unsqueeze(0) < seq_lens.unsqueeze(1)
-        attend = q_valid.unsqueeze(2) & kv_valid.unsqueeze(1)
+        attend = kv_valid.unsqueeze(1).expand(-1, aligned_max_query_len, -1)
 
         # Causal mask: prevent attending to future tokens during generation
         if apply_causal_mask:
             context_lens = seq_lens - query_lens
-            causal_limit = (context_lens.unsqueeze(1) + q_pos.unsqueeze(0)).unsqueeze(2)
+            causal_limit = (context_lens.unsqueeze(1) + q_pos).unsqueeze(2)
             kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)
             causal_ok = kv_pos_exp <= causal_limit
             attend = attend & causal_ok
 
         # Convert to additive mask: finfo.min for masked positions, 0 for valid
-        mask_bool = ~attend  # [num_seqs, max_query_len, aligned_max_seq_len]
-
-        if aligned_max_query_len > max_query_len:
-            padding = torch.ones(
-                num_seqs,
-                aligned_max_query_len - max_query_len,
-                aligned_max_seq_len,
-                dtype=torch.bool,
-                device=device,
-            )
-            mask_bool = torch.cat([mask_bool, padding], dim=1)
+        mask_bool = ~attend
 
         mask_additive = torch.where(
             mask_bool,
@@ -683,11 +676,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         q_pos = torch.arange(aligned_max_query_len)  # [aligned_max_query_len]
         kv_pos = torch.arange(kv_start, kv_end)  # [block_size]
 
-        # Padding mask: query rows beyond query_len are fully masked;
-        # KV columns beyond kv_len are fully masked.
-        q_valid = q_pos < query_len  # [aligned_max_query_len]
+        # Padded query rows are clamped to query_len - 1, matching the gather in
+        # _build_query_row_tables; see _build_attention_mask.
+        q_pos = q_pos.clamp(max=max(query_len - 1, 0))
         kv_valid = kv_pos < kv_len  # [block_size]
-        attend = q_valid.unsqueeze(1) & kv_valid.unsqueeze(0)  # [Q, B]
+        attend = kv_valid.unsqueeze(0).expand(aligned_max_query_len, -1)  # [Q, B]
 
         # Causal mask (prefill only): query at absolute position
         # context_len + q_pos can only attend to KV positions <= that value.
@@ -855,7 +848,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 seq_lens,
                 query_start_loc,
                 apply_causal_mask,
-                max_query_len,
                 aligned_max_query_len,
                 aligned_max_seq_len,
                 torch.device("cpu"),
@@ -1114,8 +1106,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
         # Compiled attention loops, keyed by
-        # (num_blocks, padded_query_len, store_mode, store_len, needs_gather)
-        self._attn_fns: dict[tuple[int, int, str, int, bool], object] = {}
+        # (num_blocks, padded_query_len, store_mode, needs_gather)
+        self._attn_fns: dict[tuple[int, int, str, bool], object] = {}
 
         self._kv_slots: SpyrePagedKVCache | None = None
 
@@ -1131,12 +1123,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_blocks: int,
         padded_query_len: int,
         store_mode: str = "none",
-        store_len: int = 0,
         needs_gather: bool = True,
     ):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len, store_mode, store_len, needs_gather)
+        key = (num_blocks, padded_query_len, store_mode, needs_gather)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -1148,7 +1139,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
                     store_mode=store_mode,
-                    store_len=store_len,
                     needs_gather=needs_gather,
                 ),
                 self._compile_attn,
@@ -1485,14 +1475,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             store_mode = "none"
             if fused_store_ok:
-                if output.shape[0] == query_len:
-                    # Owns every row, so the store is a plain copy_: no index, and
-                    # no relayout of the destination.
+                # index_copy_ writes nothing to a single-row destination
+                # (torch-spyre#4007), which is the batch-1 decode shape.
+                if output.shape[0] == 1:
+                    assert query_len == 1 and q_start == 0
                     store_mode = "copy"
-                elif output.shape[0] > 1:
-                    # Owns only a slice, so the store must be indirect. A single-row
-                    # destination is excluded: index_copy_ writes nothing there
-                    # (torch-spyre#4007).
+                else:
                     store_mode = "index"
 
             row_table = None
@@ -1508,7 +1496,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 len(active_bs),
                 aligned_max_query_len,
                 store_mode=store_mode,
-                store_len=query_len,
                 needs_gather=needs_gather,
             )
             result = attn_fn(
