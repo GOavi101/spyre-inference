@@ -21,16 +21,12 @@ compile on ``[T, …]``.
 Attention (encoder only): warmed ``(B, L)`` cells for SDPA ``[B, H, L, D]``.
 The attention backend gathers rows into that grid; the body is not rewritten
 to ``T = B × L``. ``L`` is the ``max_model_len`` ladder, not ``compile_sizes``.
-Batch buckets:
-
-    SPYRE_ENCODER_BUCKET_BATCH_SIZES   CSV of batch buckets. Default: ``1, 2,
-                                       4, …, max_num_seqs``.
+``B`` is powers of two up to ``--max-num-seqs``, same as decoder attention.
 """
 
 from __future__ import annotations
 
 import bisect
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -61,14 +57,6 @@ def default_encoder_len_buckets(max_model_len: int) -> list[int]:
     if aligned_cap <= cap and aligned_cap not in buckets:
         buckets.append(aligned_cap)
     return buckets or [ENCODER_SEQ_ALIGNMENT]
-
-
-def parse_csv_ints(env_name: str, default: list[int]) -> list[int]:
-    raw = os.getenv(env_name, "").strip()
-    if not raw:
-        return list(default)
-    values = [int(part.strip()) for part in raw.split(",") if part.strip()]
-    return values or list(default)
 
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
@@ -104,12 +92,12 @@ def len_buckets(
 
 
 def batch_buckets(max_num_seqs: int) -> list[int]:
-    """Configured batch ladder, clipped to ``[1, max_num_seqs]``."""
+    """Powers of two in ``[1, max_num_seqs]``, plus ``max_num_seqs`` itself.
+
+    Same ladder as decoder attention (``_powers_of_two_up_to``): clip with
+    ``--max-num-seqs``, no extra env var.
+    """
     cap = max(1, max_num_seqs)
-    env = parse_csv_ints("SPYRE_ENCODER_BUCKET_BATCH_SIZES", [])
-    if env:
-        values = sorted({b for b in env if 1 <= b <= cap})
-        return values or [cap]
     out: list[int] = []
     size = 1
     while size < cap:

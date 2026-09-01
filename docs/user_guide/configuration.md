@@ -40,10 +40,7 @@ Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
 
 `compile_sizes` for pooling is the body `T` ladder (`64, 128, …` up to the
 token cap). Attention `L` comes from `--max-model-len` (`64, 128, …`).
-
-| Env | Default | Meaning |
-|---|---|---|
-| `SPYRE_ENCODER_BUCKET_BATCH_SIZES` | `1, 2, 4, …, max_num_seqs` | Attention batch ladder |
+Attention `B` is powers of two up to `--max-num-seqs` (same as decoder).
 
 A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`
 and attention to `(B=4, L=64)`. Masks and pooling still use the real lengths.
@@ -55,7 +52,6 @@ at full size. Eager pooling uses one short dummy, then runtime still
 Example:
 
 ```bash
-SPYRE_ENCODER_BUCKET_BATCH_SIZES=1,4 \
 vllm serve ibm-granite/granite-embedding-125m-english \
   --runner pooling --max-num-seqs 4 --max-model-len 512
 ```

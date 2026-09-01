@@ -146,35 +146,38 @@ def _pooling_vllm_config(
 
 
 class TestEncoderDispatch:
-    def test_for_pooling_loads_warmup_shapes(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+    def test_for_pooling_loads_warmup_shapes(self):
         cfg = _pooling_vllm_config()
         cfg.compilation_config.compile_sizes = [64, 128]
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
-        assert b.encoder_shapes == [(1, 64), (1, 128), (4, 64), (4, 128)]
+        assert b.encoder_shapes == [
+            (1, 64),
+            (1, 128),
+            (2, 64),
+            (2, 128),
+            (4, 64),
+            (4, 128),
+        ]
         assert b.bucket_sizes == [64, 128]
 
     def test_for_pooling_skips_non_pooling(self):
         assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
 
-    def test_for_pooling_none_when_no_shapes(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
-        cfg = _pooling_vllm_config(max_model_len=64, max_num_batched_tokens=128)
+    def test_for_pooling_none_when_no_shapes(self):
+        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=32)
         cfg.compilation_config.compile_sizes = []
         assert SpyreShapeBucketer.for_pooling(cfg) is None
 
-    def test_for_pooling_1d_only_when_no_attention_shapes(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
-        cfg = _pooling_vllm_config(max_model_len=64, max_num_batched_tokens=128)
+    def test_for_pooling_1d_only_when_no_attention_shapes(self):
+        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=32)
         cfg.compilation_config.compile_sizes = [256]
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
         assert b.encoder_shapes == []
         assert b.bucket_sizes == [256]
 
-    def test_dispatch_encoder_pads_to_warmed_cell(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+    def test_dispatch_encoder_pads_to_warmed_cell(self):
         cfg = _pooling_vllm_config()
         cfg.compilation_config.compile_sizes = [64, 128]
         b = SpyreShapeBucketer.for_pooling(cfg)
@@ -192,13 +195,12 @@ class TestEncoderDispatch:
         assert desc.actual_num_seqs == 3
         assert desc.actual_max_len == 30
 
-    def test_pooling_2d_not_1d_token_ladder(self, monkeypatch):
+    def test_pooling_2d_not_1d_token_ladder(self):
         """Body 1D pad and attention (B, L) are independent.
 
         3 seqs × 30 tokens is 90 packed tokens. Body picks T=128; SDPA
         still gathers to (4, 64).
         """
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
         cfg = _pooling_vllm_config()
         cfg.compilation_config.compile_sizes = [64, 128]
         b = SpyreShapeBucketer.for_pooling(cfg)
@@ -303,28 +305,28 @@ class TestEncoderBuckets:
         assert encoder_batch_bucket(3, 4) == 4
         assert encoder_batch_bucket(4, 4) == 4
 
-    def test_custom_batch_buckets(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
-        assert encoder_batch_bucket(2, 4) == 4
-        assert batch_buckets(4) == [1, 4]
-
-    def test_warmup_shapes_use_max_model_len(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "1,4")
+    def test_warmup_shapes_use_max_model_len(self):
         assert pooling_warmup_shapes(
             max_num_seqs=4,
             max_model_len=128,
             max_num_batched_tokens=512,
-        ) == [(1, 64), (1, 128), (4, 64), (4, 128)]
+        ) == [
+            (1, 64),
+            (1, 128),
+            (2, 64),
+            (2, 128),
+            (4, 64),
+            (4, 128),
+        ]
 
-    def test_warmup_shapes_skip_over_token_budget(self, monkeypatch):
-        monkeypatch.setenv("SPYRE_ENCODER_BUCKET_BATCH_SIZES", "4")
-        # 4*256 = 1024 > 300 tokens; 4*64 = 256 still fits.
+    def test_warmup_shapes_skip_over_token_budget(self):
+        # 4*256 = 1024 and 2*256 = 512 both exceed 300; 4*64 = 256 still fits.
         assert pooling_warmup_shapes(
             max_num_seqs=4,
             max_model_len=2048,
             max_num_batched_tokens=300,
             len_ladder=[64, 256],
-        ) == [(4, 64)]
+        ) == [(1, 64), (1, 256), (2, 64), (4, 64)]
 
     def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):
         padded_ids, padded_pos = expand_packed_to_encoder_bucket(
