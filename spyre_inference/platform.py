@@ -146,6 +146,19 @@ class TorchSpyrePlatform(CpuPlatform):
         _spyre_patched._spyre_patched = True
         EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
 
+        # Delegate per-model EngineArgs overrides (e.g. text-only backbone
+        # selection) to spyre_inference.models before ModelConfig is built.
+        create_model_config = EngineArgs.create_model_config
+
+        @functools.wraps(create_model_config)
+        def _spyre_create_model_config(self):
+            from spyre_inference.models import apply_prelaunch_overrides
+
+            apply_prelaunch_overrides(self)
+            return create_model_config(self)
+
+        EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
+
     @classmethod
     def import_kernels(cls) -> None:
         # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
@@ -471,6 +484,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
+
+        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
+        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
+        # KV-cache manager gives every layer its own buffer; SWA is still computed
+        # in the model runner. No-op for non-hybrid models.
+        scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
         # math in CpuPlatform.check_and_update_config is meaningless for us.
