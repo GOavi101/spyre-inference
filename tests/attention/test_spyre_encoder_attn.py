@@ -28,6 +28,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     build_attention_mask,
+    gather_pack,
+    host_pack_indices,
+    host_scatter_pack_dest,
+    scatter_pack,
 )
 
 # extra `encoder_attention` mark so CI can split this into its own job
@@ -457,4 +461,70 @@ def test_spyre_encoder_attn(
         rtol=rtol,
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
+    )
+
+
+def _assert_scatter_matches_gather(
+    q_starts: list[int],
+    query_lens: list[int],
+    batch: int,
+    aligned_len: int,
+    heads: int,
+    dim: int,
+    extra_src_rows: int = 0,
+) -> None:
+    num_tokens = sum(query_lens)
+    num_src = num_tokens + extra_src_rows
+    torch.manual_seed(0)
+    flat = torch.randn(num_src, heads, dim)
+    pad_row = num_src
+    padded_starts = list(q_starts) + [num_tokens] * (batch - len(q_starts))
+    padded_lens = list(query_lens) + [0] * (batch - len(query_lens))
+    pack_idx = host_pack_indices(padded_starts, padded_lens, aligned_len, pad_row)
+    dest = host_scatter_pack_dest(
+        padded_starts,
+        padded_lens,
+        aligned_len,
+        num_src_rows=num_src,
+        dummy_row=batch * aligned_len,
+    )
+    ref = gather_pack(flat, pack_idx, dim)
+    got = scatter_pack(flat, dest, batch, aligned_len, dim)
+    assert torch.equal(got, ref)
+
+
+def test_scatter_pack_matches_gather_b1_pad():
+    """62-token prompt on L=64 (vllm --random-input-len 64)."""
+    _assert_scatter_matches_gather(
+        q_starts=[0],
+        query_lens=[62],
+        batch=1,
+        aligned_len=64,
+        heads=2,
+        dim=8,
+    )
+
+
+def test_scatter_pack_matches_gather_b1_pad_body_bucket():
+    """Body-bucket T=64 with only 62 real tokens; extras write the dummy row."""
+    _assert_scatter_matches_gather(
+        q_starts=[0],
+        query_lens=[62],
+        batch=1,
+        aligned_len=64,
+        heads=2,
+        dim=8,
+        extra_src_rows=2,
+    )
+
+
+def test_scatter_pack_matches_gather_b4_pad():
+    """3 real seqs padded to B=4, L=64."""
+    _assert_scatter_matches_gather(
+        q_starts=[0, 30, 42],
+        query_lens=[30, 12, 8],
+        batch=4,
+        aligned_len=64,
+        heads=2,
+        dim=8,
     )
