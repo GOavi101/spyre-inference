@@ -247,8 +247,8 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Body: 1D compile_sizes (packed token counts). Attention (B, L)
-            # is independent — see SpyreEncoderAttentionImpl gather-pack.
+            # Body: 1D compile_sizes (packed token counts). Encoder flash is
+            # varlen on that list — see SpyreEncoderAttentionImpl.
             # Honor a user-set list (#638); otherwise generate defaults.
             if vllm_config.compilation_config.compile_sizes:
                 compile_sizes = vllm_config.compilation_config.compile_sizes

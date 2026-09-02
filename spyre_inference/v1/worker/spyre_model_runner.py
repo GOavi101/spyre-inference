@@ -86,10 +86,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
-from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    SpyreShapeBucketer,
-    pooling_warmup_shapes,
-)
+from spyre_inference.v1.worker.spyre_shape_bucketer import SpyreShapeBucketer
 
 logger = init_logger(__name__)
 
@@ -527,17 +524,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return False
 
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
-        """Create SpyreShapeBucketer for 1D body sizes and pooling attention cells.
+        """Create SpyreShapeBucketer for 1D body token sizes.
 
-        Decoder and pooling body share 1D ``compile_sizes``. Pooling also
-        keeps attention ``(B, L)`` shapes on the same bucketer; SDPA gather
-        uses those cells, the body does not.
+        Decoder and pooling share 1D ``compile_sizes``. Encoder flash is
+        varlen on that packed list (no ``(B, L)`` cells).
 
         Pooling keeps a bucketer in eager *and* compile so *runtime* always
-        1D-pads the body. Warmup still differs: compile dummies 1D sizes then
-        each attention cell; eager does one dummy then ``mark_warmed_up()``.
-        Decoder skips a bucketer when eager because 1D pad exists only to hit
-        compiled graphs.
+        1D-pads the body. Compile dummies each 1D size (attention compiles
+        through ``force_attention``). Eager does one dummy then
+        ``mark_warmed_up()``. Decoder skips a bucketer when eager because 1D
+        pad exists only to hit compiled graphs.
         """
         if self.model_config.runner_type == "pooling":
             return SpyreShapeBucketer.for_pooling(self.vllm_config)
@@ -633,9 +629,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Warm kernels / compile.
 
         Decoder: dummy each 1D ``compile_sizes`` bucket (largest first).
-        Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
-        attention ``(B, L)`` at its full size.
-        Eager pooling: one short dummy, then ``mark_warmed_up()``.
+        Compiled pooling: dummy each 1D body size (flash compiles on those
+        packed batches via ``force_attention``). Eager pooling: one short
+        dummy, then ``mark_warmed_up()``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
@@ -648,9 +644,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     for size in sorted(self.spyre_shape_bucketer.bucket_sizes, reverse=True):
                         self._dummy_run(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
-                self._warmup_pooling_bucket_shapes()
-            if self.spyre_shape_bucketer is not None:
-                self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -718,7 +711,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         scheduler_output.total_num_scheduled_tokens.
 
         Decoder and pooling body: 1D ``compile_sizes`` after warmup.
-        Attention ``(B, L)`` is applied in ``SpyreEncoderAttentionImpl``.
+        Encoder flash reads the packed list; it does not change body ``T``.
         """
         pad = self._spyre_bucket_batch_descriptor(num_tokens, num_reqs, num_scheduled_tokens_np)
         if pad is not None:
@@ -746,8 +739,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> BatchDescriptor | None:
         """Padded ``BatchDescriptor`` for a warmed 1D body bucket, or None.
 
-        Decoder and pooling body share this path. Encoder SDPA ``(B, L)`` is
-        applied in ``SpyreEncoderAttentionImpl``, not here.
+        Decoder and pooling body share this path. Encoder flash does not
+        change body ``T``.
         """
         del num_reqs, num_scheduled_tokens_np
         bucketer = self.spyre_shape_bucketer
@@ -758,41 +751,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return None
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
 
-    def _warmup_pooling_bucket_shapes(self) -> None:
-        """Dummy each attention ``(B, L)``. Body already 1D-pads after warmup."""
-        if self.spyre_shape_bucketer is not None:
-            shapes = self.spyre_shape_bucketer.encoder_shapes
-        else:
-            shapes = pooling_warmup_shapes(
-                max_num_seqs=self.scheduler_config.max_num_seqs,
-                max_model_len=self.model_config.max_model_len,
-                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            )
-        if not shapes:
-            logger.warning("No pooling warmup shapes; falling back to a single dummy run")
-            self._dummy_run(
-                min(16, self.scheduler_config.max_num_batched_tokens),
-                force_attention=True,
-            )
-            return
-
-        saved_max_num_seqs = self.scheduler_config.max_num_seqs
-        try:
-            for batch_size, prompt_len in shapes:
-                self.scheduler_config.max_num_seqs = batch_size
-                num_tokens = batch_size * prompt_len
-                logger.info(
-                    "Pooling attention warmup: exact bucket "
-                    "batch_size=%d prompt_len=%d (%d tokens)",
-                    batch_size,
-                    prompt_len,
-                    num_tokens,
-                )
-                hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
-                self._dummy_pooler_run(hidden_states)
-        finally:
-            self.scheduler_config.max_num_seqs = saved_max_num_seqs
-
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
         """Force D2H during dummy forward (upstream logits index is CPU).
@@ -800,7 +758,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Pooling must pass ``force_attention=True``. Upstream skips attention
         metadata unless that flag or a FULL cudagraph is set; encoder impl
         then does ``if attn_metadata is None: return output`` and never
-        compiles pack/SDPA. Real ``execute_model`` always has metadata.
+        compiles flash. Real ``execute_model`` always has metadata.
 
         Decoder warmup also publishes null KV slots so the scatter-in-graph
         path (#610) sees the same binding as a real step.

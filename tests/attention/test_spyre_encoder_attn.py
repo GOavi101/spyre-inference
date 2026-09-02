@@ -27,7 +27,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
-    build_attention_mask,
+    dense_sdpa_reference,
+    encoder_flash_sdpa,
+    host_key_bias,
+    pad_seq_to_aligned,
 )
 
 # extra `encoder_attention` mark so CI can split this into its own job
@@ -236,68 +239,10 @@ def ref_encoder_attn(
     return torch.cat(outputs, dim=0)
 
 
-def _loop_attention_mask(
-    num_seqs: int,
-    aligned_len: int,
-    query_lens: list[int],
-    kv_lens: list[int],
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Host slice-write reference for ``build_attention_mask``."""
-    neg_inf = torch.finfo(dtype).min
-    mask = torch.full((num_seqs, 1, aligned_len, aligned_len), neg_inf, dtype=dtype)
-    for s in range(num_seqs):
-        q_len = query_lens[s]
-        kv_len = min(q_len, kv_lens[s])
-        mask[s, 0, :q_len, :kv_len] = 0.0
-    return mask
-
-
-@pytest.mark.parametrize(
-    "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "query_lens,kv_lens,aligned_len",
-    [
-        pytest.param([32], [32], 64, id="single_32"),
-        pytest.param([9, 70, 5], [9, 70, 5], 128, id="batch_unaligned"),
-        pytest.param([16, 8], [8, 8], 64, id="kv_shorter_than_q"),
-    ],
-)
-@torch.inference_mode()
-def test_build_attention_mask_matches_loop(
-    configure_device: str,
-    query_lens: list[int],
-    kv_lens: list[int],
-    aligned_len: int,
-) -> None:
-    """Vectorized host mask must match the slice-write reference.
-
-    Spyre ``convert`` of fp16 ``finfo.min`` (-65504) is not bit-exact (off by
-    32). Attend slots must stay 0; pad slots must stay hugely negative.
-    """
-    dtype = torch.float16
-    device = torch.device(configure_device)
-    ref = _loop_attention_mask(len(query_lens), aligned_len, query_lens, kv_lens, dtype)
-    got = build_attention_mask(
-        len(query_lens),
-        aligned_len,
-        query_lens,
-        kv_lens,
-        dtype=dtype,
-        device=device,
-    ).cpu()
-    attend = ref == 0
-    torch.testing.assert_close(got[attend], ref[attend], atol=0, rtol=0)
-    if configure_device == "cpu":
-        torch.testing.assert_close(got, ref, atol=0, rtol=0)
-        return
-    assert bool((got[~attend] < -1e4).all()), "pad slots must stay a large negative"
+def test_host_key_valid_marks_real_keys():
+    valid = host_key_bias(8, 3, torch.float32)
+    assert torch.equal(valid[:3], torch.ones(3))
+    assert torch.equal(valid[3:], torch.zeros(5))
 
 
 @pytest.mark.parametrize(
@@ -458,3 +403,46 @@ def test_spyre_encoder_attn(
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
     )
+
+
+@pytest.mark.parametrize(
+    "query_lens",
+    [
+        pytest.param([32], id="single_32"),
+        pytest.param([30, 12, 8], id="ragged_3"),
+        pytest.param([62], id="prompt_62"),
+    ],
+)
+def test_encoder_flash_matches_per_seq_sdpa(query_lens: list[int]) -> None:
+    """Online softmax on flat T matches per-sequence SDPA (no (B, L) grid)."""
+    torch.manual_seed(0)
+    heads, dim = 4, 64
+    scale = dim**-0.5
+    total = sum(query_lens)
+    query = torch.randn(total, heads, dim)
+    key = torch.randn(total, heads, dim)
+    value = torch.randn(total, heads, dim)
+    ref = dense_sdpa_reference(query, key, value, query_lens, scale)
+    cache: dict[tuple[int, int, int, int], object] = {}
+    got = query.new_empty(query.shape)
+    start = 0
+    for length in query_lens:
+        aligned = 64 if length <= 64 else 128
+        q = pad_seq_to_aligned(query[start : start + length], aligned)
+        k = pad_seq_to_aligned(key[start : start + length], aligned)
+        v = pad_seq_to_aligned(value[start : start + length], aligned)
+        out = encoder_flash_sdpa(q, k, v, length, scale, compile_enabled=False, cache=cache)
+        got[start : start + length] = out[:length]
+        start += length
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_encoder_flash_compile_matches_eager() -> None:
+    torch.manual_seed(0)
+    aligned, heads, dim = 64, 2, 64
+    q = torch.randn(aligned, heads, dim)
+    k = torch.randn(aligned, heads, dim)
+    v = torch.randn(aligned, heads, dim)
+    eager = encoder_flash_sdpa(q, k, v, 40, dim**-0.5, compile_enabled=False)
+    compiled = encoder_flash_sdpa(q, k, v, 40, dim**-0.5, compile_enabled=True)
+    torch.testing.assert_close(compiled, eager, atol=1e-4, rtol=1e-4)

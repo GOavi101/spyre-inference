@@ -20,17 +20,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    EncoderBucketDescriptor,
     SpyreShapeBucketer,
     batch_buckets,
     default_encoder_len_buckets,
     encoder_batch_bucket,
-    encoder_bucket_valid_row_indices,
     encoder_len_bucket,
-    expand_packed_to_encoder_bucket,
     len_buckets,
     next_bucket,
-    pooling_warmup_shapes,
 )
 
 
@@ -146,61 +142,30 @@ def _pooling_vllm_config(
 
 
 class TestEncoderDispatch:
-    def test_for_pooling_loads_warmup_shapes(self):
+    def test_for_pooling_uses_1d_compile_sizes(self):
         cfg = _pooling_vllm_config()
         cfg.compilation_config.compile_sizes = [64, 128]
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
-        assert b.encoder_shapes == [
-            (1, 64),
-            (1, 128),
-            (2, 64),
-            (2, 128),
-            (4, 64),
-            (4, 128),
-        ]
         assert b.bucket_sizes == [64, 128]
 
     def test_for_pooling_skips_non_pooling(self):
         assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
 
-    def test_for_pooling_none_when_no_shapes(self):
+    def test_for_pooling_none_when_no_compile_sizes(self):
         cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=32)
         cfg.compilation_config.compile_sizes = []
         assert SpyreShapeBucketer.for_pooling(cfg) is None
 
-    def test_for_pooling_1d_only_when_no_attention_shapes(self):
+    def test_for_pooling_1d_only(self):
         cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=32)
         cfg.compilation_config.compile_sizes = [256]
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
-        assert b.encoder_shapes == []
         assert b.bucket_sizes == [256]
 
-    def test_dispatch_encoder_pads_to_warmed_cell(self):
-        cfg = _pooling_vllm_config()
-        cfg.compilation_config.compile_sizes = [64, 128]
-        b = SpyreShapeBucketer.for_pooling(cfg)
-        assert b is not None
-        desc = b.dispatch_encoder(
-            num_seqs=3,
-            max_query_len=30,
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        )
-        assert desc is not None
-        assert (desc.batch_bucket, desc.len_bucket) == (4, 64)
-        assert desc.padded_num_tokens == 256
-        assert desc.actual_num_seqs == 3
-        assert desc.actual_max_len == 30
-
-    def test_pooling_2d_not_1d_token_ladder(self):
-        """Body 1D pad and attention (B, L) are independent.
-
-        3 seqs × 30 tokens is 90 packed tokens. Body picks T=128; SDPA
-        still gathers to (4, 64).
-        """
+    def test_pooling_body_pads_packed_tokens(self):
+        """3 seqs × 30 tokens is 90 packed tokens. Body picks T=128."""
         cfg = _pooling_vllm_config()
         cfg.compilation_config.compile_sizes = [64, 128]
         b = SpyreShapeBucketer.for_pooling(cfg)
@@ -208,64 +173,6 @@ class TestEncoderDispatch:
         one_d = b.dispatch(90)
         assert one_d is not None
         assert one_d.padded_num_tokens == 128
-        two_d = b.dispatch_encoder(
-            num_seqs=3,
-            max_query_len=30,
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        )
-        assert two_d is not None
-        assert (two_d.batch_bucket, two_d.len_bucket) == (4, 64)
-        assert two_d.padded_num_tokens == 256
-
-    def test_dispatch_encoder_stays_on_warmed_shapes(self):
-        config = MagicMock()
-        config.compilation_config.compile_sizes = []
-        b = SpyreShapeBucketer(config, encoder_shapes=[(4, 64)])
-        desc = b.dispatch_encoder(
-            num_seqs=1,
-            max_query_len=30,
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        )
-        assert desc is not None
-        assert (desc.batch_bucket, desc.len_bucket) == (4, 64)
-
-    def test_dispatch_encoder_none_when_over_token_budget(self):
-        config = MagicMock()
-        config.compilation_config.compile_sizes = []
-        b = SpyreShapeBucketer(config, encoder_shapes=[(4, 64)])
-        assert (
-            b.dispatch_encoder(
-                num_seqs=3,
-                max_query_len=30,
-                max_num_seqs=4,
-                max_model_len=2048,
-                max_num_batched_tokens=200,
-            )
-            is None
-        )
-
-    def test_dispatch_encoder_none_on_1d_bucketer(self, bucketer):
-        assert (
-            bucketer.dispatch_encoder(
-                num_seqs=1,
-                max_query_len=8,
-                max_num_seqs=4,
-                max_model_len=128,
-                max_num_batched_tokens=512,
-            )
-            is None
-        )
-
-    def test_encoder_descriptor_is_frozen(self):
-        desc = EncoderBucketDescriptor(
-            batch_bucket=4, len_bucket=64, actual_num_seqs=3, actual_max_len=30
-        )
-        with pytest.raises(FrozenInstanceError):
-            desc.batch_bucket = 1
 
 
 class TestEncoderBuckets:
@@ -304,43 +211,3 @@ class TestEncoderBuckets:
         assert encoder_batch_bucket(1, 4) == 1
         assert encoder_batch_bucket(3, 4) == 4
         assert encoder_batch_bucket(4, 4) == 4
-
-    def test_warmup_shapes_use_max_model_len(self):
-        assert pooling_warmup_shapes(
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        ) == [
-            (1, 64),
-            (1, 128),
-            (2, 64),
-            (2, 128),
-            (4, 64),
-            (4, 128),
-        ]
-
-    def test_warmup_shapes_skip_over_token_budget(self):
-        # 4*256 = 1024 and 2*256 = 512 both exceed 300; 4*64 = 256 still fits.
-        assert pooling_warmup_shapes(
-            max_num_seqs=4,
-            max_model_len=2048,
-            max_num_batched_tokens=300,
-            len_ladder=[64, 256],
-        ) == [(1, 64), (1, 256), (2, 64), (4, 64)]
-
-    def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):
-        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
-            input_ids=[1, 2, 3, 4, 5],
-            positions=[0, 1, 2, 0, 1],
-            query_lens=[3, 2],
-            batch_bucket=4,
-            len_bucket=4,
-            pad_token_id=9,
-        )
-        # seq0, seq1, then two dummy rows
-        assert padded_ids == [1, 2, 3, 9, 4, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
-        assert padded_pos == list(range(4)) * 4
-
-    def test_encoder_bucket_valid_row_indices_skips_pads(self):
-        indices = encoder_bucket_valid_row_indices([3, 2], len_bucket=4)
-        assert indices == [0, 1, 2, 4, 5]
