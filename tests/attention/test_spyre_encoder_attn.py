@@ -520,6 +520,29 @@ def test_encoder_workspace_rebuilds_when_query_boundaries_change():
     assert not torch.equal(second.q_pack_idx, first.q_pack_idx)
 
 
+def test_encoder_workspace_pads_to_warmed_attention_shape():
+    """Warmed (B, L) cells pad dummy seqs; unpack stays on the real batch."""
+    meta = _workspace_meta()
+    ws = encoder_workspace(
+        meta,
+        n=5,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        head_size_padded=64,
+        padded_tokens=16,
+        encoder_shapes=[(4, 64)],
+        max_num_seqs=8,
+        max_model_len=128,
+        max_num_batched_tokens=512,
+    )
+    assert ws.q_pack_idx.shape == (4, 64)
+    assert ws.kv_pack_idx.shape == (4, 64)
+    assert ws.mask.shape == (4, 1, 64, 64)
+    assert ws.unpack_idx.shape == (16,)
+    # Dummy rows gather the trailing pad slot, not real tokens.
+    assert torch.all(ws.q_pack_idx[2:] == 16)
+
+
 def test_encoder_workspace_rebuilds_when_only_kv_lens_change():
     """``seq_lens`` alone drives the KV half of the mask, so it must be keyed on."""
     meta = _workspace_meta()
