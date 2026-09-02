@@ -56,6 +56,32 @@ vllm serve ibm-granite/granite-embedding-125m-english \
   --runner pooling --max-num-seqs 4 --max-model-len 512
 ```
 
+Runtime attention picks the **smallest warmed** `(B, L)` that fits. A 64-token
+single-seq request on `--max-model-len 128` lands on `(1, 64)` when that cell
+is warmed — not `(1, 128)`. Attention FLOPs still scale as `L²`, so a fair
+latency A/B vs sendnn on 64-token prompts is:
+
+```bash
+vllm serve ibm-granite/granite-embedding-125m-english \
+  --runner pooling --max-num-seqs 1 --max-model-len 64
+```
+
+Compare mean E2EL to the same bench with `--max-model-len 128`. If the two
+are close, pad-up is not the gap; the remaining cost is per-layer pack/SDPA
+and per-block launches.
+
+At `B=1` with `T == L` (no pad slots), encoder attention skips the per-layer
+`index_select` pack/unpack and only permutes. `B > 1` still gathers.
+
+Default compile is one transformer block at a time. For a 12-layer embed
+model you can A/B a single whole-model graph (do not change this for 40-layer
+decoders):
+
+```bash
+SPYRE_COMPILE_GRANULARITY=model vllm serve ibm-granite/granite-embedding-125m-english \
+  --runner pooling --max-num-seqs 1 --max-model-len 64
+```
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:
