@@ -17,7 +17,8 @@
 ``install()``, called from the attention metadata builder, binds the forward below onto
 each eligible layer instance; every other ``Attention`` keeps upstream's forward and its
 ``unified_kv_cache_update`` op. The core must stay opaque: its per-sequence Python loop
-cannot be captured with ``fullgraph=True``.
+cannot be captured with ``fullgraph=True``. Encoder layers get the same opaque op and
+never a KV write (they inherit ``do_kv_cache_update`` but have no cache).
 """
 
 import types
@@ -130,6 +131,39 @@ def _spyre_attention_forward(
     return output.view(-1, hidden_size)
 
 
+def _encoder_attention_forward(
+    self: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_shape: torch.Size | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Opaque ``unified_attention`` only. No KV scatter (encoder has no cache)."""
+    if output_dtype is None:
+        output_dtype = query.dtype
+    if output_shape is None:
+        output_shape = torch.Size((query.shape[0], self.num_heads * self.head_size_v))
+    output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+    hidden_size = output_shape[-1]
+
+    query = query.view(-1, self.num_heads, self.head_size)
+    output = output.view(-1, self.num_heads, self.head_size_v)
+    if key is not None:
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+    if value is not None:
+        value = value.view(-1, self.num_kv_heads, self.head_size_v)
+
+    torch.ops.vllm.unified_attention_with_output(
+        query,  # ty: ignore[invalid-argument-type]
+        key,  # ty: ignore[invalid-argument-type]
+        value,  # ty: ignore[invalid-argument-type]
+        output,  # ty: ignore[invalid-argument-type]
+        _encode_layer_name(self.layer_name),  # ty: ignore[invalid-argument-type]
+    )
+    return output.view(-1, hidden_size)
+
+
 def _can_split(layer: Attention) -> bool:
     """Only Spyre paged attention, and only where upstream's own prologue is a no-op."""
     return (
@@ -142,9 +176,20 @@ def _can_split(layer: Attention) -> bool:
     )
 
 
+def _can_install_encoder(layer: Attention) -> bool:
+    """Encoder/encoder-only: opaque attention op, never a KV write."""
+    return (
+        layer.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY)
+        and layer.kv_sharing_target_layer_name is None
+        and layer.query_quant is None
+    )
+
+
 def install(layers: Iterable[Attention]) -> SlotMapping:
-    """Opt eligible layers into the traced KV write; returns their shared slot holder."""
-    split = [layer for layer in layers if _can_split(layer)]
+    """Patch decoder (KV write + opaque core) and encoder (opaque core only)."""
+    layer_list = list(layers)
+    split = [layer for layer in layer_list if _can_split(layer)]
+    encoders = [layer for layer in layer_list if _can_install_encoder(layer)]
     slot_mapping = SlotMapping(split)
     _holders.add(slot_mapping)
 
@@ -154,9 +199,19 @@ def install(layers: Iterable[Attention]) -> SlotMapping:
             _spyre_attention_forward, layer
         )
 
+    for layer in encoders:
+        layer.forward = types.MethodType(  # ty: ignore[invalid-assignment]
+            _encoder_attention_forward, layer
+        )
+
     if split:
         logger.info(
             "Scattering the KV cache inside the outer graph for %d attention layers.",
             len(split),
+        )
+    if encoders:
+        logger.info(
+            "Keeping encoder attention behind unified_attention for %d layers.",
+            len(encoders),
         )
     return slot_mapping

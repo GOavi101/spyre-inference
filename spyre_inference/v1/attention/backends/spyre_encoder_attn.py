@@ -21,6 +21,9 @@ Varlen flash: each request is a contiguous slice of the packed ``[T, H, D]``
 list (``query_start_loc``). A compiled online-softmax kernel reads that slice
 (padded to a stick-aligned length) and never materialises a dense ``(B, L)``
 grid or ``[B, 1, L, L]`` mask. Stays behind ``unified_attention``.
+
+Slices are cut on the host and sent H2D so the kernel always sees the same
+tensor provenance, whatever the batch packing looks like. See ``_seq_slice``.
 """
 
 from __future__ import annotations
@@ -37,7 +40,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _maybe_compile,
 )
-from spyre_inference.v1.pool import select_rows
 
 # Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
 # D-aligned keeps QK^T stick-aligned so Inductor never enters
@@ -219,13 +221,25 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         super().__init__(*args, **kwargs)
         self._flash_fns: dict[tuple[int, int, int, int], object] = {}
 
-    def _gather_seq(self, flat: torch.Tensor, start: int, length: int) -> torch.Tensor:
-        if length <= 0:
-            return flat[:0]
-        if start == 0 and length == flat.shape[0]:
-            return flat
-        idx = torch.arange(start, start + length, dtype=torch.int64)
-        return select_rows(flat, idx)
+    def _seq_slice(
+        self,
+        host_flat: torch.Tensor,
+        start: int,
+        length: int,
+        aligned_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """One padded sequence ``[L, H, D]``, host-sliced then sent H2D.
+
+        Every sequence must reach the kernel the same way. A device-side slice
+        that happens to span the whole packed batch (one request filling its
+        token bucket) is a no-op, so the kernel would receive the projection
+        output itself, and Spyre cannot restickify that layout for the QK^T
+        operand. A fresh H2D tensor lets the compiler pick the layout, which is
+        what the probe validated.
+        """
+        seq = pad_seq_to_aligned(host_flat[start : start + length], aligned_len)
+        return convert(seq, device)
 
     def _store_seq(
         self,
@@ -274,14 +288,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
 
         target_device = output.device
-        if query.device.type != target_device.type:
-            query = convert(query, target_device.type)
-            key = convert(key, target_device.type)
-            value = convert(value, target_device.type)
-
-        query = _pad_head_dim_to_stick(query, head_size_padded)
-        key = _pad_head_dim_to_stick(key, head_size_padded)
-        value = _pad_head_dim_to_stick(value, head_size_padded)
+        # Slicing happens on the host: a Spyre slice at start>0 reads corrupt
+        # rows, and slicing on device leaves whole-batch sequences unmaterialised
+        # (see _seq_slice). One D2H per tensor here, one H2D per sequence below.
+        q_host = _pad_head_dim_to_stick(convert(query, "cpu"), head_size_padded)
+        k_host = _pad_head_dim_to_stick(convert(key, "cpu"), head_size_padded)
+        v_host = _pad_head_dim_to_stick(convert(value, "cpu"), head_size_padded)
 
         for start, q_len, kv_len in zip(q_starts, query_lens, kv_lens):
             if start >= n or q_len <= 0:
@@ -289,9 +301,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             q_len = min(int(q_len), n - int(start))
             kv_len = min(int(kv_len), q_len)
             aligned_len = _align_up(max(q_len, kv_len, 1))
-            q_seq = pad_seq_to_aligned(self._gather_seq(query, int(start), q_len), aligned_len)
-            k_seq = pad_seq_to_aligned(self._gather_seq(key, int(start), kv_len), aligned_len)
-            v_seq = pad_seq_to_aligned(self._gather_seq(value, int(start), kv_len), aligned_len)
+            q_seq = self._seq_slice(q_host, int(start), q_len, aligned_len, target_device)
+            k_seq = self._seq_slice(k_host, int(start), kv_len, aligned_len, target_device)
+            v_seq = self._seq_slice(v_host, int(start), kv_len, aligned_len, target_device)
             attn = encoder_flash_sdpa(
                 q_seq,
                 k_seq,

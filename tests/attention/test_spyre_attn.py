@@ -1551,7 +1551,7 @@ def test_install_patches_layers_not_the_attention_class():
     assert decoder.spyre_slots is holder
     assert decoder.forward.__func__ is attn_layer._spyre_attention_forward
     assert not hasattr(encoder, "spyre_slots")
-    assert not hasattr(encoder, "forward")
+    assert encoder.forward.__func__ is attn_layer._encoder_attention_forward
 
     # No cache bound, so there is no device to mirror onto and nothing to publish.
     holder.publish_null(8)
