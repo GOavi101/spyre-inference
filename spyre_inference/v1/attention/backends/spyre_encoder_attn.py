@@ -17,16 +17,24 @@
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
 layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
-Varlen flash: each request is a contiguous slice of the packed ``[T, H, D]``
-list (``query_start_loc``). A compiled online-softmax kernel reads that slice
-(padded to a stick-aligned length) and never materialises a dense ``(B, L)``
-grid or ``[B, 1, L, L]`` mask. Stays behind ``unified_attention``.
+Blocked flash, modelled on the decoder's ``_create_compilable_page_attn``. The
+packed ``[T, H, D]`` list goes to the kernel whole and request boundaries ride
+in int32 row-index tables, so a Spyre card never has to do offset arithmetic on
+*shapes* — offsets are data. The kernel gathers its own sequence in-graph,
+walks KV in ``ENCODER_BLOCK_SIZE``-token blocks carrying a running softmax
+max/sum, and scatters the result back with ``index_copy_``. Nothing is sliced
+or copied on the host, no ``(B, L)`` grid or ``[B, 1, L, L]`` mask is
+materialised, and the only compile axis is the block count.
 
-Slices are cut on the host and sent H2D so the kernel always sees the same
-tensor provenance, whatever the batch packing looks like. See ``_seq_slice``.
+Two torch-spyre bugs shape the design. A compiled region reads its arguments
+from offset 0 and ignores ``storage_offset`` (#3770), so a sequence cannot be
+sliced outside the graph; and a gather that selects its whole source faults the
+card (#4033), so an identity gather is skipped instead.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -41,145 +49,230 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _maybe_compile,
 )
 
-# Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
-# D-aligned keeps QK^T stick-aligned so Inductor never enters
-# insert_bmm_padding (MiniLM head_size=32).
-ENCODER_SEQ_ALIGNMENT = 64
+# KV block width, in tokens. One Spyre stick of fp16.
+ENCODER_BLOCK_SIZE = 64
 
 
-def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
-    return max(align, (n + align - 1) // align * align)
+def _blocks_for(length: int) -> int:
+    """Block count covering ``length`` tokens, rounded up to a power of two.
 
-
-def host_key_valid(aligned_len: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
-    """1D key mask ``[L]``: 1.0 real, 0.0 pad. No ``-inf`` (Spyre fp16 drops it)."""
-    valid = torch.zeros(aligned_len, dtype=dtype)
-    if kv_len > 0:
-        valid[: min(kv_len, aligned_len)] = 1
-    return valid
-
-
-# Older name used by tests / probes that have not been recopied.
-host_key_bias = host_key_valid
-
-
-def _pad_head_dim_to_stick(flat: torch.Tensor, head_size_padded: int) -> torch.Tensor:
-    """Pad last dim to a stick. MiniLM ``[T,H,32]`` cannot ``F.pad`` on Spyre."""
-    head_size = flat.shape[-1]
-    if head_size == head_size_padded:
-        return flat
-    device = flat.device
-    if device.type == "spyre":
-        flat = convert(flat, "cpu")
-    flat = F.pad(flat, (0, head_size_padded - head_size))
-    if device.type == "spyre":
-        flat = convert(flat, device)
-    return flat
-
-
-def pad_seq_to_aligned(seq: torch.Tensor, aligned_len: int) -> torch.Tensor:
-    """Zero-pad a contiguous sequence ``[n, ...]`` to ``[aligned_len, ...]``."""
-    n = seq.shape[0]
-    if n == aligned_len:
-        return seq
-    if n > aligned_len:
-        raise ValueError(f"seq length {n} exceeds aligned_len {aligned_len}")
-    pad = seq.new_zeros((aligned_len - n, *seq.shape[1:]))
-    return torch.cat([seq, pad], dim=0)
-
-
-def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-    """Tiny mutation, compiled alone — do not fuse with the flash matmuls."""
-    dst.index_copy_(0, index, src)
-    return dst
-
-
-_compiled_index_copy: object | None = None
-
-
-def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-    """Eager on CPU; compiled ``index_copy_`` on Spyre (eager falls back / rejects)."""
-    global _compiled_index_copy
-    if dst.device.type != "spyre":
-        return _index_copy_kernel(dst, index, src)
-    if _compiled_index_copy is None:
-        _compiled_index_copy = torch.compile(_index_copy_kernel, dynamic=False)
-    return _compiled_index_copy(dst, index, src)
-
-
-def _create_encoder_flash_kernel(num_heads: int, num_kv_heads: int):
-    """Aligned ``L×L`` GEMM plus same-shape ``[H,L,L]`` 0/1 (no 1D broadcast)."""
-    repeat = num_heads // num_kv_heads if num_heads != num_kv_heads else 1
-    gqa = repeat > 1
-    pad_logit = -1.0e4
-
-    def _kernel(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        keep: torch.Tensor,
-        scale: float,
-    ) -> torch.Tensor:
-        qh = query.permute(1, 0, 2) * scale
-        kh = key.permute(1, 0, 2)
-        vh = value.permute(1, 0, 2)
-        if gqa:
-            kh = kh.repeat_interleave(repeat, dim=0)
-            vh = vh.repeat_interleave(repeat, dim=0)
-        scores = torch.matmul(qh, kh.transpose(-1, -2))
-        scores = scores + (1.0 - keep) * pad_logit
-        scores_max = scores.amax(dim=-1)
-        probs = torch.exp(scores - scores_max.unsqueeze(-1)) * keep
-        tiny = torch.finfo(query.dtype).tiny
-        den = probs.sum(dim=-1).clamp(min=tiny).unsqueeze(-1)
-        out = torch.matmul(probs, vh) / den
-        return out.permute(1, 0, 2).contiguous()
-
-    return _kernel
-
-
-def host_score_keep(
-    num_heads: int, aligned_len: int, kv_len: int, dtype: torch.dtype
-) -> torch.Tensor:
-    """``[H, L, L]`` 1.0 on real key columns, 0.0 on pad. Built on CPU."""
-    keep = torch.zeros(num_heads, aligned_len, aligned_len, dtype=dtype)
-    if kv_len > 0:
-        keep[:, :, : min(kv_len, aligned_len)] = 1
-    return keep
-
-
-def encoder_flash_sdpa(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    kv_len: int,
-    scale: float,
-    *,
-    compile_enabled: bool = False,
-    cache: dict[tuple[int, int, int, int], object] | None = None,
-) -> torch.Tensor:
-    """Softmax attention on one stick-aligned sequence ``[L, H, D]``.
-
-    Builds a same-rank ``[H, L, L]`` keep tensor on the host (Spyre slice writes
-    are corrupt) and passes it in so the add is not a 1D broadcast.
+    Encoder self-attention has ``q_len == kv_len``, so this single number fixes
+    both the query extent (``num_blocks * ENCODER_BLOCK_SIZE``) and the KV loop
+    trip count — the kernel cache has one shape axis, not two. Rounding to a
+    power of two keeps that axis to a handful of buckets, matching the ladder
+    ``_powers_of_two_up_to`` gives decoder attention.
     """
-    aligned_len, num_heads, head_size = query.shape
-    num_kv_heads = key.shape[1]
-    keep = host_score_keep(num_heads, aligned_len, int(kv_len), query.dtype)
-    if query.device.type == "spyre":
-        keep = convert(keep, query.device)
-    else:
-        keep = keep.to(device=query.device)
-    key_id = (aligned_len, num_heads, num_kv_heads, head_size)
-    fn: object | None = None if cache is None else cache.get(key_id)
-    if fn is None:
-        fn = _maybe_compile(
-            _create_encoder_flash_kernel(num_heads, num_kv_heads),
-            compile_enabled,
+    blocks = max(1, (length + ENCODER_BLOCK_SIZE - 1) // ENCODER_BLOCK_SIZE)
+    bucket = 1
+    while bucket < blocks:
+        bucket *= 2
+    return bucket
+
+
+def _create_encoder_block_kernel(
+    num_blocks: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    *,
+    needs_gather: bool = True,
+    store_mode: str = "none",
+):
+    """Blocked online-softmax attention over one sequence of the packed list.
+
+    Dynamo unrolls the KV loop because ``num_blocks``, ``needs_gather`` and
+    ``store_mode`` are closure constants.
+
+    ``head_size`` need not be stick-aligned: the kernel never slices a matmul
+    operand, so Inductor's ``insert_bmm_padding`` can pad the contraction
+    dimension itself.
+    """
+    num_queries_per_kv = num_heads // num_kv_heads
+    padded_len = num_blocks * ENCODER_BLOCK_SIZE
+
+    def specialized_encoder_block_attn_kernel(
+        query,
+        key,
+        value,
+        row_index,
+        mask_tiles,
+        scale,
+        out=None,
+    ):
+        """
+        Expected shapes:
+            query: [num_tokens, num_heads, head_size], the whole batch's query
+            key/value: [num_tokens, num_kv_heads, head_size], likewise
+            row_index: [num_blocks * ENCODER_BLOCK_SIZE] int32 device tensor of
+                this sequence's absolute rows. Lanes past its length repeat the
+                last real row, so the gather never reads another request's
+                tokens and the mask discards the duplicates.
+            mask_tiles: num_blocks additive tiles, each
+                [num_kv_heads, num_queries_per_kv, 1, ENCODER_BLOCK_SIZE]. The
+                query axis is 1 because an encoder mask depends only on the KV
+                column: every query row, real or padding, attends to exactly the
+                real keys. That is what makes the padding rows exact duplicates
+                of the last real row, which in turn makes the duplicate-index
+                store below harmless.
+            out: with store_mode="index", the caller's buffer to write into.
+
+        Returns [padded_len, num_heads, head_size], or ``out`` when this kernel
+        stored the result itself.
+        """
+        # A compiled region reads a view from offset 0, ignoring storage_offset
+        # (torch-spyre#3770), so rows are gathered here rather than sliced
+        # outside. A gather selecting its whole source instead faults the device
+        # (RAS ComputeHardwareError 0x7b1b, torch-spyre#4033), hence needs_gather.
+        #
+        # One gather per tensor, then index the blocks at trace time: two
+        # multi-element index_selects on the *same* tensor exhaust torch-spyre's
+        # layout candidates (see _create_compilable_bucketed_decode_attn).
+        if needs_gather:
+            q_rows = query.index_select(0, row_index)
+            k_rows = key.index_select(0, row_index)
+            v_rows = value.index_select(0, row_index)
+        else:
+            q_rows, k_rows, v_rows = query, key, value
+
+        q = (
+            q_rows.unsqueeze(0)
+            .transpose(1, 2)
+            .reshape(num_kv_heads, num_queries_per_kv, padded_len, head_size)
         )
+        k_blocks = k_rows.reshape(num_blocks, ENCODER_BLOCK_SIZE, num_kv_heads, head_size)
+        v_blocks = v_rows.reshape(num_blocks, ENCODER_BLOCK_SIZE, num_kv_heads, head_size)
+
+        tile_max = None
+        tile_sum = None
+        tile_output = None
+
+        for i in range(num_blocks):
+            # Token-major block to head-major for the matmuls; permutes on device.
+            k_block = k_blocks[i].permute(1, 0, 2).unsqueeze(1)
+            v_block = v_blocks[i].permute(1, 0, 2).unsqueeze(1)
+
+            scores = torch.matmul(q, k_block.transpose(-2, -1)) * scale
+            scores = scores + mask_tiles[i]
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = torch.matmul(tile_probs, v_block)
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                # i > 0 only reachable after the i == 0 branch initialized these.
+                assert tile_max is not None
+                assert tile_sum is not None
+                assert tile_output is not None
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output += torch.matmul(tile_probs, v_block)
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+
+        assert tile_output is not None and tile_sum is not None
+        attn = tile_output / tile_sum
+        attn = attn.reshape(1, num_heads, padded_len, head_size).transpose(1, 2)
+        attn = attn.reshape(padded_len, num_heads, head_size)
+        if store_mode == "index":
+            # `out` and `query` are both indexed by absolute token row. Storing
+            # the full padded extent keeps query_len out of the closure; the
+            # padding rows repeat the sequence's last row and, per the mask note
+            # above, carry the same value, so index_copy_'s undefined write
+            # order for duplicate indices is harmless.
+            assert out is not None
+            out.index_copy_(0, row_index, attn)
+            return out
+        return attn
+
+    return specialized_encoder_block_attn_kernel
+
+
+@dataclass
+class EncoderSeqPlan:
+    """Everything the kernel needs for one request, built once per step."""
+
+    start: int
+    query_len: int
+    num_blocks: int
+    needs_gather: bool
+    row_table: torch.Tensor
+    mask_tiles: list[torch.Tensor]
+
+
+def encoder_index_dtype(device: torch.device) -> torch.dtype:
+    """int32 on Spyre, which has no int64 and whose compiled ``index_copy_``
+    takes it; int64 everywhere else, where eager ``index_copy_`` rejects int32.
+    """
+    return torch.int32 if device.type == "spyre" else torch.int64
+
+
+def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtype) -> torch.Tensor:
+    """One sequence's absolute rows, pad lanes clamped to its last real row.
+
+    ``extent`` is a multiple of ``ENCODER_BLOCK_SIZE`` and therefore of
+    ``INT32_ELEMS_PER_STICK``, so the table is stick-aligned with no extra pad.
+    """
+    return torch.arange(extent, dtype=dtype).clamp(max=query_len - 1) + start
+
+
+def _const_tile(
+    masked: bool,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    cache: dict | None,
+) -> torch.Tensor:
+    """Shared all-zero or all-masked tile. Read-only: every block aliases it."""
+    cache_key = (masked, num_kv_heads, num_queries_per_kv, dtype, str(device))
+    tile = None if cache is None else cache.get(cache_key)
+    if tile is None:
+        fill = torch.finfo(dtype).min if masked else 0.0
+        host = torch.full(
+            (num_kv_heads, num_queries_per_kv, 1, ENCODER_BLOCK_SIZE), fill, dtype=dtype
+        )
+        tile = convert(host, device)
         if cache is not None:
-            cache[key_id] = fn
-    return fn(query, key, value, keep, scale)  # ty: ignore[invalid-call]
+            cache[cache_key] = tile
+    return tile
+
+
+def encoder_mask_tiles(
+    num_blocks: int,
+    kv_len: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    cache: dict | None = None,
+) -> list[torch.Tensor]:
+    """One additive tile per KV block. Only the boundary block is per-sequence.
+
+    This is where the mask's ``L``-squared growth disappears: interior blocks
+    are entirely real keys and beyond-the-end blocks entirely padding, so both
+    take a constant tile that ``cache`` hands out by reference.
+    """
+    tiles: list[torch.Tensor] = []
+    for i in range(num_blocks):
+        lo = i * ENCODER_BLOCK_SIZE
+        if lo + ENCODER_BLOCK_SIZE <= kv_len:
+            tiles.append(_const_tile(False, num_kv_heads, num_queries_per_kv, dtype, device, cache))
+        elif lo >= kv_len:
+            tiles.append(_const_tile(True, num_kv_heads, num_queries_per_kv, dtype, device, cache))
+        else:
+            host = torch.full(
+                (num_kv_heads, num_queries_per_kv, 1, ENCODER_BLOCK_SIZE),
+                torch.finfo(dtype).min,
+                dtype=dtype,
+            )
+            host[..., : kv_len - lo] = 0
+            tiles.append(convert(host, device))
+    return tiles
 
 
 def dense_sdpa_reference(
@@ -213,51 +306,153 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     The platform selects this impl for ENCODER/ENCODER_ONLY layers (see
     ``TorchSpyrePlatform.get_attn_backend_cls``). Forward stays inside the
-    opaque ``unified_attention`` op: varlen flash on the packed list, no
-    ``(B, L)`` gather grid.
+    opaque ``unified_attention`` op and dispatches the blocked kernel per
+    request, with no host-side slicing of activations.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._flash_fns: dict[tuple[int, int, int, int], object] = {}
+        self._block_fns: dict[tuple, object] = {}
+        # Interior and fully-masked tiles are shape-only, so one device copy
+        # each serves every sequence, layer and step.
+        self._const_tiles: dict[tuple, torch.Tensor] = {}
+        self._warmed_buffers: set[int] = set()
 
-    def _seq_slice(
+    def _get_block_fn(
         self,
-        host_flat: torch.Tensor,
-        start: int,
-        length: int,
-        aligned_len: int,
+        num_blocks: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        *,
+        needs_gather: bool,
+        store_mode: str,
+    ):
+        key = (num_blocks, num_heads, num_kv_heads, head_size, needs_gather, store_mode)
+        fn = self._block_fns.get(key)
+        if fn is None:
+            fn = _maybe_compile(
+                _create_encoder_block_kernel(
+                    num_blocks,
+                    num_heads,
+                    num_kv_heads,
+                    head_size,
+                    needs_gather=needs_gather,
+                    store_mode=store_mode,
+                ),
+                self._compile_attn,
+            )
+            self._block_fns[key] = fn
+        return fn
+
+    def _warm_block_fns(
+        self,
+        buffer_rows: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
         device: torch.device,
-    ) -> torch.Tensor:
-        """One padded sequence ``[L, H, D]``, host-sliced then sent H2D.
-
-        Every sequence must reach the kernel the same way. A device-side slice
-        that happens to span the whole packed batch (one request filling its
-        token bucket) is a no-op, so the kernel would receive the projection
-        output itself, and Spyre cannot restickify that layout for the QK^T
-        operand. A fresh H2D tensor lets the compiler pick the layout, which is
-        what the probe validated.
-        """
-        seq = pad_seq_to_aligned(host_flat[start : start + length], aligned_len)
-        return convert(seq, device)
-
-    def _store_seq(
-        self,
-        output: torch.Tensor,
-        start: int,
-        length: int,
-        result: torch.Tensor,
     ) -> None:
-        if length <= 0:
+        """Compile every kernel a batch of this token count can ask for.
+
+        A request's block count follows its own length, not the body bucket, so
+        the warmup dummies do not span the ladder on their own — one long
+        request mid-serve would otherwise stall the server compiling. Doing it
+        here, on the first forward for each body size, keeps that cost inside
+        warmup, where the dummy runs already visit every body size.
+
+        Scratch contents are irrelevant; only the shapes reach the cache key.
+        """
+        if buffer_rows in self._warmed_buffers:
             return
-        src = result[:length]
-        if output.device.type != "spyre" and start == 0 and length == output.shape[0]:
-            output.copy_(src)
-            return
-        dest = torch.arange(start, start + length, dtype=torch.int64, device=output.device)
-        if src.device.type != output.device.type:
-            src = convert(src, output.device)
-        _index_copy(output, dest, src)
+        self._warmed_buffers.add(buffer_rows)
+
+        num_queries_per_kv = num_heads // num_kv_heads
+        query = convert(torch.zeros((buffer_rows, num_heads, head_size), dtype=dtype), device)
+        key = convert(torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype), device)
+        value = convert(torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype), device)
+        out = convert(torch.zeros((buffer_rows, num_heads, head_size), dtype=dtype), device)
+
+        num_blocks = 1
+        while num_blocks * ENCODER_BLOCK_SIZE <= buffer_rows:
+            extent = num_blocks * ENCODER_BLOCK_SIZE
+            rows = convert(
+                encoder_row_table(0, extent, extent, encoder_index_dtype(device)), device
+            )
+            tiles = encoder_mask_tiles(
+                num_blocks,
+                extent,
+                num_kv_heads,
+                num_queries_per_kv,
+                dtype,
+                device,
+                self._const_tiles,
+            )
+            # A sequence only skips the gather when it fills the buffer exactly,
+            # which pins the block count; every other case gathers.
+            for needs_gather in (True, False):
+                if not needs_gather and extent != buffer_rows:
+                    continue
+                attn_fn = self._get_block_fn(
+                    num_blocks,
+                    num_heads,
+                    num_kv_heads,
+                    head_size,
+                    needs_gather=needs_gather,
+                    store_mode="index",
+                )
+                attn_fn(query, key, value, rows, tiles, self.scale, out=out)
+            num_blocks *= 2
+
+    def _build_plans(
+        self,
+        attn_metadata: SpyreAttentionMetadata,
+        query: torch.Tensor,
+        num_kv_heads: int,
+        num_queries_per_kv: int,
+    ) -> list[EncoderSeqPlan]:
+        """Row tables and mask tiles for every request in the step."""
+        query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
+        seq_lens = attn_metadata.seq_lens.cpu().tolist()
+        # The body may 1D-pad past num_actual_tokens; those rows are not a request.
+        num_tokens = attn_metadata.num_actual_tokens
+        buffer_rows = query.shape[0]
+        device = query.device
+        index_dtype = encoder_index_dtype(device)
+
+        plans: list[EncoderSeqPlan] = []
+        for seq_idx in range(attn_metadata.num_seqs):
+            start = int(query_start_loc[seq_idx])
+            query_len = int(query_start_loc[seq_idx + 1]) - start
+            if start >= num_tokens or query_len <= 0:
+                continue
+            query_len = min(query_len, num_tokens - start)
+            kv_len = min(int(seq_lens[seq_idx]), query_len)
+
+            num_blocks = _blocks_for(max(query_len, kv_len))
+            extent = num_blocks * ENCODER_BLOCK_SIZE
+            plans.append(
+                EncoderSeqPlan(
+                    start=start,
+                    query_len=query_len,
+                    num_blocks=num_blocks,
+                    needs_gather=not (start == 0 and query_len == extent and buffer_rows == extent),
+                    row_table=convert(
+                        encoder_row_table(start, query_len, extent, index_dtype), device
+                    ),
+                    mask_tiles=encoder_mask_tiles(
+                        num_blocks,
+                        kv_len,
+                        num_kv_heads,
+                        num_queries_per_kv,
+                        query.dtype,
+                        device,
+                        self._const_tiles,
+                    ),
+                )
+            )
+        return plans
 
     def forward(  # ty: ignore[invalid-method-override]
         self,
@@ -275,49 +470,59 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if attn_metadata is None:
             return output
 
-        # Body may 1D-pad past num_actual_tokens; extra rows are not sequences.
-        n = attn_metadata.num_actual_tokens
-        scale = self.scale
-
-        qsl = attn_metadata.query_start_loc.cpu()
-        q_starts = qsl[:-1].tolist()
-        query_lens = torch.diff(qsl).tolist()
-        kv_lens = attn_metadata.seq_lens.cpu().tolist()
-
+        num_heads = query.shape[1]
+        num_kv_heads = key.shape[1]
         head_size = query.shape[2]
-        head_size_padded = _align_up(head_size)
 
-        target_device = output.device
-        # Slicing happens on the host: a Spyre slice at start>0 reads corrupt
-        # rows, and slicing on device leaves whole-batch sequences unmaterialised
-        # (see _seq_slice). One D2H per tensor here, one H2D per sequence below.
-        q_host = _pad_head_dim_to_stick(convert(query, "cpu"), head_size_padded)
-        k_host = _pad_head_dim_to_stick(convert(key, "cpu"), head_size_padded)
-        v_host = _pad_head_dim_to_stick(convert(value, "cpu"), head_size_padded)
+        # Everything runs where the result lands. A real step already has all
+        # four on the same device; unit tests hand in host activations.
+        if query.device != output.device:
+            query = convert(query, output.device)
+            key = convert(key, output.device)
+            value = convert(value, output.device)
 
-        for start, q_len, kv_len in zip(q_starts, query_lens, kv_lens):
-            if start >= n or q_len <= 0:
-                continue
-            q_len = min(int(q_len), n - int(start))
-            kv_len = min(int(kv_len), q_len)
-            aligned_len = _align_up(max(q_len, kv_len, 1))
-            q_seq = self._seq_slice(q_host, int(start), q_len, aligned_len, target_device)
-            k_seq = self._seq_slice(k_host, int(start), kv_len, aligned_len, target_device)
-            v_seq = self._seq_slice(v_host, int(start), kv_len, aligned_len, target_device)
-            attn = encoder_flash_sdpa(
-                q_seq,
-                k_seq,
-                v_seq,
-                kv_len,
-                scale,
-                compile_enabled=self._compile_attn,
-                cache=self._flash_fns,
+        # Folds the per-layer eager store into the attention jobplan. Re-checked
+        # per call: vLLM hands out a fresh buffer per layer.
+        fused_store_ok = (
+            self._compile_attn
+            and output.dtype == query.dtype
+            # A compiled kernel reads its arguments from offset 0: torch-spyre#3770.
+            and output.storage_offset() == 0
+            and output.is_contiguous()
+        )
+        store_mode = "index" if fused_store_ok else "none"
+
+        if store_mode == "index":
+            self._warm_block_fns(
+                query.shape[0], num_heads, num_kv_heads, head_size, query.dtype, query.device
             )
-            if attn.shape[-1] != head_size:
-                if attn.device.type == "spyre":
-                    attn = convert(attn, "cpu")
-                attn = attn[..., :head_size].contiguous()
-            self._store_seq(output, int(start), q_len, attn)
+
+        # Built once per step; the whole encoder stack shares one build.
+        if attn_metadata.encoder_seq_plans is None:
+            attn_metadata.encoder_seq_plans = self._build_plans(
+                attn_metadata, query, num_kv_heads, num_heads // num_kv_heads
+            )
+
+        for plan in attn_metadata.encoder_seq_plans:
+            attn_fn = self._get_block_fn(
+                plan.num_blocks,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                needs_gather=plan.needs_gather,
+                store_mode=store_mode,
+            )
+            result = attn_fn(
+                query,
+                key,
+                value,
+                plan.row_table,
+                plan.mask_tiles,
+                self.scale,
+                out=output if store_mode == "index" else None,
+            )
+            if store_mode == "none":
+                output[plan.start : plan.start + plan.query_len] = result[: plan.query_len]
 
         return output
 

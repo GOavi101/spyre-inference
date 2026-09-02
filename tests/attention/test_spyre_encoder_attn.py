@@ -26,11 +26,14 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    ENCODER_BLOCK_SIZE,
     SpyreEncoderAttentionImpl,
+    _blocks_for,
+    _create_encoder_block_kernel,
     dense_sdpa_reference,
-    encoder_flash_sdpa,
-    host_key_bias,
-    pad_seq_to_aligned,
+    encoder_index_dtype,
+    encoder_mask_tiles,
+    encoder_row_table,
 )
 
 # extra `encoder_attention` mark so CI can split this into its own job
@@ -239,10 +242,83 @@ def ref_encoder_attn(
     return torch.cat(outputs, dim=0)
 
 
-def test_host_key_valid_marks_real_keys():
-    valid = host_key_bias(8, 3, torch.float32)
-    assert torch.equal(valid[:3], torch.ones(3))
-    assert torch.equal(valid[3:], torch.zeros(5))
+def _blocked_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    scale: float,
+    *,
+    compile_enabled: bool = False,
+) -> torch.Tensor:
+    """Drive the blocked kernel over a packed list the way ``forward`` does."""
+    num_heads, head_size = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+    num_queries_per_kv = num_heads // num_kv_heads
+    index_dtype = encoder_index_dtype(query.device)
+    tile_cache: dict = {}
+    out = torch.zeros_like(query)
+    start = 0
+    for length in query_lens:
+        num_blocks = _blocks_for(length)
+        extent = num_blocks * ENCODER_BLOCK_SIZE
+        kernel = _create_encoder_block_kernel(
+            num_blocks,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            needs_gather=True,
+            store_mode="index",
+        )
+        if compile_enabled:
+            kernel = torch.compile(kernel, dynamic=False)
+        kernel(
+            query,
+            key,
+            value,
+            encoder_row_table(start, length, extent, index_dtype),
+            encoder_mask_tiles(
+                num_blocks,
+                length,
+                num_kv_heads,
+                num_queries_per_kv,
+                query.dtype,
+                query.device,
+                tile_cache,
+            ),
+            scale,
+            out=out,
+        )
+        start += length
+    return out
+
+
+def test_blocks_for_rounds_up_to_powers_of_two():
+    assert [_blocks_for(n) for n in (1, 64, 65, 128, 129, 200, 512)] == [1, 1, 2, 2, 4, 4, 8]
+
+
+def test_mask_tiles_cut_at_the_boundary_block():
+    tiles = encoder_mask_tiles(3, 100, 2, 1, torch.float32, torch.device("cpu"), {})
+    masked = torch.finfo(torch.float32).min
+    # Block 0 is all real keys, block 1 straddles kv_len=100, block 2 is all padding.
+    assert torch.equal(tiles[0], torch.zeros_like(tiles[0]))
+    assert torch.equal(tiles[1][..., :36], torch.zeros_like(tiles[1][..., :36]))
+    assert torch.equal(tiles[1][..., 36:], torch.full_like(tiles[1][..., 36:], masked))
+    assert torch.equal(tiles[2], torch.full_like(tiles[2], masked))
+    # Interior and beyond-the-end tiles come from the cache by reference.
+    assert encoder_mask_tiles(1, 64, 2, 1, torch.float32, torch.device("cpu"), {})[0].shape == (
+        2,
+        1,
+        1,
+        ENCODER_BLOCK_SIZE,
+    )
+
+
+def test_row_table_clamps_padding_lanes_to_the_last_real_row():
+    rows = encoder_row_table(10, 3, ENCODER_BLOCK_SIZE, torch.int64)
+    assert rows[:3].tolist() == [10, 11, 12]
+    # Padding lanes repeat row 12 so the gather never reads the next request.
+    assert rows[3:].unique().tolist() == [12]
 
 
 @pytest.mark.parametrize(
@@ -414,7 +490,7 @@ def test_spyre_encoder_attn(
     ],
 )
 def test_encoder_flash_matches_per_seq_sdpa(query_lens: list[int]) -> None:
-    """Online softmax on flat T matches per-sequence SDPA (no (B, L) grid)."""
+    """Blocked online softmax on flat T matches per-sequence SDPA (no (B, L) grid)."""
     torch.manual_seed(0)
     heads, dim = 4, 64
     scale = dim**-0.5
@@ -423,26 +499,46 @@ def test_encoder_flash_matches_per_seq_sdpa(query_lens: list[int]) -> None:
     key = torch.randn(total, heads, dim)
     value = torch.randn(total, heads, dim)
     ref = dense_sdpa_reference(query, key, value, query_lens, scale)
-    cache: dict[tuple[int, int, int, int], object] = {}
-    got = query.new_empty(query.shape)
-    start = 0
-    for length in query_lens:
-        aligned = 64 if length <= 64 else 128
-        q = pad_seq_to_aligned(query[start : start + length], aligned)
-        k = pad_seq_to_aligned(key[start : start + length], aligned)
-        v = pad_seq_to_aligned(value[start : start + length], aligned)
-        out = encoder_flash_sdpa(q, k, v, length, scale, compile_enabled=False, cache=cache)
-        got[start : start + length] = out[:length]
-        start += length
+    got = _blocked_attn(query, key, value, query_lens, scale)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_encoder_flash_spans_multiple_kv_blocks() -> None:
+    """A sequence longer than one block exercises the running max/sum rescale."""
+    torch.manual_seed(0)
+    heads, dim = 2, 64
+    scale = dim**-0.5
+    query_lens = [200]
+    query = torch.randn(200, heads, dim)
+    key = torch.randn(200, heads, dim)
+    value = torch.randn(200, heads, dim)
+    ref = dense_sdpa_reference(query, key, value, query_lens, scale)
+    got = _blocked_attn(query, key, value, query_lens, scale)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_encoder_flash_gqa_matches_per_seq_sdpa() -> None:
+    torch.manual_seed(0)
+    heads, kv_heads, dim = 8, 2, 64
+    scale = dim**-0.5
+    query_lens = [70, 33]
+    total = sum(query_lens)
+    query = torch.randn(total, heads, dim)
+    key = torch.randn(total, kv_heads, dim)
+    value = torch.randn(total, kv_heads, dim)
+    ref = dense_sdpa_reference(query, key, value, query_lens, scale)
+    got = _blocked_attn(query, key, value, query_lens, scale)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
 def test_encoder_flash_compile_matches_eager() -> None:
     torch.manual_seed(0)
-    aligned, heads, dim = 64, 2, 64
-    q = torch.randn(aligned, heads, dim)
-    k = torch.randn(aligned, heads, dim)
-    v = torch.randn(aligned, heads, dim)
-    eager = encoder_flash_sdpa(q, k, v, 40, dim**-0.5, compile_enabled=False)
-    compiled = encoder_flash_sdpa(q, k, v, 40, dim**-0.5, compile_enabled=True)
+    heads, dim = 2, 64
+    query_lens = [40, 90]
+    total = sum(query_lens)
+    q = torch.randn(total, heads, dim)
+    k = torch.randn(total, heads, dim)
+    v = torch.randn(total, heads, dim)
+    eager = _blocked_attn(q, k, v, query_lens, dim**-0.5)
+    compiled = _blocked_attn(q, k, v, query_lens, dim**-0.5, compile_enabled=True)
     torch.testing.assert_close(compiled, eager, atol=1e-4, rtol=1e-4)

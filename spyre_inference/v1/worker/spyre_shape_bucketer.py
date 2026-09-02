@@ -33,8 +33,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Spyre stick (64 fp16 elements). Length buckets and MiniLM head-dim padding
-# both align to this so Inductor never enters insert_bmm_padding.
+# Spyre stick (64 fp16 elements), and the encoder attention KV block width.
 ENCODER_SEQ_ALIGNMENT = 64
 
 

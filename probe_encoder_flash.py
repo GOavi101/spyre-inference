@@ -3,17 +3,24 @@
 
 Numeric refs always run on CPU. Spyre seq-dim slices at a non-zero offset are
 corrupt (see examples/experimental/spyre_online_softmax_check.py); the per-seq
-SDPA on device is not a valid ground truth. Flash moves each sequence by
-host-slice + H2D, then the compiled kernel.
+SDPA on device is not a valid ground truth.
 
-Compiled Spyre drops mask *arguments*. Slicing K trips ``insert_bmm_padding``.
-``where(int)`` is unsupported (no bool). A 1D keep vector cannot broadcast
-onto ``[H,L,L]`` (mixed EA). So: full ``L×L`` GEMM, and a same-shape ``[H,L,L]``
-0/1 tensor applied with mul/add.
+Two flash modes:
 
-    python probe_encoder_flash.py
-    python probe_encoder_flash.py --device spyre --compile
-    python probe_encoder_flash.py --device spyre --compile --seqs 4 --lens 62,62,62,62
+``--blocked`` (the target design) never slices. It hands the kernel the whole
+flat ``[T, H, D]`` list plus int32 row-index tables, and the kernel gathers
+in-graph with ``index_select``, walks KV in 64-token blocks carrying a running
+softmax max/sum, and stores through ``index_copy_``. Offsets are data, not
+shapes, so the only compile axis is the block count. This mirrors the decoder's
+``_create_compilable_page_attn``.
+
+Default mode is the older host-slice + H2D per-sequence ``L×L`` GEMM, kept for
+comparison. It exists because a compiled region reads its arguments from offset
+0 (torch-spyre#3770), so slicing outside the graph reads the wrong rows.
+
+    python probe_encoder_flash.py --blocked
+    python probe_encoder_flash.py --device spyre --compile --blocked
+    python probe_encoder_flash.py --device spyre --compile --blocked --seqs 4 --lens 62,62,62,62
 """
 
 from __future__ import annotations
@@ -105,15 +112,152 @@ def _flash_varlen(
     return out
 
 
+def _make_block_kernel(
+    n_blocks: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    *,
+    needs_q_gather: bool,
+    needs_kv_gather: bool,
+):
+    """Blocked online softmax over the flat list. ``aligned_q == n_blocks * ALIGN``."""
+    per_kv = num_heads // num_kv_heads
+    aligned_q = n_blocks * ALIGN
+
+    def _kernel(query, key, value, out, q_rows, kv_rows, mask_tiles, scale):
+        # A gather that selects its whole source faults the card
+        # (torch-spyre#4033), so the caller decides whether it is needed.
+        q_flat = query.index_select(0, q_rows) if needs_q_gather else query
+        q = q_flat.unsqueeze(0).transpose(1, 2).reshape(num_kv_heads, per_kv, aligned_q, head_size)
+        if needs_kv_gather:
+            k_flat = key.index_select(0, kv_rows)
+            v_flat = value.index_select(0, kv_rows)
+        else:
+            k_flat, v_flat = key, value
+        k_blocks = k_flat.reshape(n_blocks, ALIGN, num_kv_heads, head_size)
+        v_blocks = v_flat.reshape(n_blocks, ALIGN, num_kv_heads, head_size)
+
+        tile_max = tile_sum = tile_out = None
+        for i in range(n_blocks):
+            k_blk = k_blocks[i].permute(1, 0, 2).unsqueeze(1)
+            v_blk = v_blocks[i].permute(1, 0, 2).unsqueeze(1)
+            scores = torch.matmul(q, k_blk.transpose(-2, -1)) * scale + mask_tiles[i]
+            block_max = torch.amax(scores, dim=-1, keepdim=True)
+            if i == 0:
+                tile_max = block_max
+                probs = torch.exp(scores - tile_max)
+                tile_out = torch.matmul(probs, v_blk)
+                tile_sum = probs.sum(dim=-1, keepdim=True)
+                continue
+            new_max = torch.maximum(tile_max, block_max)
+            rescale = torch.exp(tile_max - new_max)
+            probs = torch.exp(scores - new_max)
+            tile_out = tile_out * rescale + torch.matmul(probs, v_blk)
+            tile_sum = tile_sum * rescale + probs.sum(dim=-1, keepdim=True)
+            tile_max = new_max
+
+        attn = (tile_out / tile_sum).reshape(1, num_heads, aligned_q, head_size)
+        attn = attn.transpose(1, 2).reshape(aligned_q, num_heads, head_size)
+        # Pad rows repeat the sequence's last row, so the duplicate-index
+        # writes here store the same value the real row already got.
+        out.index_copy_(0, q_rows, attn)
+        return out
+
+    return _kernel
+
+
+def _row_table(start: int, length: int, extent: int, dtype: torch.dtype) -> torch.Tensor:
+    """Absolute rows, pad lanes clamped to the last real row.
+
+    int32 on Spyre, which has no int64 and whose compiled ``index_copy_`` takes
+    it; int64 everywhere else, where eager ``index_copy_`` rejects int32.
+    """
+    pos = torch.arange(extent, dtype=dtype)
+    return start + pos.clamp(max=max(length - 1, 0))
+
+
+def _mask_tiles(n_blocks: int, kv_len: int, num_kv_heads: int, per_kv: int, dtype):
+    """One additive ``[KV, per_kv, 1, ALIGN]`` tile per block; interiors share a zero."""
+    zero = torch.zeros(num_kv_heads, per_kv, 1, ALIGN, dtype=dtype)
+    neg = torch.finfo(dtype).min
+    tiles = []
+    for i in range(n_blocks):
+        lo = i * ALIGN
+        if lo + ALIGN <= kv_len:
+            tiles.append(zero)
+            continue
+        tile = torch.full((num_kv_heads, per_kv, 1, ALIGN), neg, dtype=dtype)
+        keep = max(0, min(ALIGN, kv_len - lo))
+        if keep:
+            tile[..., :keep] = 0
+        tiles.append(tile)
+    return tiles
+
+
+def _blocked_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    scale: float,
+    *,
+    compile_enabled: bool,
+    run_device: torch.device,
+) -> torch.Tensor:
+    """Flat-list blocked flash: no slicing, offsets ride in int32 index tables."""
+    num_heads, head_size = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+    per_kv = num_heads // num_kv_heads
+    total = query.shape[0]
+
+    q_dev = query.to(run_device)
+    k_dev = key.to(run_device)
+    v_dev = value.to(run_device)
+    out = torch.zeros_like(q_dev)
+
+    index_dtype = torch.int32 if run_device.type == "spyre" else torch.int64
+    cache: dict[tuple, object] = {}
+    start = 0
+    for length in query_lens:
+        n_blocks = max(1, (length + ALIGN - 1) // ALIGN)
+        extent = n_blocks * ALIGN
+        rows = _row_table(start, length, extent, index_dtype)
+        needs_q_gather = not (start == 0 and length == extent and total == extent)
+        key_id = (n_blocks, num_heads, num_kv_heads, head_size, needs_q_gather)
+        fn = cache.get(key_id)
+        if fn is None:
+            print(f"    compile/load blocked kernel n_blocks={n_blocks} gather={needs_q_gather}")
+            raw = _make_block_kernel(
+                n_blocks,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                needs_q_gather=needs_q_gather,
+                needs_kv_gather=needs_q_gather,
+            )
+            fn = torch.compile(raw, dynamic=False) if compile_enabled else raw
+            cache[key_id] = fn
+        rows_dev = rows.to(run_device)
+        tiles = [
+            t.to(run_device)
+            for t in _mask_tiles(n_blocks, length, num_kv_heads, per_kv, query.dtype)
+        ]
+        fn(q_dev, k_dev, v_dev, out, rows_dev, rows_dev, tiles, scale)
+        start += length
+    return out.cpu()
+
+
 def _dense_grid_sdpa(query, key, value, query_lens, scale) -> torch.Tensor:
     """Shipped path: pack into (B, L), one SDPA, unpack. CPU tensors only."""
     query, key, value = query.cpu(), key.cpu(), value.cpu()
     batch = len(query_lens)
     aligned_len = _align_up(max(query_lens, default=1))
     heads, dim = query.shape[1], query.shape[2]
+    kv_heads = key.shape[1]
     q_b = torch.zeros(batch, heads, aligned_len, dim, dtype=query.dtype)
-    k_b = torch.zeros_like(q_b)
-    v_b = torch.zeros_like(q_b)
+    k_b = torch.zeros(batch, kv_heads, aligned_len, dim, dtype=query.dtype)
+    v_b = torch.zeros_like(k_b)
     mask = torch.full(
         (batch, 1, aligned_len, aligned_len),
         torch.finfo(query.dtype).min,
@@ -164,6 +308,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--blocked", action="store_true", help="flat-list blocked kernel")
     parser.add_argument("--heads", type=int, default=12)
     parser.add_argument("--kv-heads", type=int, default=12)
     parser.add_argument("--dim", type=int, default=64)
@@ -178,8 +323,9 @@ def main() -> int:
     if len(lens) == 1 and args.seqs > 1:
         lens = lens * args.seqs
     t = sum(lens)
+    mode = "blocked" if args.blocked else "keep_hl"
     print(
-        f"probe_encoder_flash torch-only keep_hl seqs={lens} T={t} "
+        f"probe_encoder_flash torch-only {mode} seqs={lens} T={t} "
         f"compile={args.compile} device={device}",
         flush=True,
     )
@@ -194,9 +340,11 @@ def main() -> int:
     print("  cpu refs...", flush=True)
     dense = _dense_grid_sdpa(q, k, v, lens, scale)
     per_seq = _per_seq_sdpa(q, k, v, lens, scale)
-    print(f"  flash on {device} (one compile per aligned L)...", flush=True)
+    runner = _blocked_varlen if args.blocked else _flash_varlen
+    axis = "block count" if args.blocked else "aligned L"
+    print(f"  flash on {device} (one compile per {axis})...", flush=True)
     try:
-        flash = _flash_varlen(q, k, v, lens, scale, compile_enabled=args.compile, run_device=device)
+        flash = runner(q, k, v, lens, scale, compile_enabled=args.compile, run_device=device)
     except Exception:
         import traceback
 

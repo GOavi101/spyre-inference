@@ -523,6 +523,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_block_cpu: torch.Tensor | None = None  # [B_blocks, B_seqs * KV, 1, block_size] fp16
     mask_by_block_dev: torch.Tensor | None = None
 
+    # Encoder-only (no KV cache) precomputes: one EncoderSeqPlan per request,
+    # holding its device row table and mask tiles. Typed loosely because the
+    # encoder backend imports from this module, not the other way round. Filled
+    # by the first encoder layer's forward() — the builder runs on CPU and does
+    # not know the layer type — and reused by the rest of the stack.
+    encoder_seq_plans: list | None = None
+
     @property
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
