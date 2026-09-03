@@ -569,6 +569,17 @@ class SpyreAttentionMetadata(AttentionMetadata):
     encoder_kv_pack_idx: torch.Tensor | None = None
     encoder_unpack_idx: torch.Tensor | None = None
     encoder_attn_mask: torch.Tensor | None = None
+    # True when every batch slot is a full, unpadded aligned_len sequence (no
+    # batch-bucket dummy seqs, no per-sequence padding): pack/unpack collapse
+    # to a reshape for the whole step, not just for B=1. Set alongside the
+    # four fields above; only meaningful once they are non-None.
+    encoder_pack_is_identity: bool = False
+    # Scatter-pack scratch for Q and K/V, sized once per step and reused
+    # across layers. None when the step took the identity path and never
+    # needed one.
+    encoder_q_workspace: torch.Tensor | None = None
+    encoder_k_workspace: torch.Tensor | None = None
+    encoder_v_workspace: torch.Tensor | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:

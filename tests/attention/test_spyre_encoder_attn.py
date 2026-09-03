@@ -648,12 +648,30 @@ def test_gather_pack_b1_pad_slots_still_index_select(monkeypatch):
     assert torch.equal(out[0, :, 3, :], torch.zeros(heads, dim))
 
 
-def test_gather_pack_multi_seq_still_index_select(monkeypatch):
-    """B>1 keeps per-layer gather even when rows are 0..T-1 (reverted pack-once)."""
+def test_gather_pack_multi_seq_identity_skips_index_select(monkeypatch):
+    """B>1 with every row 0..T-1 (a saturated batch) is also a pure reshape."""
     calls = _count_select_rows(monkeypatch)
     batch, length, heads, dim = 2, 4, 2, 8
-    flat = torch.randn(batch * length, heads, dim)
+    flat = torch.arange(batch * length * heads * dim, dtype=torch.float32).reshape(
+        batch * length, heads, dim
+    )
     pack_idx = torch.arange(batch * length, dtype=torch.int64).view(batch, length)
+
+    out = gather_pack(flat, pack_idx, dim)
+
+    assert calls["n"] == 0
+    expected = flat.view(batch, length, heads, dim).permute(0, 2, 1, 3).contiguous()
+    assert torch.equal(out, expected)
+
+
+def test_gather_pack_multi_seq_padded_still_index_select(monkeypatch):
+    """B>1 with any pad slot (not a pure 0..T-1 map) still gathers."""
+    calls = _count_select_rows(monkeypatch)
+    batch, length, heads, dim = 2, 4, 2, 8
+    tokens = batch * length - 1  # one fewer real token than the grid holds
+    flat = torch.randn(tokens, heads, dim)
+    # Seq 0 fills its row of 4; seq 1 has only 3 real tokens, so slot 7 pads.
+    pack_idx = torch.tensor([[0, 1, 2, 3], [4, 5, 6, tokens]], dtype=torch.int64)
 
     gather_pack(flat, pack_idx, dim)
 
@@ -697,13 +715,67 @@ def test_scatter_pack_b1_short_seq_still_index_copy(monkeypatch):
 
 
 def test_scatter_pack_multi_seq_still_index_copy(monkeypatch):
-    """B>1 still scatters even when T == B×L."""
+    """B>1 still scatters by default even when T == B×L: caller must opt in."""
     calls = _count_index_copy(monkeypatch)
     batch, length, heads, dim = 2, 4, 2, 8
     flat = torch.randn(batch * length, heads, dim)
     dest = torch.arange(batch * length, dtype=torch.int64)
     scatter_pack(flat, dest, batch, length, dim)
     assert calls["n"] == 1
+
+
+def test_scatter_pack_multi_seq_identity_flag_skips_index_copy(monkeypatch):
+    """``pack_is_identity=True`` extends the skip to B>1, same data as above."""
+    calls = _count_index_copy(monkeypatch)
+    batch, length, heads, dim = 2, 4, 2, 8
+    flat = torch.randn(batch * length, heads, dim)
+    dest = torch.arange(batch * length, dtype=torch.int64)
+
+    out = scatter_pack(flat, dest, batch, length, dim, pack_is_identity=True)
+
+    assert calls["n"] == 0
+    expected = flat.view(batch, length, heads, dim).permute(0, 2, 1, 3).contiguous()
+    assert torch.equal(out, expected)
+
+
+def test_scatter_pack_reuses_provided_workspace(monkeypatch):
+    """A caller-owned workspace is written into, not replaced by a fresh alloc."""
+    batch, length, heads, dim = 2, 4, 2, 8
+    tokens = batch * length - 1  # 7 real source rows; grid slot 7 is an implicit pad
+    flat = torch.randn(tokens, heads, dim)
+    dest = torch.tensor([0, 1, 2, 3, 4, 5, 6], dtype=torch.int64)  # one entry per source row
+    workspace = torch.zeros(batch * length + 1, heads, dim)
+
+    out = scatter_pack(flat, dest, batch, length, dim, workspace=workspace)
+
+    ref = gather_pack(
+        flat,
+        torch.tensor([[0, 1, 2, 3], [4, 5, 6, tokens]], dtype=torch.int64),
+        dim,
+    )
+    assert torch.equal(out, ref)
+    # Real rows landed in the caller's tensor, not a fresh one scatter_pack made.
+    assert torch.equal(workspace[:tokens], flat)
+
+
+def test_is_dense_batch_requires_no_padding_anywhere():
+    """``_is_dense_batch`` -- the B>1 generalization of the B=1 shortcut."""
+    is_dense = encoder_attn._is_dense_batch
+
+    # Two sequences, each exactly filling its 4-row slot: dense.
+    dest = torch.arange(8, dtype=torch.int64)
+    assert is_dense(dest, dest, batch=2, aligned_len=4, padded_tokens=8) is True
+
+    # Same shape, but seq 1 is one token short (its last dest is a dummy row):
+    # not dense -- the mask alone can't make this safe for B>1.
+    padded_dest = torch.tensor([0, 1, 2, 3, 4, 5, 6, 8], dtype=torch.int64)
+    assert is_dense(padded_dest, padded_dest, batch=2, aligned_len=4, padded_tokens=8) is False
+
+    # A batch-bucket dummy sequence: fewer real rows than B*L.
+    assert is_dense(dest, dest, batch=2, aligned_len=4, padded_tokens=4) is False
+
+    # B=1 is _is_b1_dense_body's job, not this one's.
+    assert is_dense(dest[:4], dest[:4], batch=1, aligned_len=4, padded_tokens=4) is False
 
 
 def test_gather_unpack_b1_dense_body_skips_index_select(monkeypatch):
@@ -719,3 +791,178 @@ def test_gather_unpack_b1_dense_body_skips_index_select(monkeypatch):
     assert calls["n"] == 0
     expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
     assert torch.equal(out, expected)
+
+
+def test_gather_unpack_multi_seq_padded_still_index_select_by_default(monkeypatch):
+    """A padded B>1 batch gathers by default: neither existing check fires.
+
+    ``unpack_indices`` is device-resident in real serving (see the docstring
+    on ``gather_unpack``), where ``_is_identity_row_map`` can never fire --
+    unlike this CPU test, where it would fire for a truly identity map. Using
+    a padded (non-identity) map here isolates that ``pack_is_identity`` is
+    what the flag test below actually exercises, not a pre-existing check.
+    """
+    calls = _count_select_rows(monkeypatch)
+    batch, heads, length, dim, real = 2, 2, 4, 8, 3
+    attn_out = torch.randn(batch, heads, length, dim)
+    unpack_idx = torch.zeros(batch * length, dtype=torch.int64)
+    unpack_idx[:real] = torch.arange(real, dtype=torch.int64)
+
+    gather_unpack(attn_out, unpack_idx, dim)
+
+    assert calls["n"] == 1
+
+
+def test_gather_unpack_multi_seq_identity_flag_skips_index_select(monkeypatch):
+    """``pack_is_identity=True`` extends the skip to B>1, same data as above."""
+    calls = _count_select_rows(monkeypatch)
+    batch, heads, length, dim = 2, 2, 4, 8
+    attn_out = torch.randn(batch, heads, length, dim)
+    unpack_idx = torch.arange(batch * length, dtype=torch.int64)
+
+    out = gather_unpack(attn_out, unpack_idx, dim, pack_is_identity=True)
+
+    assert calls["n"] == 0
+    expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(batch * length, heads, dim)
+    assert torch.equal(out, expected)
+
+
+def _run_forward(impl, attn_metadata, query, key, value, kv_cache=None):
+    kv_cache = kv_cache or SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+    output = torch.empty_like(query)
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+    return output
+
+
+@torch.inference_mode()
+def test_forward_saturated_multi_seq_batch_skips_pack_and_matches_reference(
+    default_vllm_config,
+) -> None:
+    """Two full-length sequences exactly filling a 2x64 grid: no scatter/gather."""
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    num_heads, num_kv_heads, head_size, block_size = 4, 4, 64, 64
+    seq_len = 64
+    total_tokens = 2 * seq_len
+    dtype = torch.float16
+    query = torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
+    key = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    cu = torch.tensor([0, seq_len, total_tokens], dtype=torch.int32)
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([seq_len, seq_len], dtype=torch.int32),
+        query_start_loc=cu,
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+
+    output = _run_forward(impl, attn_metadata, query, key, value)
+
+    assert attn_metadata.encoder_pack_is_identity is True
+    assert attn_metadata.encoder_q_workspace is None
+    assert attn_metadata.encoder_k_workspace is None
+    assert attn_metadata.encoder_v_workspace is None
+
+    expected = ref_encoder_attn(query, key, value, [seq_len, seq_len], impl.scale)
+    assert_close_outliers(
+        output.to("cpu"),
+        expected,
+        max_outliers=5,
+        atol=0.3,
+        rtol=0.2,
+        outlier_atol=0.6,
+        outlier_rtol=0.4,
+    )
+
+
+@torch.inference_mode()
+def test_forward_padded_multi_seq_batch_reuses_workspace_without_stale_data(
+    default_vllm_config,
+) -> None:
+    """A padded B>1 batch caches its workspace across layers, and each layer's
+    output reflects only its own Q/K/V -- not a previous layer's leftovers.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    num_heads, num_kv_heads, head_size, block_size = 4, 4, 64, 64
+    query_lens = [30, 20]
+    total_tokens = sum(query_lens)
+    dtype = torch.float16
+    cu = torch.tensor([0, query_lens[0], total_tokens], dtype=torch.int32)
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor(query_lens, dtype=torch.int32),
+        query_start_loc=cu,
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+
+    layer0 = {
+        k: torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
+        for k in ("query", "key", "value")
+    }
+    out0 = _run_forward(impl, attn_metadata, **layer0)
+
+    assert attn_metadata.encoder_pack_is_identity is False
+    q_ws = attn_metadata.encoder_q_workspace
+    k_ws = attn_metadata.encoder_k_workspace
+    v_ws = attn_metadata.encoder_v_workspace
+    assert q_ws is not None and k_ws is not None and v_ws is not None
+
+    layer1 = {
+        k: torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
+        for k in ("query", "key", "value")
+    }
+    out1 = _run_forward(impl, attn_metadata, **layer1)
+
+    # Same cached objects, not reallocated.
+    assert attn_metadata.encoder_q_workspace is q_ws
+    assert attn_metadata.encoder_k_workspace is k_ws
+    assert attn_metadata.encoder_v_workspace is v_ws
+
+    expected0 = ref_encoder_attn(
+        layer0["query"], layer0["key"], layer0["value"], query_lens, impl.scale
+    )
+    expected1 = ref_encoder_attn(
+        layer1["query"], layer1["key"], layer1["value"], query_lens, impl.scale
+    )
+    outlier_kwargs = dict(max_outliers=5, atol=0.3, rtol=0.2, outlier_atol=0.6, outlier_rtol=0.4)
+    assert_close_outliers(out0.to("cpu"), expected0, **outlier_kwargs)
+    assert_close_outliers(out1.to("cpu"), expected1, **outlier_kwargs)
+    # Different inputs must not produce the same output via stale workspace rows.
+    assert not torch.equal(out0, out1)
