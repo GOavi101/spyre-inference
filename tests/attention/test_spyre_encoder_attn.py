@@ -21,6 +21,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from spyre_inference.v1.attention.backends import spyre_encoder_attn as encoder_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -28,6 +29,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     build_attention_mask,
+    gather_pack,
+    gather_unpack,
+    host_pack_indices,
+    host_scatter_pack_dest,
+    scatter_pack,
 )
 
 # extra `encoder_attention` mark so CI can split this into its own job
@@ -458,3 +464,258 @@ def test_spyre_encoder_attn(
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
     )
+
+
+@torch.inference_mode()
+def test_encoder_pack_cache_reused_across_layers(default_vllm_config) -> None:
+    """Second layer must reuse the step's scatter dest tensors, not rebuild + H2D them."""
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    query_lens = [32]
+    total_tokens = 32
+    num_heads, num_kv_heads, head_size, block_size = 16, 4, 64, 64
+    dtype = torch.float16
+    query = torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
+    key = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    cu = torch.tensor([0, 32], dtype=torch.int32)
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor(query_lens, dtype=torch.int32),
+        query_start_loc=cu,
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+    fwd = dict(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+    )
+    impl.forward(**fwd, output=torch.empty_like(query))
+    cached_q = attn_metadata.encoder_q_pack_idx
+    cached_kv = attn_metadata.encoder_kv_pack_idx
+    cached_unpack = attn_metadata.encoder_unpack_idx
+    cached_mask = attn_metadata.encoder_attn_mask
+    assert cached_q is not None
+    assert cached_kv is not None
+    assert cached_unpack is not None
+    assert cached_mask is not None
+    assert cached_q.shape == (total_tokens,)
+    assert cached_q.dtype == torch.int64
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert attn_metadata.encoder_q_pack_idx is cached_q
+    assert attn_metadata.encoder_kv_pack_idx is cached_kv
+    assert attn_metadata.encoder_unpack_idx is cached_unpack
+    assert attn_metadata.encoder_attn_mask is cached_mask
+
+
+def _assert_scatter_matches_gather(
+    q_starts: list[int],
+    query_lens: list[int],
+    batch: int,
+    aligned_len: int,
+    heads: int,
+    dim: int,
+    extra_src_rows: int = 0,
+) -> None:
+    num_tokens = sum(query_lens)
+    num_src = num_tokens + extra_src_rows
+    torch.manual_seed(0)
+    flat = torch.randn(num_src, heads, dim)
+    pad_row = num_src
+    padded_starts = list(q_starts) + [num_tokens] * (batch - len(q_starts))
+    padded_lens = list(query_lens) + [0] * (batch - len(query_lens))
+    pack_idx = host_pack_indices(padded_starts, padded_lens, aligned_len, pad_row)
+    dest = host_scatter_pack_dest(
+        padded_starts,
+        padded_lens,
+        aligned_len,
+        num_src_rows=num_src,
+        dummy_row=batch * aligned_len,
+    )
+    ref = gather_pack(flat, pack_idx, dim)
+    got = scatter_pack(flat, dest, batch, aligned_len, dim)
+    assert torch.equal(got, ref)
+
+
+def test_scatter_pack_matches_gather_b1_pad():
+    """62-token prompt on L=64 (vllm --random-input-len 64). T != L, still scatter."""
+    _assert_scatter_matches_gather(
+        q_starts=[0],
+        query_lens=[62],
+        batch=1,
+        aligned_len=64,
+        heads=2,
+        dim=8,
+    )
+
+
+def test_scatter_pack_matches_gather_b4_pad():
+    """3 real seqs padded to B=4, L=64."""
+    _assert_scatter_matches_gather(
+        q_starts=[0, 30, 42],
+        query_lens=[30, 12, 8],
+        batch=4,
+        aligned_len=64,
+        heads=2,
+        dim=8,
+    )
+
+
+def _count_select_rows(monkeypatch):
+    """Wrap ``select_rows`` so tests can assert identity B=1 skips gather."""
+    real = encoder_attn.select_rows
+    calls = {"n": 0}
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "select_rows", counting)
+    return calls
+
+
+def _count_index_copy(monkeypatch):
+    """Wrap ``_index_copy`` so tests can assert B=1 dense body skips scatter."""
+    real = encoder_attn._index_copy
+    calls = {"n": 0}
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "_index_copy", counting)
+    return calls
+
+
+def test_gather_pack_b1_identity_skips_index_select(monkeypatch):
+    """B=1 with ``T == L`` is already dense; do not ``index_select`` the full pack."""
+    calls = _count_select_rows(monkeypatch)
+    length, heads, dim = 4, 2, 8
+    flat = torch.arange(length * heads * dim, dtype=torch.float32).reshape(length, heads, dim)
+    pack_idx = torch.arange(length, dtype=torch.int64).view(1, length)
+
+    out = gather_pack(flat, pack_idx, dim)
+
+    assert calls["n"] == 0
+    expected = flat.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+    assert torch.equal(out, expected)
+
+
+def test_gather_unpack_b1_identity_skips_index_select(monkeypatch):
+    calls = _count_select_rows(monkeypatch)
+    batch, heads, length, dim = 1, 2, 4, 8
+    attn_out = torch.arange(batch * heads * length * dim, dtype=torch.float32).reshape(
+        batch, heads, length, dim
+    )
+    unpack_idx = torch.arange(length, dtype=torch.int64)
+
+    out = gather_unpack(attn_out, unpack_idx, dim)
+
+    assert calls["n"] == 0
+    expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
+    assert torch.equal(out, expected)
+
+
+def test_gather_pack_b1_pad_slots_still_index_select(monkeypatch):
+    """Pad slots still gather the extra zero row; identity skip must not fire."""
+    calls = _count_select_rows(monkeypatch)
+    tokens, heads, dim = 3, 2, 8
+    flat = torch.arange(tokens * heads * dim, dtype=torch.float32).reshape(tokens, heads, dim)
+    # Last slot is the F.pad zero row (index == T).
+    pack_idx = torch.tensor([[0, 1, 2, tokens]], dtype=torch.int64)
+
+    out = gather_pack(flat, pack_idx, dim)
+
+    assert calls["n"] == 1
+    assert torch.equal(out[0, :, 3, :], torch.zeros(heads, dim))
+
+
+def test_gather_pack_multi_seq_still_index_select(monkeypatch):
+    """B>1 keeps per-layer gather even when rows are 0..T-1 (reverted pack-once)."""
+    calls = _count_select_rows(monkeypatch)
+    batch, length, heads, dim = 2, 4, 2, 8
+    flat = torch.randn(batch * length, heads, dim)
+    pack_idx = torch.arange(batch * length, dtype=torch.int64).view(batch, length)
+
+    gather_pack(flat, pack_idx, dim)
+
+    assert calls["n"] == 1
+
+
+def test_scatter_pack_b1_body_bucket_skips_index_copy(monkeypatch):
+    """Body-bucket T=64 with 62 real tokens: skip scatter; mask covers pad slots."""
+    calls = _count_index_copy(monkeypatch)
+    tokens, aligned_len, heads, dim = 62, 64, 2, 8
+    extra = aligned_len - tokens
+    torch.manual_seed(0)
+    flat = torch.randn(tokens + extra, heads, dim)
+    dest = host_scatter_pack_dest(
+        q_starts=[0],
+        lengths=[tokens],
+        aligned_len=aligned_len,
+        num_src_rows=tokens + extra,
+        dummy_row=aligned_len,
+    )
+
+    got = scatter_pack(flat, dest, batch=1, aligned_len=aligned_len, head_size_padded=dim)
+
+    assert calls["n"] == 0
+    expected = flat.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+    assert torch.equal(got, expected)
+
+
+def test_scatter_pack_b1_short_seq_still_index_copy(monkeypatch):
+    """T=62, L=64: body is not dense; still scatter."""
+    calls = _count_index_copy(monkeypatch)
+    _assert_scatter_matches_gather(
+        q_starts=[0],
+        query_lens=[62],
+        batch=1,
+        aligned_len=64,
+        heads=2,
+        dim=8,
+    )
+    assert calls["n"] == 1
+
+
+def test_scatter_pack_multi_seq_still_index_copy(monkeypatch):
+    """B>1 still scatters even when T == B×L."""
+    calls = _count_index_copy(monkeypatch)
+    batch, length, heads, dim = 2, 4, 2, 8
+    flat = torch.randn(batch * length, heads, dim)
+    dest = torch.arange(batch * length, dtype=torch.int64)
+    scatter_pack(flat, dest, batch, length, dim)
+    assert calls["n"] == 1
+
+
+def test_gather_unpack_b1_dense_body_skips_index_select(monkeypatch):
+    """62-in-64 unpack is not identity (tail stays 0) but T==L still reshapes."""
+    calls = _count_select_rows(monkeypatch)
+    batch, heads, length, dim, real = 1, 2, 64, 8, 62
+    attn_out = torch.randn(batch, heads, length, dim)
+    unpack_idx = torch.zeros(length, dtype=torch.int64)
+    unpack_idx[:real] = torch.arange(real, dtype=torch.int64)
+
+    out = gather_unpack(attn_out, unpack_idx, dim)
+
+    assert calls["n"] == 0
+    expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
+    assert torch.equal(out, expected)

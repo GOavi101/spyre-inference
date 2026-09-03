@@ -563,6 +563,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_block_cpu: torch.Tensor | None = None  # [B_blocks, B_seqs * KV, 1, block_size] fp16
     mask_by_block_dev: torch.Tensor | None = None
 
+    # Encoder scatter dest ``[T]`` (int32 on Spyre), gather unpack, and mask.
+    # Filled on the first layer of a step (page_index_tables pattern).
+    encoder_q_pack_idx: torch.Tensor | None = None
+    encoder_kv_pack_idx: torch.Tensor | None = None
+    encoder_unpack_idx: torch.Tensor | None = None
+    encoder_attn_mask: torch.Tensor | None = None
+
     @property
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
