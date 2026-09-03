@@ -21,12 +21,18 @@ Ragged→dense packing scatters real tokens into a zeroed ``[B, L]`` grid
 (compiled ``index_copy_``, same kernel style as decoder KV write). Unpack
 is still ``index_select``. Pad slots stay zeros (never written). ``B=1``
 with ``T == L`` skips scatter/gather: the body is already dense and the
-attention mask hides pad slots (62-token prompts on an L=64 bucket). Dest
-indices and the attention mask are built on the first layer of a step and
-reused (decoder ``page_index_tables`` pattern).
+attention mask hides pad slots (62-token prompts on an L=64 bucket). A
+fully saturated batch -- every sequence exactly ``aligned_len``, no
+batch-bucket dummy seqs -- gets the same skip for any ``B``, since the
+flat token order then already matches the packed ``[B, L]`` layout. Dest
+indices, the attention mask, and (off the skip path) the scatter
+workspaces are built on the first layer of a step and reused across every
+later layer (decoder ``page_index_tables`` pattern).
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -140,6 +146,36 @@ def _is_b1_dense_body(batch: int, num_src: int, aligned_len: int) -> bool:
     return batch == 1 and num_src == aligned_len
 
 
+def _is_dense_batch(
+    q_dest_cpu: torch.Tensor,
+    kv_dest_cpu: torch.Tensor,
+    batch: int,
+    aligned_len: int,
+    padded_tokens: int,
+) -> bool:
+    """Generalizes ``_is_b1_dense_body`` to ``B > 1``: every batch slot is a
+    full, unpadded ``aligned_len`` sequence, so the flat varlen token order
+    already matches the packed ``[B, L]`` row order and pack/unpack are pure
+    reshapes. Unlike the ``B=1`` shortcut -- which tolerates padding *inside*
+    a sequence because the mask alone makes that safe -- this needs no
+    padding anywhere: one short sequence in an otherwise-full batch shifts
+    every later sequence's rows out of alignment with its bucket slot.
+
+    Host only, and must run before the dest tensors move to device: once
+    ``scatter_pack`` receives them they may already be int32 on Spyre, and
+    inspecting *values* there would mean a per-layer device round trip --
+    the opposite of what caching this on ``attn_metadata`` is for.
+    """
+    if batch == 1:
+        return False  # _is_b1_dense_body already covers B=1, more leniently
+    num_rows = batch * aligned_len
+    if padded_tokens != num_rows:
+        return False  # a batch-bucket dummy sequence: fewer real rows than B*L
+    return _is_identity_row_map(q_dest_cpu, num_rows) and _is_identity_row_map(
+        kv_dest_cpu, num_rows
+    )
+
+
 def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     """Tiny mutation, compiled alone — do not fuse with SDPA."""
     dst.index_copy_(0, index, src)
@@ -166,14 +202,14 @@ def gather_pack(
 ) -> torch.Tensor:
     """Reference pack: ``F.pad`` zero row + ``index_select`` of ``B×L``.
 
-    Kept for tests. Serve uses ``scatter_pack``. ``B=1`` with identity rows
-    (``T == L`` and no pad slots) skips ``index_select``.
+    Kept for tests. Serve uses ``scatter_pack``. Identity rows (no pad slots
+    anywhere, any ``B``) skip ``index_select`` via a reshape.
     """
     batch, aligned_len = pack_indices.shape
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
-    if batch == 1 and _is_identity_row_map(pack_indices, flat.shape[0]):
-        packed = flat.unsqueeze(0)
+    if _is_identity_row_map(pack_indices, flat.shape[0]):
+        packed = flat.view(batch, aligned_len, num_heads, head_size_padded)
         return packed.permute(0, 2, 1, 3).contiguous()
     flat_ext = F.pad(flat, (0, 0, 0, 0, 0, 1))
     gathered = select_rows(flat_ext, pack_indices)  # [B*L, H, Dp]
@@ -187,6 +223,8 @@ def scatter_pack(
     batch: int,
     aligned_len: int,
     head_size_padded: int,
+    pack_is_identity: bool = False,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pack varlen ``[T, H, D]`` → ``[B, H, L, Dp]`` via compiled ``index_copy_``.
 
@@ -194,23 +232,32 @@ def scatter_pack(
     implicit zeros. A dest past ``B×L`` is a dummy row for body-bucket padding.
 
     ``B=1`` with ``T == L`` skips ``index_copy_``: the runner already padded
-    the body to the SDPA length. The attention mask hides leftover pad tokens.
-    ``B > 1`` still scatters.
+    the body to the SDPA length, and the attention mask hides leftover pad
+    tokens. ``pack_is_identity=True`` (set by the caller from
+    ``_ensure_encoder_pack``, since it needs the pre-device dest values)
+    extends that skip to any ``B`` when the whole batch is pad-free.
+
+    ``workspace`` is an optional caller-owned ``[B*L+1, H, Dp]`` scratch
+    tensor to scatter into instead of allocating one. Safe to reuse across
+    every layer of a step: ``dest_idx`` is identical every layer, so the
+    same rows are written and the never-addressed pad rows stay at whatever
+    they were zeroed to on the first use.
     """
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
-    if _is_b1_dense_body(batch, flat.shape[0], aligned_len):
-        packed = flat.unsqueeze(0)
+    if pack_is_identity or _is_b1_dense_body(batch, flat.shape[0], aligned_len):
+        packed = flat.view(batch, aligned_len, num_heads, head_size_padded)
         return packed.permute(0, 2, 1, 3).contiguous()
     packed_rows = batch * aligned_len
-    # Dummy dest is always ``B*L``. Extra row avoids ``dest.max()`` (device sync).
-    workspace = torch.zeros(
-        packed_rows + 1,
-        num_heads,
-        head_size_padded,
-        dtype=flat.dtype,
-        device=flat.device,
-    )
+    if workspace is None:
+        # Dummy dest is always ``B*L``. Extra row avoids ``dest.max()`` (device sync).
+        workspace = torch.zeros(
+            packed_rows + 1,
+            num_heads,
+            head_size_padded,
+            dtype=flat.dtype,
+            device=flat.device,
+        )
     # Spyre has no int64. H2D dest as int32 and never .to(int64) on device
     # (that CPU-detours and used to scramble B>1 dests). Eager CPU wants int64.
     if dest_idx.device.type == "spyre":
@@ -228,16 +275,24 @@ def gather_unpack(
     attn_out: torch.Tensor,
     unpack_indices: torch.Tensor,
     head_size: int,
+    pack_is_identity: bool = False,
 ) -> torch.Tensor:
     """Unpack padded ``[B, H, L, Dp]`` → flat ``[T, H, D]`` via ``index_select``.
 
-    Identity ``B=1`` (``T == B×L``) is a reshape; pad / multi-seq still gather.
+    Identity rows (``T == B×L``, any ``B``) are a reshape; pad / multi-seq
+    still gather. ``unpack_indices`` is usually already device-resident by
+    the time this runs, so ``_is_identity_row_map`` alone won't catch the
+    ``B > 1`` case in production -- ``pack_is_identity`` carries that
+    decision in from ``_ensure_encoder_pack``, which checked the host values
+    before conversion.
     """
     batch, num_heads, aligned_len, head_size_padded = attn_out.shape
     tokens = attn_out.permute(0, 2, 1, 3).contiguous()
     flat_padded = tokens.reshape(batch * aligned_len, num_heads, head_size_padded)
-    if _is_identity_row_map(unpack_indices, flat_padded.shape[0]) or _is_b1_dense_body(
-        batch, unpack_indices.shape[0], aligned_len
+    if (
+        pack_is_identity
+        or _is_identity_row_map(unpack_indices, flat_padded.shape[0])
+        or _is_b1_dense_body(batch, unpack_indices.shape[0], aligned_len)
     ):
         gathered = flat_padded
     else:
@@ -266,6 +321,21 @@ def _dest_for_device(indices: torch.Tensor, device: torch.device) -> torch.Tenso
     return indices.to(device=device, dtype=torch.long)
 
 
+class _EncoderPackPlan(NamedTuple):
+    """Everything a layer's ``forward()`` needs, built once per step."""
+
+    q_dest: torch.Tensor
+    kv_dest: torch.Tensor
+    unpack_idx: torch.Tensor
+    mask: torch.Tensor
+    pack_is_identity: bool
+    # None when pack_is_identity: scatter_pack/gather_unpack never touch a
+    # workspace on that path, so there is nothing to allocate.
+    q_workspace: torch.Tensor | None
+    k_workspace: torch.Tensor | None
+    v_workspace: torch.Tensor | None
+
+
 def _ensure_encoder_pack(
     attn_metadata: SpyreAttentionMetadata,
     *,
@@ -273,21 +343,33 @@ def _ensure_encoder_pack(
     n: int,
     query: torch.Tensor,
     target_device: torch.device,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size_padded: int,
     cached_encoder_shapes: list[tuple[int, int]],
     cached_max_num_seqs: int,
     cached_max_model_len: int,
     cached_max_num_batched_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build scatter dest + unpack + mask once per step; later layers reuse them."""
+) -> _EncoderPackPlan:
+    """Build scatter dest + unpack + mask + workspaces once per step.
+
+    Later layers reuse all of it: the workspaces because ``dest`` never
+    changes within a step (see ``scatter_pack``'s docstring), the rest
+    because nothing about the batch shape does either.
+    """
     if attn_metadata.encoder_q_pack_idx is not None:
         assert attn_metadata.encoder_kv_pack_idx is not None
         assert attn_metadata.encoder_unpack_idx is not None
         assert attn_metadata.encoder_attn_mask is not None
-        return (
+        return _EncoderPackPlan(
             attn_metadata.encoder_q_pack_idx,
             attn_metadata.encoder_kv_pack_idx,
             attn_metadata.encoder_unpack_idx,
             attn_metadata.encoder_attn_mask,
+            attn_metadata.encoder_pack_is_identity,
+            attn_metadata.encoder_q_workspace,
+            attn_metadata.encoder_k_workspace,
+            attn_metadata.encoder_v_workspace,
         )
 
     qsl = attn_metadata.query_start_loc.cpu()
@@ -326,15 +408,48 @@ def _ensure_encoder_pack(
         device=target_device,
     )
 
+    pack_is_identity = _is_b1_dense_body(
+        batch_bucket, padded_tokens, aligned_len
+    ) or _is_dense_batch(q_dest, kv_dest, batch_bucket, aligned_len, padded_tokens)
+
+    q_workspace = k_workspace = v_workspace = None
+    if not pack_is_identity:
+        packed_rows = batch_bucket * aligned_len
+        q_workspace = torch.zeros(
+            packed_rows + 1, num_heads, head_size_padded, dtype=query.dtype, device=target_device
+        )
+        k_workspace = torch.zeros(
+            packed_rows + 1,
+            num_kv_heads,
+            head_size_padded,
+            dtype=query.dtype,
+            device=target_device,
+        )
+        v_workspace = torch.zeros(
+            packed_rows + 1,
+            num_kv_heads,
+            head_size_padded,
+            dtype=query.dtype,
+            device=target_device,
+        )
+
     attn_metadata.encoder_q_pack_idx = _dest_for_device(q_dest, target_device)
     attn_metadata.encoder_kv_pack_idx = _dest_for_device(kv_dest, target_device)
     attn_metadata.encoder_unpack_idx = _indices_for_device(unpack_idx, target_device)
     attn_metadata.encoder_attn_mask = mask
-    return (
+    attn_metadata.encoder_pack_is_identity = pack_is_identity
+    attn_metadata.encoder_q_workspace = q_workspace
+    attn_metadata.encoder_k_workspace = k_workspace
+    attn_metadata.encoder_v_workspace = v_workspace
+    return _EncoderPackPlan(
         attn_metadata.encoder_q_pack_idx,
         attn_metadata.encoder_kv_pack_idx,
         attn_metadata.encoder_unpack_idx,
         attn_metadata.encoder_attn_mask,
+        pack_is_identity,
+        q_workspace,
+        k_workspace,
+        v_workspace,
     )
 
 
@@ -385,7 +500,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ``TorchSpyrePlatform.get_attn_backend_cls``), so there is no per-call
     ``attn_type`` branch. Setup is shared with the paged decoder impl; forward
     packs with scatter (``index_copy_``, Spyre dest is int32), then SDPA
-    and gather-unpack. ``B=1`` and ``T == L`` skip pack/unpack.
+    and gather-unpack. ``B=1`` with ``T == L``, or any fully saturated batch,
+    skip pack/unpack; a padded, non-saturated ``B > 1`` batch still scatters
+    into a per-step scratch workspace shared by every layer.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -431,12 +548,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
         scale = self.scale
 
-        q_dest, kv_dest, unpack_idx, mask = _ensure_encoder_pack(
+        plan = _ensure_encoder_pack(
             attn_metadata,
             padded_tokens=padded_tokens,
             n=n,
             query=query,
             target_device=target_device,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size_padded=head_size_padded,
             cached_encoder_shapes=self._cached_encoder_shapes,
             cached_max_num_seqs=self._cached_max_num_seqs,
             cached_max_model_len=self._cached_max_model_len,
@@ -448,20 +568,46 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
-        batch, _, aligned_len, _ = mask.shape
-        q_batched = scatter_pack(query, q_dest, batch, aligned_len, head_size_padded)
-        k_batched = scatter_pack(key, kv_dest, batch, aligned_len, head_size_padded)
-        v_batched = scatter_pack(value, kv_dest, batch, aligned_len, head_size_padded)
+        batch, _, aligned_len, _ = plan.mask.shape
+        q_batched = scatter_pack(
+            query,
+            plan.q_dest,
+            batch,
+            aligned_len,
+            head_size_padded,
+            pack_is_identity=plan.pack_is_identity,
+            workspace=plan.q_workspace,
+        )
+        k_batched = scatter_pack(
+            key,
+            plan.kv_dest,
+            batch,
+            aligned_len,
+            head_size_padded,
+            pack_is_identity=plan.pack_is_identity,
+            workspace=plan.k_workspace,
+        )
+        v_batched = scatter_pack(
+            value,
+            plan.kv_dest,
+            batch,
+            aligned_len,
+            head_size_padded,
+            pack_is_identity=plan.pack_is_identity,
+            workspace=plan.v_workspace,
+        )
 
         sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
         if num_kv_heads != num_heads:
             sdpa_kwargs["enable_gqa"] = True
 
         attn_out = F.scaled_dot_product_attention(
-            q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
+            q_batched, k_batched, v_batched, attn_mask=plan.mask, **sdpa_kwargs
         )
 
-        result = gather_unpack(attn_out, unpack_idx, head_size)
+        result = gather_unpack(
+            attn_out, plan.unpack_idx, head_size, pack_is_identity=plan.pack_is_identity
+        )
         if result.dtype != output.dtype:
             result = convert(result, dtype=output.dtype)
 
