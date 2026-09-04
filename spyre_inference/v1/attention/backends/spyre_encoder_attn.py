@@ -21,8 +21,10 @@ Ragged→dense packing uses compiled ``index_copy_`` on Spyre into a
 slot-major workspace (decoder KV / torch-spyre#3705) so ``view(B, L, …)``
 is address-order-preserving. Body-pad dests write an extra dummy row
 (not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1`` with
-``T == L`` skips pack/unpack (62-token prompts on L=64). Dest, unpack,
-and mask are built once per step.
+``T == L`` skips scatter/gather: permute+SDPA+unpermute is one compiled
+graph (eager ``contiguous`` was ~half of B=1 attention). Dest/unpack stay
+on host in that case; mask is still H2D. Dest, unpack, and mask are built
+once per step.
 """
 
 from __future__ import annotations
@@ -160,6 +162,74 @@ def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor
 
 
 _compiled_index_copy: object | None = None
+_compiled_b1_sdpa: dict[bool, object] = {}
+
+
+def _b1_sdpa_kernel(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """``[T,H,D]`` → SDPA ``[1,H,T,D]`` → ``[T,H,D]``. No eager ``contiguous``.
+
+    Inductor sees the transposes; eager permute+clone was the B=1 D2D tax.
+    """
+    q = query.unsqueeze(0).transpose(1, 2)
+    k = key.unsqueeze(0).transpose(1, 2)
+    v = value.unsqueeze(0).transpose(1, 2)
+    out = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, is_causal=False, scale=scale
+    )
+    t, h, d = query.shape
+    return out.transpose(1, 2).reshape(t, h, d)
+
+
+def _b1_sdpa_kernel_gqa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    q = query.unsqueeze(0).transpose(1, 2)
+    k = key.unsqueeze(0).transpose(1, 2)
+    v = value.unsqueeze(0).transpose(1, 2)
+    out = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, is_causal=False, scale=scale, enable_gqa=True
+    )
+    t, h, d = query.shape
+    return out.transpose(1, 2).reshape(t, h, d)
+
+
+def _b1_dense_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+    enable_gqa: bool,
+    head_size_padded: int,
+    head_size: int,
+) -> torch.Tensor:
+    """Compiled B=1 ``T==L`` attention. Dest/unpack are unused."""
+    query = _pad_head_dim_to_stick(query, head_size_padded)
+    key = _pad_head_dim_to_stick(key, head_size_padded)
+    value = _pad_head_dim_to_stick(value, head_size_padded)
+    kernel = _b1_sdpa_kernel_gqa if enable_gqa else _b1_sdpa_kernel
+    if query.device.type == "spyre":
+        compiled = _compiled_b1_sdpa.get(enable_gqa)
+        if compiled is None:
+            compiled = torch.compile(kernel, dynamic=False)
+            _compiled_b1_sdpa[enable_gqa] = compiled
+        kernel = compiled  # type: ignore[assignment]
+    result = kernel(query, key, value, mask, scale)
+    if result.shape[-1] == head_size:
+        return result
+    if result.device.type == "spyre":
+        result = convert(result, "cpu")
+    return result[..., :head_size].contiguous()
 
 
 def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
@@ -366,9 +436,16 @@ def _ensure_encoder_pack(
         device=target_device,
     )
 
-    attn_metadata.encoder_q_pack_idx = _dest_for_device(q_dest, target_device)
-    attn_metadata.encoder_kv_pack_idx = _dest_for_device(kv_dest, target_device)
-    attn_metadata.encoder_unpack_idx = _indices_for_device(unpack_idx, target_device)
+    # B=1 T==L fused SDPA never reads dest/unpack. Keep them on host (no H2D).
+    b1_dense = _is_b1_dense_body(batch_bucket, padded_tokens, aligned_len)
+    if b1_dense:
+        attn_metadata.encoder_q_pack_idx = q_dest
+        attn_metadata.encoder_kv_pack_idx = kv_dest
+        attn_metadata.encoder_unpack_idx = unpack_idx
+    else:
+        attn_metadata.encoder_q_pack_idx = _dest_for_device(q_dest, target_device)
+        attn_metadata.encoder_kv_pack_idx = _dest_for_device(kv_dest, target_device)
+        attn_metadata.encoder_unpack_idx = _indices_for_device(unpack_idx, target_device)
     attn_metadata.encoder_attn_mask = mask
     return (
         attn_metadata.encoder_q_pack_idx,
@@ -426,7 +503,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ``attn_type`` branch. Setup is shared with the paged decoder impl; forward
     packs Q/K/V with scatter into a slot-major workspace (decoder KV
     layout; extra dummy row for body-pad), then SDPA and gather-unpack.
-    ``B=1`` and ``T == L`` skip pack/unpack.
+    ``B=1`` and ``T == L`` compile permute+SDPA as one graph.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -472,7 +549,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
         scale = self.scale
 
-        q_pack, kv_pack, unpack_idx, mask = _ensure_encoder_pack(
+        pack = _ensure_encoder_pack(
             attn_metadata,
             padded_tokens=padded_tokens,
             n=n,
@@ -489,20 +566,33 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
+        q_pack, kv_pack, unpack_idx, mask = pack
         batch, _, aligned_len, _ = mask.shape
-        q_batched = scatter_pack(query, q_pack, batch, aligned_len, head_size_padded)
-        k_batched = scatter_pack(key, kv_pack, batch, aligned_len, head_size_padded)
-        v_batched = scatter_pack(value, kv_pack, batch, aligned_len, head_size_padded)
+        if _is_b1_dense_body(batch, padded_tokens, aligned_len):
+            result = _b1_dense_attention(
+                query,
+                key,
+                value,
+                mask,
+                scale,
+                num_kv_heads != num_heads,
+                head_size_padded,
+                head_size,
+            )
+        else:
+            q_batched = scatter_pack(query, q_pack, batch, aligned_len, head_size_padded)
+            k_batched = scatter_pack(key, kv_pack, batch, aligned_len, head_size_padded)
+            v_batched = scatter_pack(value, kv_pack, batch, aligned_len, head_size_padded)
 
-        sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
-        if num_kv_heads != num_heads:
-            sdpa_kwargs["enable_gqa"] = True
+            sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
+            if num_kv_heads != num_heads:
+                sdpa_kwargs["enable_gqa"] = True
 
-        attn_out = F.scaled_dot_product_attention(
-            q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
-        )
+            attn_out = F.scaled_dot_product_attention(
+                q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
+            )
 
-        result = gather_unpack(attn_out, unpack_idx, head_size)
+            result = gather_unpack(attn_out, unpack_idx, head_size)
         if result.dtype != output.dtype:
             result = convert(result, dtype=output.dtype)
 
