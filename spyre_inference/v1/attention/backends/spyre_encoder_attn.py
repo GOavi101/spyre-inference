@@ -20,11 +20,11 @@ layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 Ragged→dense packing uses compiled ``index_copy_`` on Spyre into a
 slot-major workspace (decoder KV / torch-spyre#3705) so ``view(B, L, …)``
 is address-order-preserving. Body-pad dests write an extra dummy row
-(not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1`` with
-``T == L`` skips scatter/gather: permute+SDPA+unpermute is one compiled
-graph (eager ``contiguous`` was ~half of B=1 attention). Dest/unpack stay
-on host in that case; mask is still H2D. Dest, unpack, and mask are built
-once per step.
+(not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1`` with ``T == L`` and no pad (real
+length fills ``L``) compiles permute+SDPA as one graph. Short prompts
+padded to the body bucket still use pack+mask (compiled strided SDPA
+drops the pad mask). Dest/unpack stay on host when ``T == L``. Dest,
+unpack, and mask are built once per step.
 """
 
 from __future__ import annotations
@@ -153,6 +153,18 @@ def _is_identity_row_map(indices: torch.Tensor, num_rows: int) -> bool:
 def _is_b1_dense_body(batch: int, num_src: int, aligned_len: int) -> bool:
     """Single sequence already shaped ``[L, H, D]`` (token bucket == SDPA L)."""
     return batch == 1 and num_src == aligned_len
+
+
+def _is_b1_fused_sdpa(
+    batch: int, padded_tokens: int, aligned_len: int, real_len: int
+) -> bool:
+    """Compiled no-contiguous SDPA is only legal when the mask is dense.
+
+    ``T == L`` still holds for ``Hello world.`` padded to 64; the pad mask
+    is dropped inside the fused graph and embeddings collapse. Serve
+    512-in-512 stays on the fused path.
+    """
+    return _is_b1_dense_body(batch, padded_tokens, aligned_len) and real_len == aligned_len
 
 
 def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
@@ -503,7 +515,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ``attn_type`` branch. Setup is shared with the paged decoder impl; forward
     packs Q/K/V with scatter into a slot-major workspace (decoder KV
     layout; extra dummy row for body-pad), then SDPA and gather-unpack.
-    ``B=1`` and ``T == L`` compile permute+SDPA as one graph.
+    ``B=1`` with ``T == L`` and no pad compiles permute+SDPA as one graph.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -568,7 +580,11 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         q_pack, kv_pack, unpack_idx, mask = pack
         batch, _, aligned_len, _ = mask.shape
-        if _is_b1_dense_body(batch, padded_tokens, aligned_len):
+        qsl = attn_metadata.query_start_loc
+        if qsl.device.type != "cpu":
+            qsl = qsl.cpu()
+        real_len = int((qsl[1] - qsl[0]).item()) if qsl.numel() > 1 else padded_tokens
+        if _is_b1_fused_sdpa(batch, padded_tokens, aligned_len, real_len):
             result = _b1_dense_attention(
                 query,
                 key,
