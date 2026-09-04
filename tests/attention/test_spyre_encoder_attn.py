@@ -527,6 +527,92 @@ def test_encoder_pack_cache_reused_across_layers(default_vllm_config) -> None:
     assert attn_metadata.encoder_attn_mask is cached_mask
 
 
+def _b1_dense_forward_setup(total_tokens: int = 64):
+    """B=1 body already at attention L so the fused SDPA path fires."""
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    num_heads, num_kv_heads, head_size, block_size = 16, 4, 64, 64
+    dtype = torch.float16
+    query = torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
+    key = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([total_tokens], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, total_tokens], dtype=torch.int32),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+    fwd = dict(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+    )
+    return impl, fwd, query, attn_metadata
+
+
+@torch.inference_mode()
+def test_b1_dense_forward_skips_scatter_pack(monkeypatch, default_vllm_config) -> None:
+    """Serve B=1 T==L must not eager-pack Q/K/V (that was the D2D clone tax)."""
+    calls = {"n": 0}
+    real = encoder_attn.scatter_pack
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "scatter_pack", counting)
+    impl, fwd, query, _meta = _b1_dense_forward_setup()
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert calls["n"] == 0
+
+
+@torch.inference_mode()
+def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> None:
+    """Fused B=1 path does not H2D scatter dest or unpack indices."""
+    dest_calls = {"n": 0}
+    idx_calls = {"n": 0}
+    real_dest = encoder_attn._dest_for_device
+    real_idx = encoder_attn._indices_for_device
+
+    def count_dest(*args, **kwargs):
+        dest_calls["n"] += 1
+        return real_dest(*args, **kwargs)
+
+    def count_idx(*args, **kwargs):
+        idx_calls["n"] += 1
+        return real_idx(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "_dest_for_device", count_dest)
+    monkeypatch.setattr(encoder_attn, "_indices_for_device", count_idx)
+    impl, fwd, query, meta = _b1_dense_forward_setup()
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert dest_calls["n"] == 0
+    assert idx_calls["n"] == 0
+    assert meta.encoder_q_pack_idx is not None
+    assert meta.encoder_q_pack_idx.device.type == "cpu"
+    assert meta.encoder_unpack_idx is not None
+    assert meta.encoder_unpack_idx.device.type == "cpu"
+    assert meta.encoder_attn_mask is not None
+
+
 def _assert_scatter_matches_gather(
     q_starts: list[int],
     query_lens: list[int],
