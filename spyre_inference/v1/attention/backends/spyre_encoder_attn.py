@@ -17,9 +17,9 @@
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
 layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
-Ragged→dense packing uses host-built indices + ``index_select`` (gather).
-Pad slots gather a trailing zero row so the dense batch stays zeros in the
-padding region.
+Ragged→dense packing scatters real tokens into a zeroed ``[B, L]`` grid
+(compiled ``index_copy_``, same kernel style as decoder KV write). Unpack
+is still ``index_select``. Pad slots stay zeros (never written).
 """
 
 from __future__ import annotations
@@ -69,6 +69,27 @@ def host_pack_indices(
     return indices
 
 
+def host_scatter_pack_dest(
+    q_starts: list[int],
+    lengths: list[int],
+    aligned_len: int,
+    num_src_rows: int,
+    dummy_row: int,
+) -> torch.Tensor:
+    """``[num_src_rows]`` packed-row dest for each source token.
+
+    Real tokens write ``s * L + pos``. Body-pad / dummy seqs write ``dummy_row``
+    (an extra workspace row, not an attention slot).
+    """
+    dest = torch.full((num_src_rows,), dummy_row, dtype=torch.int64)
+    for s, (start, length) in enumerate(zip(q_starts, lengths)):
+        if length > 0:
+            dest[start : start + length] = torch.arange(
+                s * aligned_len, s * aligned_len + length, dtype=torch.int64
+            )
+    return dest
+
+
 def host_unpack_indices(
     q_starts: list[int],
     query_lens: list[int],
@@ -102,15 +123,33 @@ def _pad_head_dim_to_stick(flat: torch.Tensor, head_size_padded: int) -> torch.T
     return flat
 
 
+def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """Tiny mutation, compiled alone — do not fuse with SDPA."""
+    dst.index_copy_(0, index, src)
+    return dst
+
+
+_compiled_index_copy: object | None = None
+
+
+def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """Eager on CPU; compiled ``index_copy_`` on Spyre (eager falls back / rejects)."""
+    global _compiled_index_copy
+    if dst.device.type != "spyre":
+        return _index_copy_kernel(dst, index, src)
+    if _compiled_index_copy is None:
+        _compiled_index_copy = torch.compile(_index_copy_kernel, dynamic=False)
+    return _compiled_index_copy(dst, index, src)
+
+
 def gather_pack(
     flat: torch.Tensor,
     pack_indices: torch.Tensor,
     head_size_padded: int,
 ) -> torch.Tensor:
-    """Pack varlen ``[T, H, D]`` → padded ``[B, H, L, Dp]`` via ``index_select``.
+    """Reference pack: ``F.pad`` zero row + ``index_select`` of ``B×L``.
 
-    ``pack_indices`` is host ``[B, L]`` int64. Head dim is padded to the stick
-    (CPU for MiniLM D=32), then a zero token row is ``F.pad``'d on-device.
+    Kept for tests. Serve uses ``scatter_pack``.
     """
     batch, aligned_len = pack_indices.shape
     _t, num_heads, _d = flat.shape
@@ -118,6 +157,36 @@ def gather_pack(
     flat_ext = F.pad(flat, (0, 0, 0, 0, 0, 1))
     gathered = select_rows(flat_ext, pack_indices)  # [B*L, H, Dp]
     packed = gathered.view(batch, aligned_len, num_heads, head_size_padded)
+    return packed.permute(0, 2, 1, 3).contiguous()
+
+
+def scatter_pack(
+    flat: torch.Tensor,
+    dest_idx: torch.Tensor,
+    batch: int,
+    aligned_len: int,
+    head_size_padded: int,
+) -> torch.Tensor:
+    """Pack varlen ``[T, H, D]`` → ``[B, H, L, Dp]`` via compiled ``index_copy_``.
+
+    ``dest_idx`` is ``[T]`` int64 packed-row ids (host or device). Pad slots are
+    implicit zeros. A dest past ``B×L`` is a dummy row for body-bucket padding.
+    """
+    _t, num_heads, _d = flat.shape
+    flat = _pad_head_dim_to_stick(flat, head_size_padded)
+    packed_rows = batch * aligned_len
+    max_dest = int(dest_idx.max()) if dest_idx.numel() else -1
+    workspace = torch.zeros(
+        max(packed_rows, max_dest + 1),
+        num_heads,
+        head_size_padded,
+        dtype=flat.dtype,
+        device=flat.device,
+    )
+    # Spyre index_copy_ wants int64 (decoder KV write).
+    idx = dest_idx.to(device=flat.device, dtype=torch.int64)
+    _index_copy(workspace, idx, flat)
+    packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
     return packed.permute(0, 2, 1, 3).contiguous()
 
 
@@ -185,8 +254,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     The platform selects this impl for ENCODER/ENCODER_ONLY layers (see
     ``TorchSpyrePlatform.get_attn_backend_cls``), so there is no per-call
     ``attn_type`` branch. Setup is shared with the paged decoder impl; forward
-    packs with gather (``index_select``), runs one batched SDPA on Spyre, then
-    unpacks with gather.
+    packs with scatter (``index_copy_``), runs one batched SDPA on Spyre, then
+    unpacks with gather (``index_select``).
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -264,22 +333,24 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             kv_lens = kv_lens + [0] * (batch_bucket - num_seqs)
 
         target_device = output.device
-        # Keep activations on the SDPA device; pack/unpack via index_select.
+        # Keep activations on the SDPA device; scatter pack, gather unpack.
         if query.device.type != target_device.type:
             query = convert(query, target_device.type)
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
-        pad_row = padded_tokens  # index of the appended zero row in gather_pack
-        q_pack_idx = host_pack_indices(q_starts, query_lens, aligned_len, pad_row)
+        dummy_row = batch_bucket * aligned_len
         # K/V may be shorter than Q when seq_lens < query_lens; still use q_starts.
         kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
-        kv_pack_idx = host_pack_indices(q_starts, kv_pack_lens, aligned_len, pad_row)
+        q_dest = host_scatter_pack_dest(q_starts, query_lens, aligned_len, padded_tokens, dummy_row)
+        kv_dest = host_scatter_pack_dest(
+            q_starts, kv_pack_lens, aligned_len, padded_tokens, dummy_row
+        )
         unpack_idx = host_unpack_indices(orig_q_starts, orig_query_lens, aligned_len, padded_tokens)
 
-        q_batched = gather_pack(query, q_pack_idx, head_size_padded)
-        k_batched = gather_pack(key, kv_pack_idx, head_size_padded)
-        v_batched = gather_pack(value, kv_pack_idx, head_size_padded)
+        q_batched = scatter_pack(query, q_dest, batch_bucket, aligned_len, head_size_padded)
+        k_batched = scatter_pack(key, kv_dest, batch_bucket, aligned_len, head_size_padded)
+        v_batched = scatter_pack(value, kv_dest, batch_bucket, aligned_len, head_size_padded)
 
         mask = build_attention_mask(
             batch_bucket,
