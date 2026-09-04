@@ -613,6 +613,25 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
     assert meta.encoder_attn_mask is not None
 
 
+@torch.inference_mode()
+def test_b1_padded_body_does_not_use_fused_sdpa(monkeypatch, default_vllm_config) -> None:
+    """``Hello world.`` padded to T=L=64 must keep pack+mask, not fused SDPA."""
+    fused_calls = {"n": 0}
+    real = encoder_attn._b1_dense_attention
+
+    def counting(*args, **kwargs):
+        fused_calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "_b1_dense_attention", counting)
+    impl, fwd, query, _meta = _b1_dense_forward_setup(total_tokens=64)
+    # Real prompt length 5; body/attention still 64 (e2e embed tests).
+    fwd["attn_metadata"].query_start_loc = torch.tensor([0, 5], dtype=torch.int32)
+    fwd["attn_metadata"].seq_lens = torch.tensor([5], dtype=torch.int32)
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert fused_calls["n"] == 0
+
+
 def _assert_scatter_matches_gather(
     q_starts: list[int],
     query_lens: list[int],
