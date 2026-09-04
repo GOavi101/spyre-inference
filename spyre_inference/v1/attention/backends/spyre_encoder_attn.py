@@ -38,6 +38,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference.custom_ops.utils import convert
@@ -46,6 +47,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
+    _maybe_compile,
     slot_major_kv_layout,
 )
 from spyre_inference.v1.pool import select_rows
@@ -54,6 +56,8 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     pick_encoder_attention_shape,
     pooling_warmup_shapes,
 )
+
+logger = init_logger(__name__)
 
 # Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
 # L-aligned keeps P·V's K stick-aligned; D-aligned keeps QKᵀ's K stick-aligned
@@ -514,6 +518,53 @@ def gather_unpack(
     return gathered[..., :head_size].contiguous()
 
 
+def _create_compilable_encoder_attn(
+    head_size_padded: int,
+    enable_gqa: bool,
+):
+    """Factory for one pack→SDPA kernel, closed over per-layer constants.
+
+    Mirrors the decoder's ``_create_compilable_page_attn``: everything that
+    never varies per call for a given attention layer (head size, GQA) is a
+    closure constant, not a runtime argument. Fusing pack and SDPA into one
+    function lets ``_maybe_compile`` wrap the whole sequence in a single
+    ``torch.compile``, so Dynamo checks guards once per call instead of once
+    per inner op — the latter is what makes eager per-op dispatch on Spyre
+    recompile on content changes alone (spyre-inference#775 follow-up).
+
+    ``gather_unpack`` stays outside this kernel and runs eager, called
+    separately by ``forward()``: compiling it together with SDPA in one graph
+    hits a torch-spyre layout-propagation limit ("Incompatible host_size and
+    dim_order", `torch_spyre/_inductor/propagate_layouts.py`) regardless of
+    mask or GQA — isolated experimentally, not yet root-caused inside
+    torch-spyre. Pack+SDPA alone compiles cleanly; that's most of the benefit,
+    since it collapses 3 gather_pack calls plus SDPA from 4+ separately
+    guard-checked eager dispatches down to 1.
+    """
+
+    def encoder_attn(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_pack_idx: torch.Tensor,
+        kv_pack_idx: torch.Tensor,
+        mask: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        q_batched = gather_pack(query, q_pack_idx, head_size_padded)
+        k_batched = gather_pack(key, kv_pack_idx, head_size_padded)
+        v_batched = gather_pack(value, kv_pack_idx, head_size_padded)
+
+        sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
+        if enable_gqa:
+            sdpa_kwargs["enable_gqa"] = True
+        return F.scaled_dot_product_attention(
+            q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
+        )
+
+    return encoder_attn
+
+
 def _indices_for_device(indices: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Move pack dest / unpack indices onto ``device`` once.
 
@@ -562,7 +613,20 @@ def _ensure_encoder_pack(
         cached_max_model_len,
         cached_max_num_batched_tokens,
     )
-    batch_bucket, aligned_len = pair if pair is not None else (num_seqs, _align_up(max_len))
+    if pair is not None:
+        batch_bucket, aligned_len = pair
+    else:
+        batch_bucket, aligned_len = num_seqs, _align_up(max_len)
+        logger.warning_once(
+            "No warmed encoder attention shape covers num_seqs=%d, "
+            "max_query_len=%d; falling back to (%d, %d), which triggers a "
+            "runtime recompile. Widen --max-num-batched-tokens or lower "
+            "--max-num-seqs so every batch bucket has a warmed cell.",
+            num_seqs,
+            max_len,
+            batch_bucket,
+            aligned_len,
+        )
     query_lens = _content_query_lens(qsl_lens, kv_lens, num_actual_tokens=n)
     orig_q_starts = q_starts
     orig_query_lens = query_lens
@@ -687,6 +751,24 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             max_num_batched_tokens=self._cached_max_num_batched_tokens,
             len_bucket=default_encoder_len_buckets(self._cached_max_model_len),
         )
+        # One compiled pack→SDPA kernel per (batch_bucket, aligned_len),
+        # mirroring the decoder's self._attn_fns/_decode_fns.
+        self._encoder_attn_fns: dict[tuple[int, int], object] = {}
+
+    def _get_encoder_attn_fn(
+        self,
+        batch_bucket: int,
+        aligned_len: int,
+        head_size_padded: int,
+        enable_gqa: bool,
+    ):
+        key = (batch_bucket, aligned_len)
+        if key not in self._encoder_attn_fns:
+            self._encoder_attn_fns[key] = _maybe_compile(
+                _create_compilable_encoder_attn(head_size_padded, enable_gqa),
+                self._compile_attn,
+            )
+        return self._encoder_attn_fns[key]
 
     def forward(  # ty: ignore[invalid-method-override]
         self,

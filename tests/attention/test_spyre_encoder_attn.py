@@ -378,11 +378,6 @@ def test_spyre_encoder_attn(
     configure_device: str,
 ) -> None:
     """Validate SpyreEncoderAttentionImpl against a bidirectional reference."""
-    # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
-    # "missing device_tensor_layout on graph input arg0_1"
-    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
-        pytest.skip("STOCK + device_spyre, currently fails.")
-
     num_query_heads, num_kv_heads = num_heads
     # only for preparation, actual device is set via `configure_device`
     torch.set_default_device("cpu")
