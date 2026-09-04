@@ -28,6 +28,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
+    _content_query_lens,
     build_attention_mask,
     dummy_pack_row,
     gather_pack,
@@ -624,12 +625,25 @@ def test_b1_padded_body_does_not_use_fused_sdpa(monkeypatch, default_vllm_config
         return real(*args, **kwargs)
 
     monkeypatch.setattr(encoder_attn, "_b1_dense_attention", counting)
-    impl, fwd, query, _meta = _b1_dense_forward_setup(total_tokens=64)
-    # Real prompt length 5; body/attention still 64 (e2e embed tests).
-    fwd["attn_metadata"].query_start_loc = torch.tensor([0, 5], dtype=torch.int32)
-    fwd["attn_metadata"].seq_lens = torch.tensor([5], dtype=torch.int32)
+    impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
+    # Real prompt length 5; body/attention still 64 (e2e / upstream BGE).
+    meta.query_start_loc = torch.tensor([0, 64], dtype=torch.int32)  # padded cu_seqlens
+    meta.seq_lens = torch.tensor([5], dtype=torch.int32)
+    meta.num_actual_tokens = 5
     impl.forward(**fwd, output=torch.empty_like(query))
     assert fused_calls["n"] == 0
+    mask = meta.encoder_attn_mask
+    assert mask is not None
+    mask_cpu = mask.cpu() if mask.device.type != "cpu" else mask
+    # Identity-pack + dense qsl mask was BGE ~0.47; pad keys must be -inf.
+    assert mask_cpu[0, 0, 0, 0].item() == 0.0
+    assert mask_cpu[0, 0, 0, 5].item() < -1.0e3
+
+
+def test_content_query_lens_prefers_seq_over_padded_qsl():
+    assert _content_query_lens([64], [5]) == [5]
+    assert _content_query_lens([5, 12], [5, 12]) == [5, 12]
+    assert _content_query_lens([32, 32], [5, 12]) == [5, 12]
 
 
 def _assert_scatter_matches_gather(
