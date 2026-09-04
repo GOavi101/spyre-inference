@@ -17,13 +17,13 @@
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
 layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
-Ragged→dense packing scatters real tokens into a zeroed ``[B, L]`` grid
-(compiled ``index_copy_``, same kernel style as decoder KV write). Unpack
-is still ``index_select``. Pad slots stay zeros (never written). ``B=1``
-with ``T == L`` skips scatter/gather: the body is already dense and the
-attention mask hides pad slots (62-token prompts on an L=64 bucket). Dest
-indices and the attention mask are built on the first layer of a step and
-reused (decoder ``page_index_tables`` pattern).
+Ragged→dense packing uses compiled ``index_copy_`` on Spyre. The packed
+grid is ``[B, L, H, D]`` with a slot-major layout over flattened ``B×L``
+(decoder KV / torch-spyre#3705), so the scatter view is created in eager
+Python and no post-scatter ``view`` splits a tiled dim 0. Body-pad dests
+write a masked pad slot, not an extra row. Unpack is ``index_select``.
+``B=1`` with ``T == L`` skips pack/unpack (62-token prompts on L=64).
+Dest, unpack, and mask are built once per step.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
+    slot_major_kv_layout,
 )
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -73,6 +74,19 @@ def host_pack_indices(
     return indices
 
 
+def dummy_pack_row(lengths: list[int], aligned_len: int) -> int:
+    """First pad slot in the ``[B, L]`` grid, or ``0`` when the grid is full.
+
+    Body-pad dests write here so the scatter workspace is exactly ``B×L``
+    (no extra row, no sliced layout). The slot is masked and never unpacked.
+    A full grid has no pad slot; ``0`` is unused unless extra src rows exist.
+    """
+    for s, length in enumerate(lengths):
+        if length < aligned_len:
+            return s * aligned_len + length
+    return 0
+
+
 def host_scatter_pack_dest(
     q_starts: list[int],
     lengths: list[int],
@@ -82,8 +96,8 @@ def host_scatter_pack_dest(
 ) -> torch.Tensor:
     """``[num_src_rows]`` packed-row dest for each source token.
 
-    Real tokens write ``s * L + pos``. Body-pad / dummy seqs write ``dummy_row``
-    (an extra workspace row, not an attention slot).
+    Real tokens write ``s * L + pos``. Body-pad rows write ``dummy_row``,
+    a masked pad slot (see ``dummy_pack_row``), not an extra workspace row.
     """
     dest = torch.full((num_src_rows,), dummy_row, dtype=torch.int64)
     for s, (start, length) in enumerate(zip(q_starts, lengths)):
@@ -159,15 +173,52 @@ def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> to
     return _compiled_index_copy(dst, index, src)
 
 
+def _dest_on_flat_device(dest_idx: torch.Tensor, flat: torch.Tensor) -> torch.Tensor:
+    """Spyre compiled index_copy_ wants int32; eager CPU wants int64."""
+    if dest_idx.device.type == "spyre":
+        return dest_idx
+    if flat.device.type == "spyre":
+        return convert(dest_idx.to(torch.int32), flat.device)
+    return dest_idx.to(device=flat.device, dtype=torch.int64)
+
+
+def _zeros_packed_grid(
+    batch: int,
+    aligned_len: int,
+    num_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """``[B, L, H, D]`` zeros. Spyre pins flattened ``B×L`` at device position 0.
+
+    Same stamp as decoder pages (``[blocks, block_size, H, D]`` with a
+    slot-major ``[slots, H, D]`` layout). The scatter view is created in
+    eager Python — Inductor cannot lower a store through a Spyre-layout
+    view created inside a graph. ``empty`` + ``zero_`` stays on device.
+    """
+    if device.type != "spyre":
+        return torch.zeros(batch, aligned_len, num_heads, head_size, dtype=dtype, device=device)
+    layout = slot_major_kv_layout(batch * aligned_len, num_heads, head_size, dtype)
+    # empty_with_layout takes one size tuple, not *shape. Decoder uses
+    # zeros().to(..., device_layout=); empty+zero_ stays on device.
+    return torch.empty(  # ty: ignore[no-matching-overload]
+        (batch, aligned_len, num_heads, head_size),
+        dtype=dtype,
+        device=device,
+        device_layout=layout,
+    ).zero_()
+
+
 def gather_pack(
     flat: torch.Tensor,
     pack_indices: torch.Tensor,
     head_size_padded: int,
 ) -> torch.Tensor:
-    """Reference pack: ``F.pad`` zero row + ``index_select`` of ``B×L``.
+    """Pack via ``F.pad`` zero row + ``index_select`` of ``B×L``.
 
-    Kept for tests. Serve uses ``scatter_pack``. ``B=1`` with identity rows
-    (``T == L`` and no pad slots) skips ``index_select``.
+    Reference / tests. Serve uses ``scatter_pack``. ``B=1`` identity skips
+    ``index_select``.
     """
     batch, aligned_len = pack_indices.shape
     _t, num_heads, _d = flat.shape
@@ -190,38 +241,33 @@ def scatter_pack(
 ) -> torch.Tensor:
     """Pack varlen ``[T, H, D]`` → ``[B, H, L, Dp]`` via compiled ``index_copy_``.
 
-    ``dest_idx`` is ``[T]`` packed-row ids (host or device). Pad slots are
-    implicit zeros. A dest past ``B×L`` is a dummy row for body-bucket padding.
+    ``dest_idx`` is ``[T]`` packed-row ids (host or device). Pad slots start
+    as zeros. Body-pad dests write a masked pad slot (``dummy_pack_row``),
+    so the grid is exactly ``[B, L, H, D]`` — no extra row, no sliced layout.
 
     ``B=1`` with ``T == L`` skips ``index_copy_``: the runner already padded
     the body to the SDPA length. The attention mask hides leftover pad tokens.
-    ``B > 1`` still scatters.
+
+    Spyre grid is slot-major over ``B×L`` (decoder KV). The scatter view is
+    eager; default-layout ``view(B, L, …)`` after ``index_copy_`` scrambles
+    ``B>1``.
     """
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
     if _is_b1_dense_body(batch, flat.shape[0], aligned_len):
         packed = flat.unsqueeze(0)
         return packed.permute(0, 2, 1, 3).contiguous()
-    packed_rows = batch * aligned_len
-    # Dummy dest is always ``B*L``. Extra row avoids ``dest.max()`` (device sync).
-    workspace = torch.zeros(
-        packed_rows + 1,
+    grid = _zeros_packed_grid(
+        batch,
+        aligned_len,
         num_heads,
         head_size_padded,
-        dtype=flat.dtype,
-        device=flat.device,
+        flat.dtype,
+        flat.device,
     )
-    # Spyre has no int64. H2D dest as int32 and never .to(int64) on device
-    # (that CPU-detours and used to scramble B>1 dests). Eager CPU wants int64.
-    if dest_idx.device.type == "spyre":
-        idx = dest_idx
-    elif flat.device.type == "spyre":
-        idx = convert(dest_idx.to(torch.int32), flat.device)
-    else:
-        idx = dest_idx.to(device=flat.device, dtype=torch.int64)
-    _index_copy(workspace, idx, flat)
-    packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
-    return packed.permute(0, 2, 1, 3).contiguous()
+    slots = grid.reshape(batch * aligned_len, num_heads, head_size_padded)
+    _index_copy(slots, _dest_on_flat_device(dest_idx, flat), flat)
+    return grid.permute(0, 2, 1, 3).contiguous()
 
 
 def gather_unpack(
@@ -312,7 +358,7 @@ def _ensure_encoder_pack(
         query_lens = query_lens + [0] * (batch_bucket - num_seqs)
         kv_lens = kv_lens + [0] * (batch_bucket - num_seqs)
 
-    dummy_row = batch_bucket * aligned_len
+    dummy_row = dummy_pack_row(query_lens, aligned_len)
     kv_pack_lens = [min(q, k) for q, k in zip(query_lens, kv_lens)]
     q_dest = host_scatter_pack_dest(q_starts, query_lens, aligned_len, padded_tokens, dummy_row)
     kv_dest = host_scatter_pack_dest(q_starts, kv_pack_lens, aligned_len, padded_tokens, dummy_row)
@@ -384,8 +430,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     The platform selects this impl for ENCODER/ENCODER_ONLY layers (see
     ``TorchSpyrePlatform.get_attn_backend_cls``), so there is no per-call
     ``attn_type`` branch. Setup is shared with the paged decoder impl; forward
-    packs with scatter (``index_copy_``, Spyre dest is int32), then SDPA
-    and gather-unpack. ``B=1`` and ``T == L`` skip pack/unpack.
+    packs Q/K/V with scatter into a slot-major ``[B, L, H, D]`` grid
+    (decoder KV layout), then SDPA and gather-unpack. ``B=1`` and
+    ``T == L`` skip pack/unpack.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -431,7 +478,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
         scale = self.scale
 
-        q_dest, kv_dest, unpack_idx, mask = _ensure_encoder_pack(
+        q_pack, kv_pack, unpack_idx, mask = _ensure_encoder_pack(
             attn_metadata,
             padded_tokens=padded_tokens,
             n=n,
@@ -449,9 +496,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             value = convert(value, target_device.type)
 
         batch, _, aligned_len, _ = mask.shape
-        q_batched = scatter_pack(query, q_dest, batch, aligned_len, head_size_padded)
-        k_batched = scatter_pack(key, kv_dest, batch, aligned_len, head_size_padded)
-        v_batched = scatter_pack(value, kv_dest, batch, aligned_len, head_size_padded)
+        q_batched = scatter_pack(query, q_pack, batch, aligned_len, head_size_padded)
+        k_batched = scatter_pack(key, kv_pack, batch, aligned_len, head_size_padded)
+        v_batched = scatter_pack(value, kv_pack, batch, aligned_len, head_size_padded)
 
         sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
         if num_kv_heads != num_heads:

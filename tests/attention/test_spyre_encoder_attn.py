@@ -29,6 +29,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     build_attention_mask,
+    dummy_pack_row,
     gather_pack,
     gather_unpack,
     host_pack_indices,
@@ -548,11 +549,17 @@ def _assert_scatter_matches_gather(
         padded_lens,
         aligned_len,
         num_src_rows=num_src,
-        dummy_row=batch * aligned_len,
+        dummy_row=dummy_pack_row(padded_lens, aligned_len),
     )
     ref = gather_pack(flat, pack_idx, dim)
     got = scatter_pack(flat, dest, batch, aligned_len, dim)
     assert torch.equal(got, ref)
+
+
+def test_dummy_pack_row_first_pad_or_zero_when_full():
+    assert dummy_pack_row([62], 64) == 62
+    assert dummy_pack_row([30, 12, 8, 0], 64) == 30
+    assert dummy_pack_row([64, 64], 64) == 0
 
 
 def test_scatter_pack_matches_gather_b1_pad():
@@ -672,7 +679,7 @@ def test_scatter_pack_b1_body_bucket_skips_index_copy(monkeypatch):
         lengths=[tokens],
         aligned_len=aligned_len,
         num_src_rows=tokens + extra,
-        dummy_row=aligned_len,
+        dummy_row=dummy_pack_row([tokens], aligned_len),
     )
 
     got = scatter_pack(flat, dest, batch=1, aligned_len=aligned_len, head_size_padded=dim)
