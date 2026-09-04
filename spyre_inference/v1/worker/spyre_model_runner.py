@@ -475,7 +475,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # CLS/LAST on Spyre via v1.pool; MEAN stays CPU.
+        # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
+        # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
@@ -892,12 +893,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        """Pool on the activation device; D2H only the pooled vectors.
+        """Pool on the activation device; copy only the pooled vectors back.
 
-        MEAN / FP32 heads keep the pooler on CPU — delegate to
-        ``GPUModelRunner._pool``. On-Spyre CLS/LAST still overrides the private
-        hook: pooled D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU).
-        Drop this once that op is safe (fallback probes / #3507–#3508).
+        FP32 linear heads keep the pooler on CPU and use
+        ``GPUModelRunner._pool``. Do not crop here: Spyre dim-0 slices are
+        unsafe, and each method gathers itself (CLS/LAST rows, MEAN
+        per-request rows, token AllPool ranges).
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"
@@ -922,8 +923,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Unlike upstream's cheap [:num_scheduled_tokens] slice, cropping here
         # would need index_select (Spyre dim-0 slice views are unsafe) and
         # would make its shape vary with real content on every request.
-        # Skip it: CLS/LAST read rows via cursor_row_indices_cpu, which never
-        # depends on hidden_states' own length.
+        # Skip it: each method gathers itself from host cursor counts.
         hidden_states = convert(hidden_states, self._spyre_device)
 
         # Build the cursor on CPU: upstream does ``cumsum[1:] - 1`` for

@@ -198,18 +198,15 @@ def test_spyre_single_row_index_select(spyre_device):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Tensor.index_add_ / aten::index_add is unimplemented on Spyre "
-        "(torch-spyre#3507). Upstream MeanPool uses index_add_ for segment "
-        "sums; until this works we keep MEAN pooling on CPU. When this probe "
-        "passes, add SpyreMeanPool (or drop MEAN from the unsupported list in "
-        "configure_pooling_for_spyre) and keep the pooler on Spyre like CLS/LAST."
+        "SpyreMeanPool copies packed activations once and sums in float32 on the host. "
+        "This probe still uses index_add_ with repeated ids and is expected to fail "
+        "(torch-spyre#3507). When it XPASS-es, MEAN can segment-sum on device."
     ),
 )
 def test_spyre_index_add_for_mean_pooling(spyre_device):
-    """Segment sum via index_add_ (MEAN pooling primitive).
+    """index_add_ with many tokens per sequence (upstream MeanPool shape).
 
-    Shape mirrors a small pooled batch: values [T, H], segment ids [T] →
-    out [B, H] with out.index_add_(0, ids, values).
+    SpyreMeanPool does not use this path; it copies the packed tensor once.
     """
     num_tokens, hidden, num_seqs = 12, 64, 3
     values = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
@@ -758,3 +755,98 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
     expected = x.cpu().float() ** 3
     torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# 10. FP32 reduce then D2H (MEAN destagger — both paths fail)
+# ---------------------------------------------------------------------------
+#
+# Device fp32 is staggered inside sticks (torch-spyre#2971). A raw convert
+# of the reduction is interleaved garbage. Downcast to fp16, convert, then
+# upcast is also garbage (e5/roberta cosine ~-0.02). MEAN therefore copies
+# packed fp16 and reduces on the host. When either XPASS-es, MEAN can
+# destagger a device fp32 sum and copy [B, H].
+
+
+def _fp32_mean_reduction(spyre_device):
+    hidden = torch.randn(32, 64, dtype=torch.float16, device=spyre_device)
+    acc = hidden.sum(dim=0, dtype=torch.float32)
+    ref = hidden.cpu().sum(dim=0, dtype=torch.float32)
+    return acc, ref
+
+
+def _destagger_fp32_to_host(tensor):
+    from spyre_inference.custom_ops.utils import convert
+
+    return convert(tensor.to(dtype=torch.float16), "cpu").to(dtype=torch.float32)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Device fp32 is staggered inside sticks (torch-spyre#2971). convert() of "
+        "that layout is interleaved garbage. MEAN copies packed fp16 instead. "
+        "When this XPASS-es, MEAN can convert a device fp32 sum."
+    ),
+)
+def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
+    """Raw convert of a device fp32 sum."""
+    from spyre_inference.custom_ops.utils import convert
+
+    acc, ref = _fp32_mean_reduction(spyre_device)
+    torch.testing.assert_close(convert(acc, "cpu"), ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "to(fp16) then convert then upcast is also garbage (e5/roberta cosine "
+        "~-0.02). MEAN copies packed fp16 and reduces on the host. When this "
+        "XPASS-es, MEAN can destagger a device fp32 sum."
+    ),
+)
+def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
+    """to(fp16) before convert does not un-stagger a device fp32 sum."""
+    acc, ref = _fp32_mean_reduction(spyre_device)
+    torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 11. FP32 linear / batchmatmul (pooling classifier heads)
+# ---------------------------------------------------------------------------
+#
+# torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul
+# (torch-spyre#1794), so F.linear on float32 classifier / reranker heads
+# stays on CPU (configure_pooling_for_spyre). When this XPASS-es, drop that
+# fallback.
+
+
+_FP32_BMM_REASON = (
+    "torch-spyre has FP32 for add/mul/sum/mean (SPYRE_FP32_OPS) but not for "
+    "batchmatmul / F.linear (torch-spyre#1794). Pooling classifier heads stay "
+    "float32, so configure_pooling_for_spyre keeps them on CPU. When this "
+    "XPASS-es, drop the FP32-head CPU fallback in configure_pooling_for_spyre."
+)
+
+
+@pytest.mark.parametrize("mode", ["eager", "compile"])
+@pytest.mark.xfail(strict=True, reason=_FP32_BMM_REASON)
+def test_spyre_fp32_linear_for_pooling_heads(spyre_device, mode):
+    """FP32 F.linear used by reranker / classifier pooling heads.
+
+    out>=2 so this is not the fp16 out=1 restickify xfail
+    (test_spyre_matmul_output_dim_1).
+    """
+    hidden = torch.randn(4, 64, dtype=torch.float32, device=spyre_device)
+    weight = torch.randn(8, 64, dtype=torch.float32, device=spyre_device)
+    bias = torch.randn(8, dtype=torch.float32, device=spyre_device)
+
+    def fn(h, w, b):
+        return F.linear(h, w, b)
+
+    if mode == "compile":
+        fn = torch.compile(fn, dynamic=False, backend="inductor")
+
+    out = fn(hidden, weight, bias)
+    expected = F.linear(hidden.cpu(), weight.cpu(), bias.cpu())
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
