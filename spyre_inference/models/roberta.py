@@ -14,22 +14,34 @@
 
 """Spyre adaptations for vLLM RoBERTa / XLM-R pooling models.
 
-RoBERTa re-exports BERT's ``_encode_token_type_ids`` /
-``_decode_token_type_ids`` into its own module globals, so the side-buffer
-adapter must be installed here as well as on ``bert``.
+RoBERTa reuses BERT's ``token_type_ids`` bit-pack transport, so these mirror
+``spyre_inference.models.bert``; the embedding differs only in RoBERTa's
+position offset, which runs on CPU (SDSC cannot schedule integer add).
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
-from vllm.logger import init_logger
+from vllm.model_executor.models.bert import BertModel
+from vllm.model_executor.models.roberta import (
+    BgeM3EmbeddingModel,
+    RobertaEmbedding,
+    RobertaEmbeddingModel,
+    RobertaForSequenceClassification,
+    RobertaForTokenClassification,
+)
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.models.token_type_adapter import install_on
+from spyre_inference.models._token_type import (
+    SpyreTokenTypeEmbedding,
+    SpyreTokenTypeModel,
+)
 
-logger = init_logger(__name__)
-
-_ROBERTA_POS_OFFSET_ATTR = "_spyre_cpu_position_offset"
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.model_executor.models.bert_with_rope import BertWithRope
 
 
 def offset_roberta_position_ids(
@@ -46,56 +58,64 @@ def offset_roberta_position_ids(
     return convert(pos, device=device, dtype=torch.int64)
 
 
-def _roberta_embedding_forward_spyre(
-    self,
-    input_ids: torch.Tensor,
-    position_ids: torch.Tensor,
-    inputs_embeds: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """vLLM ``RobertaEmbedding.forward`` with the padding offset on CPU."""
-    from vllm.model_executor.models.roberta import _decode_token_type_ids
+class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
+    """``RobertaEmbedding`` reading segment ids from the side buffer."""
 
-    token_type_ids = _decode_token_type_ids(input_ids)
+    padding_idx: int
 
-    if inputs_embeds is None:
-        inputs_embeds = self.word_embeddings(input_ids)
-
-    position_embeddings = self.position_embeddings(
-        offset_roberta_position_ids(
-            position_ids, self.padding_idx, input_ids.device
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        embeddings = (
+            inputs_embeds
+            + self.spyre_token_type_embeddings(input_ids)
+            + self.position_embeddings(
+                offset_roberta_position_ids(
+                    position_ids, self.padding_idx, input_ids.device
+                )
+            )
         )
-    )
-    token_type_embeddings = self.token_type_embeddings(token_type_ids)
-    embeddings = inputs_embeds + token_type_embeddings + position_embeddings
-    return self.LayerNorm(embeddings)
+        return self.LayerNorm(embeddings)
 
 
-def _install_cpu_position_offset() -> None:
-    from vllm.model_executor.models.roberta import RobertaEmbedding
+class SpyreRobertaEmbeddingMixin:
+    """Inject the Spyre embedding through ``RobertaEmbeddingModel._build_model``.
 
-    if getattr(RobertaEmbedding.forward, _ROBERTA_POS_OFFSET_ATTR, False):
-        return
-    RobertaEmbedding.forward = _roberta_embedding_forward_spyre
-    setattr(RobertaEmbedding.forward, _ROBERTA_POS_OFFSET_ATTR, True)
-    logger.info(
-        "Spyre: RoBERTa position_ids + padding_idx offset runs on CPU "
-        "(SDSC cannot schedule integer add)"
-    )
+    A mixin rather than an override on the concrete class: ``RobertaEmbedding``
+    unpacks the bit-packed segment ids on every ``forward``, so every
+    ``RobertaEmbeddingModel`` subclass needs the swap to compile at all.
+    """
 
-
-def install_spyre_patches() -> None:
-    """Install token_type adapter and CPU RoBERTa position offset."""
-    from vllm.model_executor.models import roberta
-
-    if not hasattr(roberta, "_encode_token_type_ids") or not hasattr(
-        roberta, "_decode_token_type_ids"
-    ):
-        logger.debug("Spyre: RoBERTa module has no token_type helpers; skipping adapter")
-    else:
-        install_on(roberta)
-        logger.info(
-            "Spyre: RoBERTa token_type_ids use side-buffer adapter "
-            "(skip vLLM bit-pack; torch-spyre#3509)"
+    def _build_model(self, vllm_config: VllmConfig, prefix: str = "") -> BertModel | BertWithRope:
+        hf_config = vllm_config.model_config.hf_config
+        if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
+            # Rotary variants (Jina) do not use the bit-pack transport.
+            return super()._build_model(vllm_config, prefix)
+        return BertModel(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            embedding_class=SpyreRobertaEmbedding,
         )
 
-    _install_cpu_position_offset()
+
+class SpyreRobertaEmbeddingModel(SpyreRobertaEmbeddingMixin, RobertaEmbeddingModel):
+    pass
+
+
+class SpyreBgeM3EmbeddingModel(SpyreRobertaEmbeddingMixin, BgeM3EmbeddingModel):
+    """BGE-M3 keeps its own ``__init__``/``_build_pooler`` (sparse + colbert heads)."""
+
+
+class SpyreRobertaForSequenceClassification(SpyreTokenTypeModel, RobertaForSequenceClassification):
+    spyre_embedding_class = SpyreRobertaEmbedding
+    spyre_encoder_attr = "roberta"
+
+
+class SpyreRobertaForTokenClassification(SpyreTokenTypeModel, RobertaForTokenClassification):
+    spyre_embedding_class = SpyreRobertaEmbedding
+    spyre_encoder_attr = "roberta"
