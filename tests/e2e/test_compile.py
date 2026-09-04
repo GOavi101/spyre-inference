@@ -24,7 +24,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = pytest.mark.compile
+# enforce_eager=False builds a subprocess EngineCore, so uses_subprocess runs these
+# before any in-process test initializes the Spyre device (a subprocess cannot open
+# the VFIO device once the main pytest process holds it).
+pytestmark = pytest.mark.uses_subprocess
 
 _POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
 _POOLING_REFS = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
