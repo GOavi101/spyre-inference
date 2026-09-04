@@ -19,12 +19,14 @@ layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
 Ragged→dense packing uses compiled ``index_copy_`` on Spyre into a
 slot-major workspace (decoder KV / torch-spyre#3705) so ``view(B, L, …)``
-is address-order-preserving. Body-pad dests write an extra dummy row
-(not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1`` with ``T == L`` and no pad (real
-length fills ``L``) compiles permute+SDPA as one graph. Short prompts
-padded to the body bucket still use pack+mask (compiled strided SDPA
-drops the pad mask). Dest/unpack stay on host when ``T == L``. Dest,
-unpack, and mask are built once per step.
+is address-order-preserving. Default-layout ``view`` after ``index_copy_``
+scrambles B>1 (real-slot cosine ~0.07). Body-pad dests write an extra
+dummy row (not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1``
+with ``T == L`` and no pad (real length fills ``L``) compiles permute+SDPA
+as one graph. Short prompts padded to the body bucket still use pack+mask
+(compiled strided SDPA drops the pad mask). ``query_start_loc`` can count
+that pad — dest/mask use ``min(qsl, seq_lens)``. Dest/unpack stay on host
+when ``T == L``. Dest, unpack, and mask are built once per step.
 """
 
 from __future__ import annotations
@@ -73,6 +75,11 @@ def host_pack_indices(
         if length > 0:
             indices[s, :length] = torch.arange(start, start + length, dtype=torch.int64)
     return indices
+
+
+def _content_query_lens(qsl_lens: list[int], kv_lens: list[int]) -> list[int]:
+    """Per-seq counts for dest/mask. ``query_start_loc`` can include 1D body pad."""
+    return [min(int(q), int(k)) for q, k in zip(qsl_lens, kv_lens)]
 
 
 def dummy_pack_row(lengths: list[int], aligned_len: int) -> int:
@@ -160,9 +167,11 @@ def _is_b1_fused_sdpa(
 ) -> bool:
     """Compiled no-contiguous SDPA is only legal when the mask is dense.
 
-    ``T == L`` still holds for ``Hello world.`` padded to 64; the pad mask
-    is dropped inside the fused graph and embeddings collapse. Serve
-    512-in-512 stays on the fused path.
+    ``T == L`` still holds for a short prompt padded to the body bucket.
+    Callers must pass the true token count (``min(qsl, seq_lens)``), not
+    padded ``query_start_loc``. Fusing with a live pad mask collapses
+    CLS/MEAN (BGE cosine ~0.47). Identity-pack + a dense mask from qsl
+    is the same bug.
     """
     return _is_b1_dense_body(batch, padded_tokens, aligned_len) and real_len == aligned_len
 
@@ -414,9 +423,13 @@ def _ensure_encoder_pack(
 
     qsl = attn_metadata.query_start_loc.cpu()
     q_starts = qsl[:-1].tolist()
-    query_lens = torch.diff(qsl).tolist()
+    qsl_lens = torch.diff(qsl).tolist()
     kv_lens = attn_metadata.seq_lens.cpu().tolist()
     num_seqs = attn_metadata.num_seqs
+    q_starts = q_starts[:num_seqs]
+    qsl_lens = qsl_lens[:num_seqs]
+    kv_lens = kv_lens[:num_seqs]
+    query_lens = _content_query_lens(qsl_lens, kv_lens)
     max_len = max(query_lens, default=0)
     pair = pick_encoder_attention_shape(
         num_seqs,
@@ -583,7 +596,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         qsl = attn_metadata.query_start_loc
         if qsl.device.type != "cpu":
             qsl = qsl.cpu()
-        real_len = int((qsl[1] - qsl[0]).item()) if qsl.numel() > 1 else padded_tokens
+        qsl_len = int((qsl[1] - qsl[0]).item()) if qsl.numel() > 1 else padded_tokens
+        seq = attn_metadata.seq_lens
+        if seq.device.type != "cpu":
+            seq = seq.cpu()
+        seq0 = int(seq.reshape(-1)[0].item()) if seq.numel() else qsl_len
+        # qsl can include body pad; seq_lens is the real prompt (BGE ~0.47).
+        real_len = min(n, qsl_len, seq0)
         if _is_b1_fused_sdpa(batch, padded_tokens, aligned_len, real_len):
             result = _b1_dense_attention(
                 query,
