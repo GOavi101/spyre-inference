@@ -579,7 +579,12 @@ class SpyreAttentionMetadata(AttentionMetadata):
     encoder_q_pack_idx: torch.Tensor | None = None
     encoder_kv_pack_idx: torch.Tensor | None = None
     encoder_unpack_idx: torch.Tensor | None = None
+    # Full ``[B, 1, L, L]`` (aligned_len + fused SDPA). Keep L×L: ``mask.shape[2]``
+    # is the body length. Do not store a key-only slice here.
     encoder_attn_mask: torch.Tensor | None = None
+    # Host-built dense key-pad ``[B * KV, 1, L, L]``. Spyre cannot broadcast
+    # ``[BH, 1, 1, L]`` onto scores.
+    encoder_key_pad_mask: torch.Tensor | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
