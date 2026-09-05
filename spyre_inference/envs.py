@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_BUCKETED_DECODE: bool = False
+    SPYRE_BUCKETED_ENCODE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -67,6 +68,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BUCKETED_DECODE": lambda: bool(int(os.getenv("SPYRE_BUCKETED_DECODE", "0"))),
+    # When "1", enables the encoder's batched dense (B, L) SDPA grid kernel. Off
+    # by default: the encoder instead loops over sequences one at a time (mirroring
+    # SPYRE_BUCKETED_DECODE's default for the decoder). The dense grid's own (B, L)
+    # bucket can be unreachable for some batch sizes within the token budget,
+    # leaving that batch size with no warmed cell at any prompt length; the loop
+    # has no such joint constraint. Re-enable to measure the batched path or to
+    # restore it after calibration.
+    "SPYRE_BUCKETED_ENCODE": lambda: bool(int(os.getenv("SPYRE_BUCKETED_ENCODE", "0"))),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

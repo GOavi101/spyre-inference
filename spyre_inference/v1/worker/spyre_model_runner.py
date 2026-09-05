@@ -833,7 +833,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
 
     def _warmup_pooling_bucket_shapes(self) -> None:
-        """Dummy each attention ``(B, L)``. Body already 1D-pads after warmup."""
+        """Dummy each ``(batch_size, prompt_len)`` shape. Body already 1D-pads after warmup.
+
+        This 2D cross-product is needed for BOTH the per-sequence loop (the
+        default, see SpyreEncoderAttentionImpl.forward) and the batched (B, L)
+        grid (opt-in via SPYRE_BUCKETED_ENCODE=1) — not just the batched path.
+        Each loop kernel is cached only on ``aligned_len``, but its query/key/
+        value arguments are the whole body-padded batch tensor, whose leading
+        dimension (set by the body's *independent* 1D ``compile_sizes``
+        bucketer) torch.compile also specializes on; a batch of >1 sequences
+        almost always pads to a body size larger than any one sequence's own
+        ``aligned_len``, off the (batch_size=1) diagonal. Sweeping every
+        ``(batch_size, prompt_len)`` pair here exercises every reachable
+        ``(body bucket, aligned_len)`` combination once at warmup instead of
+        on a live request's critical path.
+        """
         if self.spyre_shape_bucketer is not None:
             shapes = self.spyre_shape_bucketer.encoder_shapes
         else:

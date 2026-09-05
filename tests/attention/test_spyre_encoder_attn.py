@@ -58,6 +58,19 @@ def configure_device(request, monkeypatch):
 
 
 @pytest.fixture()
+def enable_bucketed_encode(monkeypatch):
+    """Enable the batched (B, L) dense-grid attention path for tests that exercise it.
+
+    The path ships gated off (``SPYRE_BUCKETED_ENCODE``, default "0") in favor of
+    the per-sequence loop. Without this fixture the bucketed tests would silently
+    fall back to the loop and pass while testing nothing. The autouse
+    cache-clearing fixture in ``tests/conftest.py`` makes the monkeypatched value
+    visible to ``envs``.
+    """
+    monkeypatch.setenv("SPYRE_BUCKETED_ENCODE", "1")
+
+
+@pytest.fixture()
 def configure_compilation(request, monkeypatch):
     """Configure torch.compile mode for tests."""
     import torch
@@ -377,7 +390,69 @@ def test_spyre_encoder_attn(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Validate SpyreEncoderAttentionImpl against a bidirectional reference."""
+    """Validate SpyreEncoderAttentionImpl against a bidirectional reference.
+
+    Runs whichever path ``envs.SPYRE_BUCKETED_ENCODE`` currently selects (the
+    default per-sequence loop unless a test opts into the batched (B, L) grid
+    via ``enable_bucketed_encode``).
+    """
+    _run_encoder_attn_test(
+        dtype=dtype,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(100, 100)], id="prefill(q=100,kv=100)"),
+        pytest.param([(9, 9), (70, 70), (5, 5)], id="batch_unaligned(3seqs)"),
+    ],
+)
+@torch.inference_mode()
+def test_spyre_encoder_attn_bucketed_batched(
+    default_vllm_config,
+    enable_bucketed_encode,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Batched (B, L) dense-grid path (opt-in): bit-exact vs the bidirectional reference."""
+    _run_encoder_attn_test(
+        dtype=torch.float16,
+        block_size=64,
+        head_size=64,
+        num_heads=(16, 4),
+        seq_lens=seq_lens,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+def _run_encoder_attn_test(
+    dtype: torch.dtype,
+    block_size: int,
+    head_size: int,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
     num_query_heads, num_kv_heads = num_heads
     # only for preparation, actual device is set via `configure_device`
     torch.set_default_device("cpu")
