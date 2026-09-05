@@ -515,10 +515,12 @@ def test_encoder_pack_cache_reused_across_layers(default_vllm_config) -> None:
     cached_kv = attn_metadata.encoder_kv_pack_idx
     cached_unpack = attn_metadata.encoder_unpack_idx
     cached_mask = attn_metadata.encoder_attn_mask
+    cached_key_pad = attn_metadata.encoder_key_pad_mask
     assert cached_q is not None
     assert cached_kv is not None
     assert cached_unpack is not None
     assert cached_mask is not None
+    assert cached_key_pad is not None
     assert cached_q.shape == (total_tokens,)
     assert cached_q.dtype == torch.int64
     impl.forward(**fwd, output=torch.empty_like(query))
@@ -526,6 +528,7 @@ def test_encoder_pack_cache_reused_across_layers(default_vllm_config) -> None:
     assert attn_metadata.encoder_kv_pack_idx is cached_kv
     assert attn_metadata.encoder_unpack_idx is cached_unpack
     assert attn_metadata.encoder_attn_mask is cached_mask
+    assert attn_metadata.encoder_key_pad_mask is cached_key_pad
 
 
 def _b1_dense_forward_setup(total_tokens: int = 64):
@@ -587,7 +590,7 @@ def test_b1_dense_forward_skips_scatter_pack(monkeypatch, default_vllm_config) -
 
 @torch.inference_mode()
 def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> None:
-    """Fused B=1 path does not H2D scatter dest or unpack indices."""
+    """Fused B=1 path does not H2D dest, unpack, or a zeros L×L mask."""
     dest_calls = {"n": 0}
     idx_calls = {"n": 0}
     real_dest = encoder_attn._dest_for_device
@@ -603,47 +606,191 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
 
     monkeypatch.setattr(encoder_attn, "_dest_for_device", count_dest)
     monkeypatch.setattr(encoder_attn, "_indices_for_device", count_idx)
+    pad_calls = {"n": 0}
+    real_pad = encoder_attn.host_key_pad_mask
+
+    def count_pad(*args, **kwargs):
+        pad_calls["n"] += 1
+        return real_pad(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "host_key_pad_mask", count_pad)
+    mask_calls = {"n": 0}
+    real_mask = encoder_attn.build_attention_mask
+
+    def count_mask(*args, **kwargs):
+        mask_calls["n"] += 1
+        return real_mask(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "build_attention_mask", count_mask)
     impl, fwd, query, meta = _b1_dense_forward_setup()
     impl.forward(**fwd, output=torch.empty_like(query))
     assert dest_calls["n"] == 0
     assert idx_calls["n"] == 0
+    assert pad_calls["n"] == 0
+    assert mask_calls["n"] == 0
     assert meta.encoder_q_pack_idx is not None
     assert meta.encoder_q_pack_idx.device.type == "cpu"
     assert meta.encoder_unpack_idx is not None
     assert meta.encoder_unpack_idx.device.type == "cpu"
     assert meta.encoder_attn_mask is not None
+    assert meta.encoder_attn_mask.numel() == 0
+    assert meta.encoder_key_pad_mask is meta.encoder_attn_mask
+
+
+def _run_b1_padded_forward(monkeypatch, *, seq_len: int, qsl_end: int, actual: int):
+    fused_calls = {"n": 0}
+    scatter_calls = {"n": 0}
+    packed_calls = {"n": 0}
+    index_copy_calls = {"n": 0}
+    real_fused = encoder_attn._b1_dense_attention
+    real_scatter = encoder_attn.scatter_pack
+    real_packed = encoder_attn._packed_masked_attention
+    real_index = encoder_attn._index_copy
+
+    def count_fused(*args, **kwargs):
+        fused_calls["n"] += 1
+        return real_fused(*args, **kwargs)
+
+    def count_scatter(*args, **kwargs):
+        scatter_calls["n"] += 1
+        return real_scatter(*args, **kwargs)
+
+    def count_packed(*args, **kwargs):
+        packed_calls["n"] += 1
+        return real_packed(*args, **kwargs)
+
+    def count_index(*args, **kwargs):
+        index_copy_calls["n"] += 1
+        return real_index(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "_b1_dense_attention", count_fused)
+    monkeypatch.setattr(encoder_attn, "scatter_pack", count_scatter)
+    monkeypatch.setattr(encoder_attn, "_packed_masked_attention", count_packed)
+    monkeypatch.setattr(encoder_attn, "_index_copy", count_index)
+    impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
+    meta.query_start_loc = torch.tensor([0, qsl_end], dtype=torch.int32)
+    meta.seq_lens = torch.tensor([seq_len], dtype=torch.int32)
+    meta.num_actual_tokens = actual
+    impl.forward(**fwd, output=torch.empty_like(query))
+    return fused_calls["n"], scatter_calls["n"], packed_calls["n"], index_copy_calls["n"], meta
 
 
 @torch.inference_mode()
-def test_b1_padded_body_does_not_use_fused_sdpa(monkeypatch, default_vllm_config) -> None:
-    """``Hello world.`` padded to T=L=64 must keep pack+mask, not fused SDPA."""
-    fused_calls = {"n": 0}
-    real = encoder_attn._b1_dense_attention
+def test_b1_padded_body_uses_packed_mask(monkeypatch, default_vllm_config) -> None:
+    """Short prompt padded to T=L=64 uses packed QK, not fused SDPA; no index_copy_."""
+    fused, scatter, packed, index_copy, meta = _run_b1_padded_forward(
+        monkeypatch, seq_len=5, qsl_end=64, actual=5
+    )
+    assert fused == 0
+    assert packed == 1
+    assert scatter == 3
+    assert index_copy == 0
+    _assert_pad_mask(meta, 5)
 
-    def counting(*args, **kwargs):
-        fused_calls["n"] += 1
-        return real(*args, **kwargs)
 
-    monkeypatch.setattr(encoder_attn, "_b1_dense_attention", counting)
-    impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
-    # Real prompt length 5; body/attention still 64 (e2e / upstream BGE).
-    meta.query_start_loc = torch.tensor([0, 64], dtype=torch.int32)  # padded cu_seqlens
-    meta.seq_lens = torch.tensor([5], dtype=torch.int32)
-    meta.num_actual_tokens = 5
-    impl.forward(**fwd, output=torch.empty_like(query))
-    assert fused_calls["n"] == 0
+@torch.inference_mode()
+def test_b1_padded_qsl_and_seq_use_actual_tokens(monkeypatch, default_vllm_config) -> None:
+    """Upstream can pad both cu_seqlens and seq_lens; num_actual_tokens still marks pad."""
+    fused, scatter, packed, index_copy, meta = _run_b1_padded_forward(
+        monkeypatch, seq_len=64, qsl_end=64, actual=5
+    )
+    assert fused == 0
+    assert packed == 1
+    assert scatter == 3
+    assert index_copy == 0
+    _assert_pad_mask(meta, 5)
+
+
+def _assert_pad_mask(meta, real_len: int) -> None:
     mask = meta.encoder_attn_mask
     assert mask is not None
     mask_cpu = mask.cpu() if mask.device.type != "cpu" else mask
-    # Identity-pack + dense qsl mask was BGE ~0.47; pad keys must be -inf.
     assert mask_cpu[0, 0, 0, 0].item() == 0.0
-    assert mask_cpu[0, 0, 0, 5].item() < -1.0e3
+    assert mask_cpu[0, 0, 0, real_len].item() < -1.0e3
+    key_pad = meta.encoder_key_pad_mask
+    assert key_pad is not None
+    key_cpu = key_pad.cpu() if key_pad.device.type != "cpu" else key_pad
+    assert key_cpu.shape[-2] == key_cpu.shape[-1]
+    assert key_cpu[0, 0, 0, 0].item() == 0.0
+    assert key_cpu[0, 0, 0, real_len].item() < -1.0e3
 
 
 def test_content_query_lens_prefers_seq_over_padded_qsl():
     assert _content_query_lens([64], [5]) == [5]
     assert _content_query_lens([5, 12], [5, 12]) == [5, 12]
     assert _content_query_lens([32, 32], [5, 12]) == [5, 12]
+
+
+def test_content_query_lens_actual_tokens_beat_padded_qsl_and_seq():
+    assert _content_query_lens([64], [64], num_actual_tokens=5) == [5]
+    assert _content_query_lens([32, 32], [32, 32], num_actual_tokens=17) == [17, 0]
+    assert _content_query_lens([5, 12], [5, 12], num_actual_tokens=17) == [5, 12]
+
+
+@torch.inference_mode()
+def test_b1_short_seq_scatter_uses_packed_mask(monkeypatch, default_vllm_config) -> None:
+    """T != L (BGE short prompts) scatters; F.sdpa would drop the pad mask."""
+    sdpa = {"n": 0}
+    packed = {"n": 0}
+    real_sdpa = encoder_attn.F.scaled_dot_product_attention
+    real_packed = encoder_attn._packed_masked_attention
+
+    def count_sdpa(*args, **kwargs):
+        sdpa["n"] += 1
+        return real_sdpa(*args, **kwargs)
+
+    def count_packed(*args, **kwargs):
+        packed["n"] += 1
+        return real_packed(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn.F, "scaled_dot_product_attention", count_sdpa)
+    monkeypatch.setattr(encoder_attn, "_packed_masked_attention", count_packed)
+    impl, fwd, query, _meta = _b1_dense_forward_setup(total_tokens=5)
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert packed["n"] == 1
+    assert sdpa["n"] == 0
+
+
+def test_packed_masked_qk_matches_softmax_reference():
+    torch.manual_seed(0)
+    batch, heads, length, dim = 1, 4, 64, 64
+    query = torch.randn(batch, heads, length, dim)
+    key = torch.randn(batch, heads, length, dim)
+    value = torch.randn(batch, heads, length, dim)
+    real_len = 5
+    mask = build_attention_mask(1, length, [real_len], [real_len], dtype=query.dtype)
+    scale = dim**-0.5
+    key_pad = encoder_attn.host_key_pad_mask(mask, heads)
+    got = encoder_attn._packed_masked_attention(query, key, value, key_pad, scale, False)
+    ref = torch.matmul(
+        torch.softmax(
+            torch.matmul(query, key.transpose(-2, -1)) * scale + mask[:, :, :1, :],
+            dim=-1,
+        ),
+        value,
+    )
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_packed_attention_compiles_matmul_without_mask(monkeypatch) -> None:
+    """Serve must not compile ``matmul + mask`` (Inductor → SDPA drops pad)."""
+    seen: list[str] = []
+    real = encoder_attn._compile_if_spyre
+
+    def rec(cache, kernel, enable_gqa, device_type):
+        seen.append(kernel.__name__)
+        return real(cache, kernel, enable_gqa, device_type)
+
+    monkeypatch.setattr(encoder_attn, "_compile_if_spyre", rec)
+    torch.manual_seed(0)
+    batch, heads, length, dim = 2, 4, 64, 64
+    query = torch.randn(batch, heads, length, dim)
+    key = torch.randn(batch, heads, length, dim)
+    value = torch.randn(batch, heads, length, dim)
+    mask = build_attention_mask(batch, length, [5, 12], [5, 12], dtype=query.dtype)
+    key_pad = encoder_attn.host_key_pad_mask(mask, heads)
+    encoder_attn._packed_masked_attention(query, key, value, key_pad, dim**-0.5, False)
+    assert seen == ["_packed_qk_matmul", "_packed_pv"]
 
 
 def _assert_scatter_matches_gather(
@@ -703,6 +850,19 @@ def test_scatter_pack_matches_gather_b4_pad():
         heads=2,
         dim=8,
     )
+
+
+def test_scatter_pack_strided_qkv_source_matches_contiguous():
+    """Fused QKV views are not contiguous; scatter must densify before index_copy."""
+    torch.manual_seed(0)
+    t, h, d = 8, 4, 8
+    qkv = torch.randn(t, 3 * h * d)
+    q = qkv[:, : h * d].view(t, h, d)
+    assert not q.is_contiguous()
+    dest = host_scatter_pack_dest([0, 4], [4, 4], 8, 8, dummy_row=16)
+    got = scatter_pack(q, dest, batch=2, aligned_len=8, head_size_padded=d)
+    ref = scatter_pack(q.contiguous(), dest, batch=2, aligned_len=8, head_size_padded=d)
+    torch.testing.assert_close(got, ref)
 
 
 def _count_select_rows(monkeypatch):
