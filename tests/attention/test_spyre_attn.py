@@ -32,6 +32,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _create_compilable_bucketed_decode_attn,
     _mirror_mask_tiles,
+    _stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
@@ -1799,7 +1800,9 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
     k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
-    block_ids = torch.arange(n_pages, dtype=torch.int64)
+    # [num_blocks, stick-padded num_seqs]: row b holds each sequence's b-th page.
+    block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
+    block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
     mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
     query_row_ids = torch.arange(num_seqs, dtype=torch.int64)
     # Trailing None is the `out` buffer; unused because store_out defaults to False.
