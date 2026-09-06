@@ -36,9 +36,7 @@ def test_offset_roberta_position_ids_runs_on_cpu(monkeypatch):
             pass
         return out
 
-    monkeypatch.setattr(
-        "spyre_inference.models.roberta.convert", fake_convert
-    )
+    monkeypatch.setattr("spyre_inference.models.roberta.convert", fake_convert)
 
     pos = torch.tensor([0, 1, 2], dtype=torch.int64)
     out = offset_roberta_position_ids(pos, padding_idx=1, device=torch.device("meta"))
@@ -61,9 +59,7 @@ def test_wrapper_converts_ints_to_int64(monkeypatch):
         def forward(self, input_ids=None, positions=None, **kwargs):
             return {"input_ids": input_ids, "positions": positions}
 
-    wrapper = mr._SpyreModelWrapper(
-        _Capture(), torch.device("cpu"), keep_outputs_on_device=True
-    )
+    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("cpu"), keep_outputs_on_device=True)
     out = wrapper(
         input_ids=torch.tensor([1, 2], dtype=torch.int32),
         positions=torch.tensor([0, 1], dtype=torch.int32),

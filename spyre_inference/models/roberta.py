@@ -75,9 +75,7 @@ class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
             inputs_embeds
             + self.spyre_token_type_embeddings(input_ids)
             + self.position_embeddings(
-                offset_roberta_position_ids(
-                    position_ids, self.padding_idx, input_ids.device
-                )
+                offset_roberta_position_ids(position_ids, self.padding_idx, input_ids.device)
             )
         )
         return self.LayerNorm(embeddings)

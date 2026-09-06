@@ -594,20 +594,13 @@ def test_b1_dense_forward_skips_scatter_pack(monkeypatch, default_vllm_config) -
 @torch.inference_mode()
 def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> None:
     """Fused B=1 path does not H2D dest, unpack, or a zeros L×L mask."""
-    dest_calls = {"n": 0}
     idx_calls = {"n": 0}
-    real_dest = encoder_attn._dest_for_device
     real_idx = encoder_attn._indices_for_device
-
-    def count_dest(*args, **kwargs):
-        dest_calls["n"] += 1
-        return real_dest(*args, **kwargs)
 
     def count_idx(*args, **kwargs):
         idx_calls["n"] += 1
         return real_idx(*args, **kwargs)
 
-    monkeypatch.setattr(encoder_attn, "_dest_for_device", count_dest)
     monkeypatch.setattr(encoder_attn, "_indices_for_device", count_idx)
     pad_calls = {"n": 0}
     real_pad = encoder_attn.host_key_pad_mask
@@ -627,7 +620,6 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
     monkeypatch.setattr(encoder_attn, "build_attention_mask", count_mask)
     impl, fwd, query, meta = _b1_dense_forward_setup()
     impl.forward(**fwd, output=torch.empty_like(query))
-    assert dest_calls["n"] == 0
     assert idx_calls["n"] == 0
     assert pad_calls["n"] == 0
     assert mask_calls["n"] == 0

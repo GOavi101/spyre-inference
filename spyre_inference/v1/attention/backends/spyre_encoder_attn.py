@@ -188,9 +188,7 @@ def _is_b1_dense_body(batch: int, num_src: int, aligned_len: int) -> bool:
     return batch == 1 and num_src == aligned_len
 
 
-def _is_b1_fused_sdpa(
-    batch: int, padded_tokens: int, aligned_len: int, real_len: int
-) -> bool:
+def _is_b1_fused_sdpa(batch: int, padded_tokens: int, aligned_len: int, real_len: int) -> bool:
     """Compiled permute+SDPA is only legal when the mask is dense (no live pad)."""
     return _is_b1_dense_body(batch, padded_tokens, aligned_len) and real_len == aligned_len
 
@@ -201,7 +199,7 @@ def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor
     return dst
 
 
-_compiled_index_copy: object | None = None
+_compiled_index_copy: dict[bool, object] = {}
 _compiled_b1_sdpa: dict[bool, object] = {}
 _compiled_packed_qk: dict[bool, object] = {}
 _compiled_packed_pv: dict[bool, object] = {}
@@ -250,9 +248,7 @@ def _b1_sdpa_kernel_gqa(
     q = query.unsqueeze(0).transpose(1, 2)
     k = key.unsqueeze(0).transpose(1, 2)
     v = value.unsqueeze(0).transpose(1, 2)
-    out = F.scaled_dot_product_attention(
-        q, k, v, is_causal=False, scale=scale, enable_gqa=True
-    )
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=False, scale=scale, enable_gqa=True)
     t, h, d = query.shape
     return out.transpose(1, 2).reshape(t, h, d)
 
@@ -335,12 +331,10 @@ def _b1_dense_attention(
 
 def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     """Eager on CPU; compiled ``index_copy_`` on Spyre (eager falls back / rejects)."""
-    global _compiled_index_copy
     if dst.device.type != "spyre":
         return _index_copy_kernel(dst, index, src)
-    if _compiled_index_copy is None:
-        _compiled_index_copy = torch.compile(_index_copy_kernel, dynamic=False)
-    return _compiled_index_copy(dst, index, src)
+    compiled = _compile_if_spyre(_compiled_index_copy, _index_copy_kernel, False, dst.device.type)
+    return compiled(dst, index, src)
 
 
 def _dest_on_flat_device(dest_idx: torch.Tensor, flat: torch.Tensor) -> torch.Tensor:
@@ -465,15 +459,10 @@ def gather_unpack(
 
 
 def _indices_for_device(indices: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move unpack indices onto ``device`` once. Spyre index_select is int32."""
-    if device.type == "spyre":
-        cpu = indices if indices.device.type == "cpu" else indices.cpu()
-        return convert(cpu.to(torch.int32), device)
-    return indices.to(device=device, dtype=torch.long)
+    """Move pack dest / unpack indices onto ``device`` once.
 
-
-def _dest_for_device(indices: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move scatter dest onto ``device`` once. Spyre compiled index_copy_ is int32."""
+    Spyre ``index_select`` and compiled ``index_copy_`` want int32; CPU wants int64.
+    """
     if device.type == "spyre":
         cpu = indices if indices.device.type == "cpu" else indices.cpu()
         return convert(cpu.to(torch.int32), device)
@@ -585,8 +574,8 @@ def _ensure_encoder_pack(
         attn_metadata.encoder_kv_pack_idx = kv_dest
         attn_metadata.encoder_unpack_idx = unpack_idx
     else:
-        attn_metadata.encoder_q_pack_idx = _dest_for_device(q_dest, target_device)
-        attn_metadata.encoder_kv_pack_idx = _dest_for_device(kv_dest, target_device)
+        attn_metadata.encoder_q_pack_idx = _indices_for_device(q_dest, target_device)
+        attn_metadata.encoder_kv_pack_idx = _indices_for_device(kv_dest, target_device)
         attn_metadata.encoder_unpack_idx = _indices_for_device(unpack_idx, target_device)
     attn_metadata.encoder_attn_mask = mask
     attn_metadata.encoder_key_pad_mask = key_pad
