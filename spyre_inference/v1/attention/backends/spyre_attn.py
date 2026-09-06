@@ -40,6 +40,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    default_encoder_len_buckets,
+    pooling_warmup_shapes,
+)
 
 logger = init_logger(__name__)
 
@@ -641,6 +645,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             static_ctx[name] for name in layer_names if name in static_ctx
         )
 
+        sched = vllm_config.scheduler_config
+        self._max_num_seqs = sched.max_num_seqs
+        self._max_model_len = model_config.max_model_len
+        self._max_num_batched_tokens = sched.max_num_batched_tokens
+        self._encoder_shapes = pooling_warmup_shapes(
+            max_num_seqs=self._max_num_seqs,
+            max_model_len=self._max_model_len,
+            max_num_batched_tokens=self._max_num_batched_tokens,
+            len_ladder=default_encoder_len_buckets(self._max_model_len),
+        )
+
         # Bucket lattices for the bucketed decode fast path. One compiled kernel
         # per bucket. TODO: expose as engine args if configurability is needed.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -1029,6 +1044,26 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     .reshape(b_blocks, b_seqs * self.num_kv_heads, 1, block_size)
                     .contiguous()
                 )
+
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+            fused_encoder_sdpa_from_common,
+        )
+
+        attn_layer.publish_encoder_fused(
+            fused_encoder_sdpa_from_common(
+                num_seqs=num_seqs,
+                padded_tokens=int(common_attn_metadata.num_actual_tokens),
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                num_actual_tokens=int(common_attn_metadata.num_actual_tokens),
+                causal=bool(causal),
+                head_size=self.head_size,
+                encoder_shapes=self._encoder_shapes,
+                max_num_seqs=self._max_num_seqs,
+                max_model_len=self._max_model_len,
+                max_num_batched_tokens=self._max_num_batched_tokens,
+            )
+        )
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,

@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre ``Attention.forward``: the KV write is traced, the attention core stays opaque.
+"""Spyre ``Attention.forward`` patches applied by the metadata builder.
 
-``install()``, called from the attention metadata builder, binds the forward below onto
-each eligible layer instance; every other ``Attention`` keeps upstream's forward and its
-``unified_kv_cache_update`` op. The core must stay opaque: its per-sequence Python loop
-cannot be captured with ``fullgraph=True``.
+Decoder: the KV write is traced; the attention core stays an opaque custom op
+(its per-sequence Python loop cannot be captured with ``fullgraph=True``).
+
+Encoder: fused B=1 (``T == L`` and no live pad, stick-aligned head dim) runs
+permute+SDPA in this forward so block ``torch.compile`` captures it — one graph
+per layer, not block + nested SDPA. Live pad / MiniLM still use
+``unified_attention_with_output`` so Inductor cannot rewrite ``matmul + mask``
+to unmasked SDPA (BGE cosine ~0.46).
 """
 
 import types
@@ -78,6 +82,17 @@ class SlotMapping:
 
 
 _holders: weakref.WeakSet[SlotMapping] = weakref.WeakSet()
+_encoder_layers: weakref.WeakSet[Attention] = weakref.WeakSet()
+
+
+def publish_encoder_fused(fused: bool) -> None:
+    """Tell encoder layers whether this step is fused B=1 SDPA (no custom op).
+
+    Dynamo specializes on the Python bool, so a later padded step recompiles
+    the block with the opaque path instead of baking unmasked SDPA into BGE.
+    """
+    for layer in _encoder_layers:
+        layer.spyre_fused_sdpa = fused  # ty: ignore[invalid-assignment]
 
 
 def publish_null_slots(num_tokens: int) -> None:
@@ -130,6 +145,57 @@ def _spyre_attention_forward(
     return output.view(-1, hidden_size)
 
 
+def _spyre_encoder_attention_forward(
+    self: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_shape: torch.Size | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Fused B=1: inline SDPA into the block graph. Pad: opaque custom op."""
+    if output_dtype is None:
+        output_dtype = query.dtype
+    if output_shape is None:
+        output_shape = torch.Size((query.shape[0], self.num_heads * self.head_size_v))
+    hidden_size = output_shape[-1]
+
+    query = query.view(-1, self.num_heads, self.head_size)
+    if key is not None:
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+    if value is not None:
+        value = value.view(-1, self.num_kv_heads, self.head_size_v)
+
+    if getattr(self, "spyre_fused_sdpa", False):
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+            _align_up,
+            _b1_dense_attention,
+        )
+
+        head_size = query.shape[2]
+        result = _b1_dense_attention(
+            query,
+            key,
+            value,
+            self.impl.scale,
+            self.num_kv_heads != self.num_heads,
+            _align_up(head_size),
+            head_size,
+        )
+        return result.reshape(-1, hidden_size)
+
+    output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+    output = output.view(-1, self.num_heads, self.head_size_v)
+    torch.ops.vllm.unified_attention_with_output(
+        query,  # ty: ignore[invalid-argument-type]
+        key,  # ty: ignore[invalid-argument-type]
+        value,  # ty: ignore[invalid-argument-type]
+        output,  # ty: ignore[invalid-argument-type]
+        _encode_layer_name(self.layer_name),  # ty: ignore[invalid-argument-type]
+    )
+    return output.view(-1, hidden_size)
+
+
 def _can_split(layer: Attention) -> bool:
     """Only Spyre paged attention, and only where upstream's own prologue is a no-op."""
     return (
@@ -142,9 +208,14 @@ def _can_split(layer: Attention) -> bool:
     )
 
 
+def _is_encoder_attn(layer: Attention) -> bool:
+    return layer.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY)
+
+
 def install(layers: Iterable[Attention]) -> SlotMapping:
-    """Opt eligible layers into the traced KV write; returns their shared slot holder."""
+    """Patch decoder KV scatter and encoder fused-SDPA inlining; return slot holder."""
     split = [layer for layer in layers if _can_split(layer)]
+    encoders = [layer for layer in layers if _is_encoder_attn(layer)]
     slot_mapping = SlotMapping(split)
     _holders.add(slot_mapping)
 
@@ -154,9 +225,21 @@ def install(layers: Iterable[Attention]) -> SlotMapping:
             _spyre_attention_forward, layer
         )
 
+    for layer in encoders:
+        layer.spyre_fused_sdpa = False  # ty: ignore[invalid-assignment]
+        layer.forward = types.MethodType(  # ty: ignore[invalid-assignment]
+            _spyre_encoder_attention_forward, layer
+        )
+        _encoder_layers.add(layer)
+
     if split:
         logger.info(
             "Scattering the KV cache inside the outer graph for %d attention layers.",
             len(split),
+        )
+    if encoders:
+        logger.info(
+            "Inlining fused B=1 encoder SDPA into the block graph for %d layers.",
+            len(encoders),
         )
     return slot_mapping

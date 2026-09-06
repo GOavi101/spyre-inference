@@ -1612,12 +1612,18 @@ def test_install_patches_layers_not_the_attention_class():
     assert Attention.forward is class_forward
     assert decoder.spyre_slots is holder
     assert decoder.forward.__func__ is attn_layer._spyre_attention_forward
+    assert encoder.forward.__func__ is attn_layer._spyre_encoder_attention_forward
+    assert encoder.spyre_fused_sdpa is False
     assert not hasattr(encoder, "spyre_slots")
-    assert not hasattr(encoder, "forward")
 
     # No cache bound, so there is no device to mirror onto and nothing to publish.
     holder.publish_null(8)
     assert holder.slots is None
+
+    attn_layer.publish_encoder_fused(True)
+    assert encoder.spyre_fused_sdpa is True
+    attn_layer.publish_encoder_fused(False)
+    assert encoder.spyre_fused_sdpa is False
 
 
 @pytest.mark.parametrize(

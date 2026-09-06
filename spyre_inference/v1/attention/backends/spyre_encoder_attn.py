@@ -22,8 +22,9 @@ slot-major workspace (decoder KV / torch-spyre#3705) so ``view(B, L, …)``
 is address-order-preserving. Default-layout ``view`` after ``index_copy_``
 scrambles B>1 (real-slot cosine ~0.07). Body-pad dests write an extra
 dummy row (not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1``
-with ``T == L`` and a full prompt compiles permute+SDPA (no ``attn_mask``).
-Any live pad uses packed QK: compile matmul only, eager pad add, compile P·V
+with ``T == L`` and a full prompt inlines permute+SDPA into the block graph
+(no ``attn_mask``, no nested SDPA compile). Any live pad uses packed QK via
+the opaque custom op: compile matmul only, eager pad add, compile P·V
 (Inductor ``matmul + mask`` → ``F.sdpa`` drops the mask; BGE cosine
 ~0.46). Dest/mask use ``min(qsl, seq_lens, num_actual_tokens)``.
 Dest/unpack stay on host when ``T == L``. Pack tensors are built once
@@ -195,6 +196,47 @@ def _is_b1_fused_sdpa(
     return _is_b1_dense_body(batch, padded_tokens, aligned_len) and real_len == aligned_len
 
 
+def fused_encoder_sdpa_from_common(
+    *,
+    num_seqs: int,
+    padded_tokens: int,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_actual_tokens: int,
+    causal: bool,
+    head_size: int,
+    encoder_shapes: list[tuple[int, int]],
+    max_num_seqs: int,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+) -> bool:
+    """True when this step can inline unmasked SDPA into the block graph.
+
+    MiniLM (head dim not stick-aligned) stays on the custom op: crop/flat write
+    is a D2H. Live pad stays packed so Inductor cannot drop the mask.
+    """
+    if causal or num_seqs != 1:
+        return False
+    if head_size % ENCODER_SEQ_ALIGNMENT != 0:
+        return False
+    qsl = query_start_loc.cpu()
+    qsl_lens = torch.diff(qsl).tolist()[:num_seqs]
+    kv_lens = seq_lens.cpu().tolist()[:num_seqs]
+    max_len = max(_content_query_lens(qsl_lens, kv_lens), default=0)
+    real_lens = _content_query_lens(qsl_lens, kv_lens, num_actual_tokens=num_actual_tokens)
+    real_len = real_lens[0] if real_lens else 0
+    pair = pick_encoder_attention_shape(
+        num_seqs,
+        max_len,
+        encoder_shapes,
+        max_num_seqs,
+        max_model_len,
+        max_num_batched_tokens,
+    )
+    aligned_len = pair[1] if pair is not None else _align_up(max_len)
+    return _is_b1_fused_sdpa(1, padded_tokens, aligned_len, real_len)
+
+
 def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     """Tiny mutation, compiled alone — do not fuse with SDPA."""
     dst.index_copy_(0, index, src)
@@ -219,6 +261,11 @@ def _compile_if_spyre(cache: dict[bool, object], kernel, enable_gqa: bool, devic
         compiled = torch.compile(kernel, dynamic=False)
         cache[enable_gqa] = compiled
     return compiled
+
+
+def _nested_compile_fused_sdpa(device_type: str) -> bool:
+    """Nested SDPA compile only when this Python is the outermost graph."""
+    return device_type == "spyre" and not torch.compiler.is_compiling()
 
 
 def _b1_sdpa_kernel(
@@ -319,12 +366,20 @@ def _b1_dense_attention(
     head_size_padded: int,
     head_size: int,
 ) -> torch.Tensor:
-    """B=1 ``T==L`` full-bucket attention. Dest/unpack/mask unused. Compiled permute+SDPA."""
+    """B=1 ``T==L`` full-bucket attention. Dest/unpack/mask unused.
+
+    Nested ``torch.compile`` only when this is the outermost graph. Inside a
+    compiled Bert block the permute+SDPA is traced into that graph.
+    """
     query = _pad_head_dim_to_stick(query, head_size_padded)
     key = _pad_head_dim_to_stick(key, head_size_padded)
     value = _pad_head_dim_to_stick(value, head_size_padded)
     kernel = _b1_sdpa_kernel_gqa if enable_gqa else _b1_sdpa_kernel
-    kernel = _compile_if_spyre(_compiled_b1_sdpa, kernel, enable_gqa, query.device.type)
+    # Nested compile only when this is the outermost graph (custom-op / eager).
+    # Inside block ``torch.compile`` leave the permute+SDPA as FX so it fuses
+    # with QKV/FFN. Do not compile the padded path here.
+    if _nested_compile_fused_sdpa(query.device.type):
+        kernel = _compile_if_spyre(_compiled_b1_sdpa, kernel, enable_gqa, query.device.type)
     result = kernel(query, key, value, scale)
     if result.shape[-1] == head_size:
         return result
@@ -647,9 +702,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ``attn_type`` branch. Setup is shared with the paged decoder impl; forward
     packs Q/K/V with scatter into a slot-major workspace (decoder KV
     layout; extra dummy row for body-pad), then attention and gather-unpack.
-    ``B=1`` ``T == L`` with a full prompt compiles permute+SDPA; live pad
-    uses packed QK (matmul and P·V compiled apart so Inductor cannot fuse
-    to ``F.sdpa``).
+    ``B=1`` ``T == L`` with a full prompt inlines permute+SDPA into the
+    compiled block (no nested SDPA graph). Live pad uses packed QK (matmul
+    and P·V compiled apart so Inductor cannot fuse to ``F.sdpa``).
     """
 
     def __init__(self, *args, **kwargs) -> None:

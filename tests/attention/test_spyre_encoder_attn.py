@@ -29,8 +29,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     _content_query_lens,
+    _nested_compile_fused_sdpa,
     build_attention_mask,
     dummy_pack_row,
+    fused_encoder_sdpa_from_common,
     gather_pack,
     gather_unpack,
     host_pack_indices,
@@ -586,6 +588,120 @@ def test_b1_dense_forward_skips_scatter_pack(monkeypatch, default_vllm_config) -
     impl, fwd, query, _meta = _b1_dense_forward_setup()
     impl.forward(**fwd, output=torch.empty_like(query))
     assert calls["n"] == 0
+
+
+def _full_bucket_shapes(max_len: int = 512):
+    from spyre_inference.v1.worker.spyre_shape_bucketer import (
+        default_encoder_len_buckets,
+        pooling_warmup_shapes,
+    )
+
+    return pooling_warmup_shapes(
+        1, max_len, max_len, default_encoder_len_buckets(max_len)
+    )
+
+
+def test_fused_encoder_sdpa_from_common_full_bucket() -> None:
+    shapes = _full_bucket_shapes()
+    kwargs = dict(
+        num_seqs=1,
+        padded_tokens=64,
+        query_start_loc=torch.tensor([0, 64], dtype=torch.int32),
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        num_actual_tokens=64,
+        encoder_shapes=shapes,
+        max_num_seqs=1,
+        max_model_len=512,
+        max_num_batched_tokens=512,
+    )
+    assert fused_encoder_sdpa_from_common(causal=False, head_size=64, **kwargs)
+    assert not fused_encoder_sdpa_from_common(causal=True, head_size=64, **kwargs)
+    assert not fused_encoder_sdpa_from_common(causal=False, head_size=32, **kwargs)
+
+
+def test_fused_encoder_sdpa_from_common_rejects_live_pad() -> None:
+    shapes = _full_bucket_shapes()
+    assert not fused_encoder_sdpa_from_common(
+        num_seqs=1,
+        padded_tokens=64,
+        query_start_loc=torch.tensor([0, 64], dtype=torch.int32),
+        seq_lens=torch.tensor([5], dtype=torch.int32),
+        num_actual_tokens=5,
+        causal=False,
+        head_size=64,
+        encoder_shapes=shapes,
+        max_num_seqs=1,
+        max_model_len=512,
+        max_num_batched_tokens=512,
+    )
+
+
+def test_nested_compile_fused_sdpa_skipped_while_tracing(monkeypatch) -> None:
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert _nested_compile_fused_sdpa("spyre") is False
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    assert _nested_compile_fused_sdpa("spyre") is True
+    assert _nested_compile_fused_sdpa("cpu") is False
+
+
+def test_encoder_fused_forward_inlines_sdpa_not_custom_op(monkeypatch) -> None:
+    """Fused flag skips unified_attention so block compile can capture F.sdpa."""
+    from spyre_inference.v1.attention import attn_layer
+
+    custom = {"n": 0}
+
+    def boom(*args, **kwargs):
+        custom["n"] += 1
+        raise AssertionError("padded custom op must not run on fused B=1")
+
+    monkeypatch.setattr(attn_layer.torch.ops.vllm, "unified_attention_with_output", boom)
+
+    class _Layer:
+        num_heads = 2
+        num_kv_heads = 2
+        head_size = 64
+        head_size_v = 64
+        layer_name = "encoder.0"
+        impl = type("I", (), {"scale": 64**-0.5})()
+        spyre_fused_sdpa = True
+
+    layer = _Layer()
+    t, h, d = 8, 2, 64
+    query = torch.randn(t, h * d, dtype=torch.float32)
+    key = torch.randn(t, h * d, dtype=torch.float32)
+    value = torch.randn(t, h * d, dtype=torch.float32)
+    out = attn_layer._spyre_encoder_attention_forward(layer, query, key, value)
+    assert out.shape == (t, h * d)
+    assert custom["n"] == 0
+    assert torch.isfinite(out).all()
+
+
+def test_encoder_padded_forward_uses_custom_op(monkeypatch) -> None:
+    from spyre_inference.v1.attention import attn_layer
+
+    called = {"n": 0}
+
+    def fake(query, key, value, output, *args, **kwargs):
+        called["n"] += 1
+        output.copy_(query)
+
+    monkeypatch.setattr(attn_layer.torch.ops.vllm, "unified_attention_with_output", fake)
+
+    class _Layer:
+        num_heads = 2
+        num_kv_heads = 2
+        head_size = 64
+        head_size_v = 64
+        layer_name = "encoder.0"
+        impl = type("I", (), {"scale": 64**-0.5})()
+        spyre_fused_sdpa = False
+
+    layer = _Layer()
+    t, h, d = 8, 2, 64
+    query = torch.randn(t, h * d, dtype=torch.float32)
+    out = attn_layer._spyre_encoder_attention_forward(layer, query, query, query)
+    assert called["n"] == 1
+    assert out.shape == (t, h * d)
 
 
 @torch.inference_mode()
