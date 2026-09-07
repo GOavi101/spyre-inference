@@ -1200,23 +1200,18 @@ def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
-        "same weight sustains with a full 8-row block, so padding the activation out "
-        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
-        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
-        "constants it reads. Tracked by torch-spyre#4032."
-    ),
-)
 def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
-    """A 1-row GEMM should not cost more than the same weight against 8 rows."""
+    """1-row granite gate/up GEMM must stay as fast as an 8-row block.
+
+    torch-spyre#4032 used to make the 1-row path far slower, so merged-column
+    linears padded activations to `_PAD_ROWS`. That workaround is gone; this
+    probe is the regression that it stay gone.
+    """
     import time
 
     from torch_spyre.streams import synchronize
 
-    # granite-3.3-8b's gate_up_proj weight_t -- the shape the workaround targets.
+    # granite-3.3-8b's gate_up_proj weight_t.
     weight = torch.randn(4096, 25600, dtype=torch.float16, device=spyre_device)
     activations = {
         m: torch.randn(m, 4096, dtype=torch.float16, device=spyre_device) for m in (1, 8)
