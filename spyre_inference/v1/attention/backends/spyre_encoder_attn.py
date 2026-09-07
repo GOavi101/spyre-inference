@@ -32,6 +32,9 @@ per step.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
@@ -200,14 +203,18 @@ def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor
     return dst
 
 
-_compiled_index_copy: object | None = None
-_compiled_packed_qk: object | None = None
-_compiled_packed_pv: object | None = None
-_compiled_b1_sdpa: object | None = None
-_compiled_b1_sdpa_gqa: object | None = None
+_CompiledFn = Callable[..., torch.Tensor]
+
+_compiled_index_copy: _CompiledFn | None = None
+_compiled_packed_qk: _CompiledFn | None = None
+_compiled_packed_pv: _CompiledFn | None = None
+_compiled_b1_sdpa: _CompiledFn | None = None
+_compiled_b1_sdpa_gqa: _CompiledFn | None = None
 
 
-def _compile_if_spyre(cached: object | None, kernel, device_type: str) -> object:
+def _compile_if_spyre(
+    cached: _CompiledFn | None, kernel: _CompiledFn, device_type: str
+) -> _CompiledFn:
     """Compile ``kernel`` once on Spyre. CPU always runs ``kernel``.
 
     Packed QK/P·V derive G from shapes; index_copy_ has one graph. Callers
@@ -216,7 +223,7 @@ def _compile_if_spyre(cached: object | None, kernel, device_type: str) -> object
     if device_type != "spyre":
         return kernel
     if cached is None:
-        return torch.compile(kernel, dynamic=False)
+        return cast(_CompiledFn, torch.compile(kernel, dynamic=False))
     return cached
 
 
