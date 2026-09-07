@@ -85,9 +85,12 @@ def _content_query_lens(
 ) -> list[int]:
     """Per-seq counts for dest/mask. ``query_start_loc`` can include 1D body pad.
 
-    When qsl and ``seq_lens`` are both the body bucket, ``num_actual_tokens``
-    (unpadded scheduled count) still marks pad. B=1 is ``min(qsl, seq, n)``.
-    B>1 shrinks the tail: runner pad is appended after the last sequence.
+    When B=1 qsl and ``seq_lens`` are both the body bucket, ``num_actual_tokens``
+    (unpadded scheduled count) still marks pad: ``min(qsl, seq, n)``.
+
+    B>1 does not redistribute. The runner 1D-pads the concatenated body
+    (suffix after the last sequence); per-seq padded qsl cannot occur. Shrinking
+    the tail would turn real ``[5, 12]`` reported as ``[32, 32]`` into ``[17, 0]``.
     """
     out = [min(int(q), int(k)) for q, k in zip(qsl_lens, kv_lens)]
     if not out or num_actual_tokens is None:
@@ -97,14 +100,12 @@ def _content_query_lens(
         out[0] = min(out[0], n)
         return out
     excess = sum(out) - n
-    if excess <= 0:
-        return out
-    for i in range(len(out) - 1, -1, -1):
-        take = min(out[i], excess)
-        out[i] -= take
-        excess -= take
-        if excess == 0:
-            break
+    if excess > 0:
+        raise AssertionError(
+            f"B>1 query_start_loc/seq_lens include {excess} pad tokens "
+            f"(lens={out}, num_actual_tokens={n}). Per-seq padded qsl is "
+            "unsupported; 1D body pad is a suffix after the last sequence."
+        )
     return out
 
 
@@ -199,24 +200,24 @@ def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor
     return dst
 
 
-_compiled_index_copy: dict[bool, object] = {}
-_compiled_b1_sdpa: dict[bool, object] = {}
-_compiled_packed_qk: dict[bool, object] = {}
-_compiled_packed_pv: dict[bool, object] = {}
-# Cached on fused B=1 so later layers skip dest/mask build. ``numel()==0`` is
-# the forward sentinel — do not convert or H2D this.
-_FUSED_NO_MASK = torch.empty(0)
+_compiled_index_copy: object | None = None
+_compiled_packed_qk: object | None = None
+_compiled_packed_pv: object | None = None
+_compiled_b1_sdpa: object | None = None
+_compiled_b1_sdpa_gqa: object | None = None
 
 
-def _compile_if_spyre(cache: dict[bool, object], kernel, enable_gqa: bool, device_type: str):
-    """Compile one kernel on Spyre. QK and P·V must not share a graph (SDPA fusion)."""
+def _compile_if_spyre(cached: object | None, kernel, device_type: str) -> object:
+    """Compile ``kernel`` once on Spyre. CPU always runs ``kernel``.
+
+    Packed QK/P·V derive G from shapes; index_copy_ has one graph. Callers
+    assign the return value back into their module-level slot on Spyre.
+    """
     if device_type != "spyre":
         return kernel
-    compiled = cache.get(enable_gqa)
-    if compiled is None:
-        compiled = torch.compile(kernel, dynamic=False)
-        cache[enable_gqa] = compiled
-    return compiled
+    if cached is None:
+        return torch.compile(kernel, dynamic=False)
+    return cached
 
 
 def _b1_sdpa_kernel(
@@ -254,7 +255,14 @@ def _b1_sdpa_kernel_gqa(
 
 
 def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
-    """CPU ``[B,1,L,L]`` → dense ``[B*KV, 1, L, L]``. Spyre cannot broadcast key-pad."""
+    """CPU ``[B,1,L,L]`` → dense ``[B*KV, 1, L, L]`` for eager ``scores + mask``.
+
+    Same key-pad row is repeated across KV and query-L. ``[B*KV, 1, 1, L]``
+    was tried (decoder ``mask_by_block``). Decode gets away with that shape
+    because Q=1; encoder scores are ``[BH, G, L, L]``. Eager Spyre add does
+    not broadcast ``1 → L`` on the query axis (no stick-scatter). Prefill
+    tiles are already ``[Q, block]``. Densify on the host once per step.
+    """
     key = mask[:, :, :1, :]
     batch, _, _, length = key.shape
     return (
@@ -279,6 +287,10 @@ def _packed_pv(scores: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
     g = scores.shape[1]
     v = value.reshape(batch * hkv, 1, length, dim)
     scores_max = torch.amax(scores, dim=-1, keepdim=True)
+    # Dummy seqs (batch_bucket > num_seqs) have all-inf key_pad, so
+    # scores - scores_max is NaN. Decoder documents the same hazard where an
+    # in-graph store would publish it (spyre_attn mask_bs_bb[num_seqs:, 0]).
+    # Safe here: unpack only gathers orig_query_lens rows, never those seqs.
     probs = torch.exp(scores - scores_max)
     out = torch.matmul(probs, v) / probs.sum(dim=-1, keepdim=True)
     return out.reshape(batch, hkv * g, length, dim)
@@ -290,18 +302,22 @@ def _packed_masked_attention(
     value: torch.Tensor,
     mask: torch.Tensor,
     scale: float,
-    enable_gqa: bool,
 ) -> torch.Tensor:
     """Scatter-path attention. Compile QK and P·V separately; pad add is eager.
 
     Compiling ``matmul + mask`` lets Inductor rewrite to ``F.sdpa``, which drops
     ``attn_mask`` on Spyre (BGE cosine ~0.46).
     """
+    global _compiled_packed_qk, _compiled_packed_pv
     device_type = query.device.type
-    qk = _compile_if_spyre(_compiled_packed_qk, _packed_qk_matmul, enable_gqa, device_type)
-    pv = _compile_if_spyre(_compiled_packed_pv, _packed_pv, enable_gqa, device_type)
+    qk = _compile_if_spyre(_compiled_packed_qk, _packed_qk_matmul, device_type)
+    pv = _compile_if_spyre(_compiled_packed_pv, _packed_pv, device_type)
+    if device_type == "spyre":
+        _compiled_packed_qk = qk
+        _compiled_packed_pv = pv
     scores = qk(query, key, scale)
     if mask.shape != scores.shape:
+        # GQA: ``[B*KV, 1, L, L]`` → ``[B*KV, G, L, L]``. Query-L is already dense.
         mask = mask.expand_as(scores).contiguous()
     return pv(scores + mask, value)
 
@@ -320,7 +336,14 @@ def _b1_dense_attention(
     key = _pad_head_dim_to_stick(key, head_size_padded)
     value = _pad_head_dim_to_stick(value, head_size_padded)
     kernel = _b1_sdpa_kernel_gqa if enable_gqa else _b1_sdpa_kernel
-    kernel = _compile_if_spyre(_compiled_b1_sdpa, kernel, enable_gqa, query.device.type)
+    global _compiled_b1_sdpa, _compiled_b1_sdpa_gqa
+    cached = _compiled_b1_sdpa_gqa if enable_gqa else _compiled_b1_sdpa
+    kernel = _compile_if_spyre(cached, kernel, query.device.type)
+    if query.device.type == "spyre":
+        if enable_gqa:
+            _compiled_b1_sdpa_gqa = kernel
+        else:
+            _compiled_b1_sdpa = kernel
     result = kernel(query, key, value, scale)
     if result.shape[-1] == head_size:
         return result
@@ -331,9 +354,11 @@ def _b1_dense_attention(
 
 def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     """Eager on CPU; compiled ``index_copy_`` on Spyre (eager falls back / rejects)."""
+    global _compiled_index_copy
     if dst.device.type != "spyre":
         return _index_copy_kernel(dst, index, src)
-    compiled = _compile_if_spyre(_compiled_index_copy, _index_copy_kernel, False, dst.device.type)
+    compiled = _compile_if_spyre(_compiled_index_copy, _index_copy_kernel, dst.device.type)
+    _compiled_index_copy = compiled
     return compiled(dst, index, src)
 
 
@@ -369,6 +394,29 @@ def _zeros_slot_major(
     ).zero_()
 
 
+def _cached_encoder_workspace(
+    attn_metadata: SpyreAttentionMetadata,
+    attr: str,
+    rows: int,
+    num_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Reuse the step's slot-major scratch; allocate on first pack."""
+    workspace = getattr(attn_metadata, attr)
+    if (
+        workspace is not None
+        and workspace.shape == (rows, num_heads, head_size)
+        and workspace.dtype == dtype
+        and workspace.device.type == device.type
+    ):
+        return workspace
+    workspace = _zeros_slot_major(rows, num_heads, head_size, dtype, device)
+    setattr(attn_metadata, attr, workspace)
+    return workspace
+
+
 def gather_pack(
     flat: torch.Tensor,
     pack_indices: torch.Tensor,
@@ -397,6 +445,7 @@ def scatter_pack(
     batch: int,
     aligned_len: int,
     head_size_padded: int,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pack varlen ``[T, H, D]`` → ``[B, H, L, Dp]`` via compiled ``index_copy_``.
 
@@ -408,7 +457,8 @@ def scatter_pack(
 
     Spyre workspace is slot-major so ``view(B, L, …)`` splits an outermost
     dim (decoder KV). Default-layout ``view`` after ``index_copy_`` scrambles
-    ``B>1``.
+    ``B>1``. Serve caches ``workspace`` on the step and ``zero_``s it here so
+    pad slots from the previous pack do not leak.
     """
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
@@ -420,14 +470,23 @@ def scatter_pack(
         packed = flat.unsqueeze(0)
         return packed.permute(0, 2, 1, 3).contiguous()
     packed_rows = batch * aligned_len
+    rows = packed_rows + 1
     # Extra row is the dummy dest. Slot-major prefix view is 2c on hardware.
-    workspace = _zeros_slot_major(
-        packed_rows + 1,
-        num_heads,
-        head_size_padded,
-        flat.dtype,
-        flat.device,
-    )
+    if (
+        workspace is None
+        or workspace.shape != (rows, num_heads, head_size_padded)
+        or workspace.dtype != flat.dtype
+        or workspace.device.type != flat.device.type
+    ):
+        workspace = _zeros_slot_major(
+            rows,
+            num_heads,
+            head_size_padded,
+            flat.dtype,
+            flat.device,
+        )
+    else:
+        workspace.zero_()
     _index_copy(workspace, _dest_on_flat_device(dest_idx, flat), flat)
     packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
     return packed.permute(0, 2, 1, 3).contiguous()
@@ -481,20 +540,10 @@ def _ensure_encoder_pack(
     cached_max_num_seqs: int,
     cached_max_model_len: int,
     cached_max_num_batched_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build scatter dest + unpack + mask once per step; later layers reuse them."""
-    if attn_metadata.encoder_q_pack_idx is not None:
-        assert attn_metadata.encoder_kv_pack_idx is not None
-        assert attn_metadata.encoder_unpack_idx is not None
-        assert attn_metadata.encoder_attn_mask is not None
-        assert attn_metadata.encoder_key_pad_mask is not None
-        return (
-            attn_metadata.encoder_q_pack_idx,
-            attn_metadata.encoder_kv_pack_idx,
-            attn_metadata.encoder_unpack_idx,
-            attn_metadata.encoder_attn_mask,
-            attn_metadata.encoder_key_pad_mask,
-        )
+) -> None:
+    """Build scatter dest + unpack + key-pad once per step; later layers reuse them."""
+    if attn_metadata.encoder_pack_batch is not None:
+        return
 
     qsl = attn_metadata.query_start_loc.cpu()
     q_starts = qsl[:-1].tolist()
@@ -527,20 +576,11 @@ def _ensure_encoder_pack(
         orig_query_lens[0] if orig_query_lens else 0,
     )
     if fused:
-        # No dest, unpack, or L×L mask. Compiled SDPA has no attn_mask.
-        empty = torch.empty(0, dtype=torch.int64)
-        attn_metadata.encoder_q_pack_idx = empty
-        attn_metadata.encoder_kv_pack_idx = empty
-        attn_metadata.encoder_unpack_idx = empty
-        attn_metadata.encoder_attn_mask = _FUSED_NO_MASK
-        attn_metadata.encoder_key_pad_mask = _FUSED_NO_MASK
-        return (
-            attn_metadata.encoder_q_pack_idx,
-            attn_metadata.encoder_kv_pack_idx,
-            attn_metadata.encoder_unpack_idx,
-            attn_metadata.encoder_attn_mask,
-            attn_metadata.encoder_key_pad_mask,
-        )
+        # No dest, unpack, or mask. Compiled SDPA has no attn_mask.
+        attn_metadata.encoder_pack_batch = batch_bucket
+        attn_metadata.encoder_pack_len = aligned_len
+        attn_metadata.encoder_fused_sdpa = True
+        return
     if batch_bucket > num_seqs:
         q_starts = q_starts + [n] * (batch_bucket - num_seqs)
         query_lens = query_lens + [0] * (batch_bucket - num_seqs)
@@ -560,11 +600,11 @@ def _ensure_encoder_pack(
         device=torch.device("cpu"),
     )
     key_pad = host_key_pad_mask(mask_cpu, num_kv_heads)
+    # Do not H2D ``mask_cpu`` ([B, 1, L, L]). Forward only needs (B, L) plus
+    # this key-pad; at B=8, L=512 the unused copy is ~4 MB fp16 per step.
     if target_device.type == "spyre":
-        mask = convert(mask_cpu, target_device)
         key_pad = convert(key_pad, target_device)
     else:
-        mask = mask_cpu.to(target_device)
         key_pad = key_pad.to(target_device)
 
     # B=1 T==L with live pad still identity-packs; dest/unpack stay on host.
@@ -577,15 +617,10 @@ def _ensure_encoder_pack(
         attn_metadata.encoder_q_pack_idx = _indices_for_device(q_dest, target_device)
         attn_metadata.encoder_kv_pack_idx = _indices_for_device(kv_dest, target_device)
         attn_metadata.encoder_unpack_idx = _indices_for_device(unpack_idx, target_device)
-    attn_metadata.encoder_attn_mask = mask
+    attn_metadata.encoder_pack_batch = batch_bucket
+    attn_metadata.encoder_pack_len = aligned_len
+    attn_metadata.encoder_fused_sdpa = False
     attn_metadata.encoder_key_pad_mask = key_pad
-    return (
-        attn_metadata.encoder_q_pack_idx,
-        attn_metadata.encoder_kv_pack_idx,
-        attn_metadata.encoder_unpack_idx,
-        attn_metadata.encoder_attn_mask,
-        attn_metadata.encoder_key_pad_mask,
-    )
 
 
 def build_attention_mask(
@@ -684,7 +719,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         head_size_padded = _align_up(head_size)
         scale = self.scale
 
-        pack = _ensure_encoder_pack(
+        _ensure_encoder_pack(
             attn_metadata,
             padded_tokens=padded_tokens,
             n=n,
@@ -702,8 +737,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
-        q_pack, kv_pack, unpack_idx, mask, key_pad_mask = pack
-        if mask.numel() == 0:
+        if attn_metadata.encoder_fused_sdpa:
             result = _b1_dense_attention(
                 query,
                 key,
@@ -714,17 +748,49 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 head_size,
             )
         else:
-            batch, _, aligned_len, _ = mask.shape
-            q_batched = scatter_pack(query, q_pack, batch, aligned_len, head_size_padded)
-            k_batched = scatter_pack(key, kv_pack, batch, aligned_len, head_size_padded)
-            v_batched = scatter_pack(value, kv_pack, batch, aligned_len, head_size_padded)
+            batch = attn_metadata.encoder_pack_batch
+            aligned_len = attn_metadata.encoder_pack_len
+            q_pack = attn_metadata.encoder_q_pack_idx
+            kv_pack = attn_metadata.encoder_kv_pack_idx
+            unpack_idx = attn_metadata.encoder_unpack_idx
+            key_pad_mask = attn_metadata.encoder_key_pad_mask
+            assert batch is not None and aligned_len is not None
+            assert q_pack is not None and kv_pack is not None and unpack_idx is not None
+            assert key_pad_mask is not None
+            rows = batch * aligned_len + 1
+            q_ws = _cached_encoder_workspace(
+                attn_metadata,
+                "encoder_q_workspace",
+                rows,
+                num_heads,
+                head_size_padded,
+                query.dtype,
+                query.device,
+            )
+            kv_ws = _cached_encoder_workspace(
+                attn_metadata,
+                "encoder_kv_workspace",
+                rows,
+                num_kv_heads,
+                head_size_padded,
+                key.dtype,
+                key.device,
+            )
+            q_batched = scatter_pack(
+                query, q_pack, batch, aligned_len, head_size_padded, workspace=q_ws
+            )
+            k_batched = scatter_pack(
+                key, kv_pack, batch, aligned_len, head_size_padded, workspace=kv_ws
+            )
+            v_batched = scatter_pack(
+                value, kv_pack, batch, aligned_len, head_size_padded, workspace=kv_ws
+            )
             attn_out = _packed_masked_attention(
                 q_batched,
                 k_batched,
                 v_batched,
                 key_pad_mask,
                 scale,
-                num_kv_heads != num_heads,
             )
             result = gather_unpack(attn_out, unpack_idx, head_size)
         if result.dtype != output.dtype:
