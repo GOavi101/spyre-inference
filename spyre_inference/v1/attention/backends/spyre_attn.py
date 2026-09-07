@@ -577,10 +577,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # encoder scores ``[BH, G, L, L]`` (eager add; query axis ``1 → L``).
     encoder_key_pad_mask: torch.Tensor | None = None
     # Slot-major scatter scratch ``[B*L+1, H, D]``. Alloc once per step; ``zero_``
-    # before each Q/K/V pack so pad slots stay empty. ``permute.contiguous``
-    # copies out, so reuse is alias-safe. Q and KV differ under GQA.
+    # before each pack so pad slots stay empty. K and V must not share a buffer:
+    # at ``Hkv == 1`` ``permute.contiguous`` is a no-op view, so packing V into
+    # K's workspace would silently overwrite ``k_batched``. Q still differs
+    # under GQA.
     encoder_q_workspace: torch.Tensor | None = None
     encoder_kv_workspace: torch.Tensor | None = None
+    encoder_v_workspace: torch.Tensor | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:

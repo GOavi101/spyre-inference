@@ -205,26 +205,22 @@ def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor
 
 _CompiledFn = Callable[..., torch.Tensor]
 
-_compiled_index_copy: _CompiledFn | None = None
-_compiled_packed_qk: _CompiledFn | None = None
-_compiled_packed_pv: _CompiledFn | None = None
-_compiled_b1_sdpa: _CompiledFn | None = None
-_compiled_b1_sdpa_gqa: _CompiledFn | None = None
+_compiled_kernels: dict[Callable[..., torch.Tensor], _CompiledFn] = {}
 
 
-def _compile_if_spyre(
-    cached: _CompiledFn | None, kernel: _CompiledFn, device_type: str
-) -> _CompiledFn:
+def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
     """Compile ``kernel`` once on Spyre. CPU always runs ``kernel``.
 
-    Packed QK/P·V derive G from shapes; index_copy_ has one graph. Callers
-    assign the return value back into their module-level slot on Spyre.
+    Memo is keyed on the Python function, so packed QK, P·V, index_copy_, and
+    the two B=1 SDPA kernels each compile once without caller write-back.
     """
     if device_type != "spyre":
         return kernel
-    if cached is None:
-        return cast(_CompiledFn, torch.compile(kernel, dynamic=False))
-    return cached
+    compiled = _compiled_kernels.get(kernel)
+    if compiled is None:
+        compiled = cast(_CompiledFn, torch.compile(kernel, dynamic=False))
+        _compiled_kernels[kernel] = compiled
+    return compiled
 
 
 def _b1_sdpa_kernel(
@@ -315,13 +311,9 @@ def _packed_masked_attention(
     Compiling ``matmul + mask`` lets Inductor rewrite to ``F.sdpa``, which drops
     ``attn_mask`` on Spyre (BGE cosine ~0.46).
     """
-    global _compiled_packed_qk, _compiled_packed_pv
     device_type = query.device.type
-    qk = _compile_if_spyre(_compiled_packed_qk, _packed_qk_matmul, device_type)
-    pv = _compile_if_spyre(_compiled_packed_pv, _packed_pv, device_type)
-    if device_type == "spyre":
-        _compiled_packed_qk = qk
-        _compiled_packed_pv = pv
+    qk = _compile_if_spyre(_packed_qk_matmul, device_type)
+    pv = _compile_if_spyre(_packed_pv, device_type)
     scores = qk(query, key, scale)
     if mask.shape != scores.shape:
         # GQA: ``[B*KV, 1, L, L]`` → ``[B*KV, G, L, L]``. Query-L is already dense.
@@ -342,15 +334,10 @@ def _b1_dense_attention(
     query = _pad_head_dim_to_stick(query, head_size_padded)
     key = _pad_head_dim_to_stick(key, head_size_padded)
     value = _pad_head_dim_to_stick(value, head_size_padded)
-    kernel = _b1_sdpa_kernel_gqa if enable_gqa else _b1_sdpa_kernel
-    global _compiled_b1_sdpa, _compiled_b1_sdpa_gqa
-    cached = _compiled_b1_sdpa_gqa if enable_gqa else _compiled_b1_sdpa
-    kernel = _compile_if_spyre(cached, kernel, query.device.type)
-    if query.device.type == "spyre":
-        if enable_gqa:
-            _compiled_b1_sdpa_gqa = kernel
-        else:
-            _compiled_b1_sdpa = kernel
+    kernel = _compile_if_spyre(
+        _b1_sdpa_kernel_gqa if enable_gqa else _b1_sdpa_kernel,
+        query.device.type,
+    )
     result = kernel(query, key, value, scale)
     if result.shape[-1] == head_size:
         return result
@@ -361,11 +348,7 @@ def _b1_dense_attention(
 
 def _index_copy(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     """Eager on CPU; compiled ``index_copy_`` on Spyre (eager falls back / rejects)."""
-    global _compiled_index_copy
-    if dst.device.type != "spyre":
-        return _index_copy_kernel(dst, index, src)
-    compiled = _compile_if_spyre(_compiled_index_copy, _index_copy_kernel, dst.device.type)
-    _compiled_index_copy = compiled
+    compiled = _compile_if_spyre(_index_copy_kernel, dst.device.type)
     return compiled(dst, index, src)
 
 
@@ -466,6 +449,10 @@ def scatter_pack(
     dim (decoder KV). Default-layout ``view`` after ``index_copy_`` scrambles
     ``B>1``. Serve caches ``workspace`` on the step and ``zero_``s it here so
     pad slots from the previous pack do not leak.
+
+    ``permute.contiguous`` does **not** copy when ``H == 1`` (size-1 dim is
+    ignored by ``is_contiguous``). If the result still aliases ``workspace``,
+    clone so a later pack into the same buffer cannot clobber this tensor.
     """
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
@@ -496,7 +483,10 @@ def scatter_pack(
         workspace.zero_()
     _index_copy(workspace, _dest_on_flat_device(dest_idx, flat), flat)
     packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
-    return packed.permute(0, 2, 1, 3).contiguous()
+    packed = packed.permute(0, 2, 1, 3).contiguous()
+    if packed.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr():
+        packed = packed.clone()
+    return packed
 
 
 def gather_unpack(
@@ -783,6 +773,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 key.dtype,
                 key.device,
             )
+            v_ws = _cached_encoder_workspace(
+                attn_metadata,
+                "encoder_v_workspace",
+                rows,
+                num_kv_heads,
+                head_size_padded,
+                value.dtype,
+                value.device,
+            )
             q_batched = scatter_pack(
                 query, q_pack, batch, aligned_len, head_size_padded, workspace=q_ws
             )
@@ -790,7 +789,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 key, kv_pack, batch, aligned_len, head_size_padded, workspace=kv_ws
             )
             v_batched = scatter_pack(
-                value, kv_pack, batch, aligned_len, head_size_padded, workspace=kv_ws
+                value, kv_pack, batch, aligned_len, head_size_padded, workspace=v_ws
             )
             attn_out = _packed_masked_attention(
                 q_batched,

@@ -531,6 +531,7 @@ def test_encoder_pack_cache_reused_across_layers(monkeypatch, default_vllm_confi
     cached_key_pad = attn_metadata.encoder_key_pad_mask
     cached_q_ws = attn_metadata.encoder_q_workspace
     cached_kv_ws = attn_metadata.encoder_kv_workspace
+    cached_v_ws = attn_metadata.encoder_v_workspace
     assert cached_q is not None
     assert cached_kv is not None
     assert cached_unpack is not None
@@ -539,14 +540,16 @@ def test_encoder_pack_cache_reused_across_layers(monkeypatch, default_vllm_confi
     assert cached_key_pad is not None
     assert cached_q_ws is not None
     assert cached_kv_ws is not None
+    assert cached_v_ws is not None
     assert cached_q_ws is not cached_kv_ws
+    assert cached_kv_ws is not cached_v_ws
     assert not cached_fused
     assert getattr(attn_metadata, "encoder_attn_mask", None) is None
     assert cached_q.shape == (total_tokens,)
     assert cached_q.dtype == torch.int64
-    assert allocs["n"] == 2
+    assert allocs["n"] == 3
     impl.forward(**fwd, output=torch.empty_like(query))
-    assert allocs["n"] == 2
+    assert allocs["n"] == 3
     assert attn_metadata.encoder_q_pack_idx is cached_q
     assert attn_metadata.encoder_kv_pack_idx is cached_kv
     assert attn_metadata.encoder_unpack_idx is cached_unpack
@@ -556,6 +559,7 @@ def test_encoder_pack_cache_reused_across_layers(monkeypatch, default_vllm_confi
     assert attn_metadata.encoder_key_pad_mask is cached_key_pad
     assert attn_metadata.encoder_q_workspace is cached_q_ws
     assert attn_metadata.encoder_kv_workspace is cached_kv_ws
+    assert attn_metadata.encoder_v_workspace is cached_v_ws
 
 
 def _b1_dense_forward_setup(total_tokens: int = 64):
@@ -656,6 +660,7 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
     assert meta.encoder_key_pad_mask is None
     assert meta.encoder_q_workspace is None
     assert meta.encoder_kv_workspace is None
+    assert meta.encoder_v_workspace is None
     impl.forward(**fwd, output=torch.empty_like(query))
     assert idx_calls["n"] == 0
     assert mask_calls["n"] == 0
@@ -792,6 +797,31 @@ def test_scatter_pack_reused_workspace_zeros_pad_slots():
     assert torch.equal(got[0, :, 3:, :], torch.zeros(heads, aligned_len - 3, dim))
 
 
+def test_scatter_pack_h1_shared_workspace_does_not_clobber_k():
+    """H=1 ``permute.contiguous`` is a view of the scratch. Packing V into the
+    same buffer must not rewrite ``k_batched`` (MQA; BGE/MiniLM are MHA)."""
+    batch, aligned_len, heads, dim = 1, 8, 1, 8
+    rows = batch * aligned_len + 1
+    dest = host_scatter_pack_dest(
+        q_starts=[0],
+        lengths=[5],
+        aligned_len=aligned_len,
+        num_src_rows=5,
+        dummy_row=5,
+    )
+    torch.manual_seed(0)
+    key = torch.randn(5, heads, dim)
+    value = torch.randn(5, heads, dim) + 10
+    ws = torch.zeros(rows, heads, dim)
+    k_batched = scatter_pack(key, dest, batch, aligned_len, dim, workspace=ws)
+    k_before = k_batched.clone()
+    v_batched = scatter_pack(value, dest, batch, aligned_len, dim, workspace=ws)
+    torch.testing.assert_close(k_batched, k_before)
+    assert not torch.equal(k_batched, v_batched)
+    assert k_batched.untyped_storage().data_ptr() != ws.untyped_storage().data_ptr()
+    assert v_batched.untyped_storage().data_ptr() != ws.untyped_storage().data_ptr()
+
+
 def test_packed_masked_qk_matches_softmax_reference():
     torch.manual_seed(0)
     batch, heads, length, dim = 1, 4, 64, 64
@@ -818,9 +848,9 @@ def test_packed_attention_compiles_matmul_without_mask(monkeypatch) -> None:
     seen: list[str] = []
     real = encoder_attn._compile_if_spyre
 
-    def rec(cached, kernel, device_type):
+    def rec(kernel, device_type):
         seen.append(kernel.__name__)
-        return real(cached, kernel, device_type)
+        return real(kernel, device_type)
 
     monkeypatch.setattr(encoder_attn, "_compile_if_spyre", rec)
     torch.manual_seed(0)
