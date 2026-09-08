@@ -21,13 +21,16 @@ decides whether a dispatch reuses a graph. The kernels run on CPU here (no
 Spyre), which is enough to exercise dummy-arg construction and the guards.
 """
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, get_current_vllm_config
+from vllm.logger import _print_warning_once
 
+from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
@@ -309,3 +312,57 @@ class TestRecompileLimit:
         with pytest.raises(RuntimeError):
             impl.record_graphs(torch.device("cpu"), make_bucketer(), kv_cache)
         assert torch._dynamo.config.accumulated_recompile_limit == before
+
+
+def _toy_kernel(x, n):
+    """`n` is a plain int, so ``dynamic=False`` gives one graph per value, like num_blocks."""
+    for _ in range(n):
+        x = x + 1
+    return x
+
+
+class TestLateCompileWarning:
+    """The runtime half of the acceptance criterion, for what the tests above cannot see:
+    a real config whose buckets miss something, or the batched decode kernel, which the
+    recorder never traces. ``backend="eager"`` suffices since the counter is Dynamo's.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch):
+        torch._dynamo.reset()
+        # warning_once is lru_cached process-wide, so a prior emit would mask ours.
+        _print_warning_once.cache_clear()
+        monkeypatch.setattr(spyre_attn, "_warmup_complete", False)
+        yield
+        _print_warning_once.cache_clear()
+
+    def test_quiet_before_warmup_is_marked(self, caplog):
+        fn = torch.compile(_toy_kernel, dynamic=False, backend="eager")
+        with caplog.at_level(logging.WARNING):
+            spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
+        assert "outside warmup" not in caplog.text
+
+    def test_warns_when_an_unrecorded_variant_compiles(self, caplog):
+        fn = torch.compile(_toy_kernel, dynamic=False, backend="eager")
+        spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
+        spyre_attn.mark_warmup_complete()
+
+        with caplog.at_level(logging.WARNING):
+            spyre_attn._call_kernel("page attention", fn, torch.ones(4), 2)
+
+        assert "page attention compiled outside warmup" in caplog.text
+
+    def test_quiet_when_the_variant_was_already_recorded(self, caplog):
+        fn = torch.compile(_toy_kernel, dynamic=False, backend="eager")
+        spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
+        spyre_attn.mark_warmup_complete()
+
+        with caplog.at_level(logging.WARNING):
+            spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
+
+        assert "outside warmup" not in caplog.text
+
+    def test_mark_warmup_complete_arms_the_check(self):
+        assert spyre_attn._warmup_complete is False
+        spyre_attn.mark_warmup_complete()
+        assert spyre_attn._warmup_complete is True

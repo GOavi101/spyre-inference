@@ -87,6 +87,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
     allocate_staging_buffers,
+    mark_warmup_complete,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
@@ -766,6 +767,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             total,
             time.time() - t0,
         )
+        # Past the early returns: with recording off, first-use compiles are intended.
+        mark_warmup_complete()
 
     def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
         """The attention bucketer the metadata builders dispatch against.

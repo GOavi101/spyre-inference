@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple
 
 import torch
+from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -429,6 +430,36 @@ def _batched_decode_kernel(
 # hold the per-sequence Python loop around these.
 _page_attn_compiled = torch.compile(_page_attn_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(_batched_decode_kernel, dynamic=False)
+
+_warmup_complete = False
+
+
+def mark_warmup_complete() -> None:
+    """Arm the late-compile warning, once warmup has claimed full variant coverage."""
+    global _warmup_complete
+    _warmup_complete = True
+
+
+def _call_kernel(label: str, fn, *args):
+    """Dispatch a kernel, warning if it compiles once warmup has claimed coverage.
+
+    Dynamo's counter is process-wide but attributable across just this call: a
+    compiled region runs no eager ops, and torch-spyre compiles every eager aten op.
+    That assumes nothing else compiles concurrently on another thread, which holds for
+    a single-tenant serving process; if it ever stops holding, the cost is a spurious
+    warning, not a wrong result.
+    """
+    if not _warmup_complete:
+        return fn(*args)
+    before = counters["stats"]["unique_graphs"]
+    result = fn(*args)
+    if counters["stats"]["unique_graphs"] != before:
+        logger.warning_once(
+            "%s compiled outside warmup, which costs a full Inductor compile mid-request. "
+            "Re-run with TORCH_LOGS=recompiles to see which guard failed.",
+            label,
+        )
+    return result
 
 
 @dataclass
@@ -1569,7 +1600,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             and output.storage_offset() == 0
             and output.is_contiguous()
         )
-        result = self._decode_fn(
+        result = _call_kernel(
+            "batched decode attention",
+            self._decode_fn,
             query_dev,
             attn_metadata.query_row_ids_dev if needs_gather else None,
             k_pages,
@@ -1738,7 +1771,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             row_table = attn_metadata.query_row_tables[seq_idx]
 
             # Run attention on target device
-            result = self._attn_fn(
+            result = _call_kernel(
+                "page attention",
+                self._attn_fn,
                 q_staging,
                 row_table,
                 k_pages,
