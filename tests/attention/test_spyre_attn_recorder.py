@@ -180,9 +180,82 @@ class TestRecordGraphs:
             assert num_blocks in bucketer.num_blocks_buckets, (
                 f"kv_len={kv_len} produced an unrecorded block count {num_blocks}"
             )
-            _dispatch(impl, kv_cache, num_blocks, metadata.aligned_max_query_len)
+            _dispatch(impl, kv_cache, num_blocks, metadata.aligned_query_lens[0])
 
         assert compiles() == snapshot
+
+    def test_mixed_batch_dispatch_compiles_nothing(self, impl, kv_cache):
+        """A mixed batch dispatches two query widths; both must be recorded."""
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        bucketer = SpyreAttnBucketer(get_current_vllm_config())
+        impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+
+        snapshot = compiles()
+        metadata = _padded_mask_metadata(
+            [(32, 300), (1, 200), (1, 65)],
+            block_size=BLOCK_SIZE,
+            num_query_heads=NUM_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            max_num_blocks=NUM_PAGES,
+        )
+        assert metadata.aligned_query_lens[0] > 1
+        assert metadata.aligned_query_lens[1:] == [1, 1]
+        assert metadata.padded_num_blocks is not None
+
+        for seq_idx, aligned in enumerate(metadata.aligned_query_lens):
+            num_blocks = metadata.padded_num_blocks[seq_idx]
+            assert num_blocks <= NUM_PAGES, "variant would have been skipped when recording"
+            _dispatch(impl, kv_cache, num_blocks, aligned)
+
+        assert compiles() == snapshot
+
+    def test_wide_chunk_beside_short_decode_stays_on_recorded_keys(
+        self, default_vllm_config, monkeypatch
+    ):
+        """The case that makes variants()' pruning load-bearing.
+
+        Pruning drops a (num_blocks, query bucket) pair on query_len <= kv_len,
+        which only holds within one sequence. It removes nothing until there are
+        three query buckets, and only bites when a chunk is wider than another
+        sequence's padded KV, so the other recorder tests never reach it.
+        """
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        cfg = get_current_vllm_config()
+        monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 2048)
+
+        chunk_len, chunk_kv, decode_kv = 600, 700, 200
+        metadata = _padded_mask_metadata(
+            [(chunk_len, chunk_kv), (1, decode_kv)],
+            block_size=128,
+            num_query_heads=NUM_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            max_num_blocks=16,
+        )
+
+        bucketer = SpyreAttnBucketer(cfg)
+        recorded = set(bucketer.variants())
+        assert len(recorded) < len(bucketer.query_buckets) * len(bucketer.num_blocks_buckets), (
+            "config prunes nothing, so this test would pass vacuously"
+        )
+
+        assert metadata.padded_num_blocks is not None
+        chunk_width = bucketer.find_query_bucket(chunk_len)
+        assert chunk_width is not None
+        assert metadata.aligned_query_lens == [chunk_width, 1]
+
+        # The variant a batch-wide width would have produced for the decode
+        # sequence. Pruned, so dispatching it means an Inductor compile in the
+        # serving path; asserted absent so this test fails loudly if the
+        # bucketer stops pruning it and the case goes uncovered.
+        assert SpyreAttnBucket(metadata.padded_num_blocks[1], chunk_width) not in recorded
+
+        for seq_idx, aligned in enumerate(metadata.aligned_query_lens):
+            variant = SpyreAttnBucket(metadata.padded_num_blocks[seq_idx], aligned)
+            assert variant in recorded, f"sequence {seq_idx} dispatches unrecorded {variant}"
 
     def test_eager_records_nothing(self, impl, kv_cache):
         impl._compile_attn = False
