@@ -173,38 +173,38 @@ Encoder-only (embedding) models take a separate path. For `ENCODER`/`ENCODER_ONL
 layers, `TorchSpyrePlatform.get_attn_backend_cls` selects `SpyreEncoderAttentionBackend`
 → `SpyreEncoderAttentionImpl` (both subclass the decoder backend/impl in
 `spyre_encoder_attn.py`). This path has **no KV cache** — attention is bidirectional over
-the full sequence — so it skips the paged-cache machinery entirely and instead:
+the full sequence — so it skips the paged-cache machinery. The packed `[T, H, D]` list
+goes to a blocked flash kernel whole; request boundaries ride in int32 row-index tables
+(offsets are data, not shapes):
 
-1. Assembles a dense, padded batch on CPU (per-sequence variable-length slice, transpose,
-   and scatter of ragged Q/K/V into `[num_seqs, H, L, D]`, plus an additive attention
-   mask). Both sequence length `L` and head dim `D` are padded to the
-   `ENCODER_SEQ_ALIGNMENT = 64` stick so the on-device matmuls stay stick-aligned (this
-   is what lets small-head-dim models like MiniLM's `head_size=32` compile).
-2. Runs a single batched `F.scaled_dot_product_attention` on Spyre
-   (`is_causal=False`, additive mask, `enable_gqa` when `num_kv_heads != num_heads`).
-3. Scatters the unpadded results back to CPU, then writes them per token into the Spyre
-   output buffer.
+1. First encoder layer of the step builds one `EncoderSeqPlan` per request (row table +
+   64-token mask tiles) and stashes it on `attn_metadata.encoder_seq_plans` for the rest
+   of the stack.
+2. The kernel gathers that sequence in-graph (`index_select`), walks KV in
+   `ENCODER_BLOCK_SIZE = 64` blocks with a running softmax max/sum, and writes back with
+   `index_copy_`. There is no host slice (torch-spyre#3770) and no identity gather
+   (torch-spyre#4033).
+3. The only compile axis is the per-request block count (power of two). Body `T` stays a
+   1D `compile_sizes` bucket; there is no dense `(B, L)` grid or `[B, 1, L, L]` mask.
 
-## Encoder / embedding models: target state
+Encoder layers are patched onto opaque `unified_attention_with_output` with **no KV
+write**. Warmup dummies each body size with `force_attention=True`, and the first forward
+at that size compiles the block-count ladder so serving does not recompile mid-request.
 
-Everything above describes what is implemented today. The diagram below is a **target
-state** — where the encoder path is heading once the compile-mode work lands, and not a
-description of current behaviour.
+## Encoder / embedding models: compile shape axes
 
-The shape of that target: the model body compiled once per token bucket, attention
-shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
-both sets of shape buckets so nothing compiles on the first request.
+The model body is compiled once per token bucket. Attention is shape-managed separately
+behind the opaque custom-op boundary; its axis is the per-request flash block count, not
+a dense `(S, L)` grid.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
-    Target architecture for encoder / embedding models under
-    <code>STOCK_TORCH_COMPILE</code>. Two shape axes are bucketed independently: the
-    token count <code>T</code> for the model body, and <code>(S, L)</code> for
-    attention's dense grid — they are decoupled because attention builds its grid by
-    gathering rows rather than by being handed a reshaped tensor. The foot of the
-    diagram contrasts today's dense-grid strategy with the planned flash-style variant,
-    which would collapse the second axis and converge on the upstream design.
+    Architecture for encoder / embedding models under
+    <code>STOCK_TORCH_COMPILE</code>. The body is bucketed on packed token count
+    <code>T</code>. Attention is blocked flash over that packed list (the flash-style
+    variant at the foot of the diagram), so the second axis is a per-request block
+    count rather than a dense <code>(S, L)</code> grid.
   </figcaption>
 </figure>
 
