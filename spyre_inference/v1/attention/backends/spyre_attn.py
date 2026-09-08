@@ -210,17 +210,24 @@ def _stick_aligned_len(n: int) -> int:
 def _build_query_row_tables(
     attn_metadata: "SpyreAttentionMetadata", device: torch.device
 ) -> list[torch.Tensor]:
+    """Build query gather/dest row tables for the whole batch.
+
+    Builds one contiguous CPU tensor for the whole batch and mirrors it to the
+    Spyre device with a single convert() call, then clones per-sequence rows so
+    each compiled kernel sees an offset-0 buffer (torch-spyre#3770).
+    """
     num_seqs = attn_metadata.num_seqs
     starts = attn_metadata.query_start_loc[:num_seqs].cpu()
     lens = attn_metadata.query_start_loc[1 : num_seqs + 1].cpu() - starts
-    tables: list[torch.Tensor] = []
-    for s in range(num_seqs):
-        aligned = attn_metadata.aligned_query_lens[s]
-        rows = torch.zeros(_stick_aligned_len(aligned), dtype=torch.int32)
+    aligned_query_lens = attn_metadata.aligned_query_lens
+    max_index_len = max((_stick_aligned_len(al) for al in aligned_query_lens), default=0)
+    rows = torch.zeros(num_seqs, max_index_len, dtype=torch.int32)
+    for s, aligned in enumerate(aligned_query_lens):
         last_real = max(int(lens[s]) - 1, 0)
-        rows[:aligned] = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
-        tables.append(convert(rows, device=device))
-    return tables
+        rows[s, :aligned] = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
+    rows_dev = convert(rows, device=device)
+    # Per-seq clones keep offset 0 for the compiled kernel (torch-spyre#3770).
+    return [rows_dev[s].clone() for s in range(num_seqs)]
 
 
 def _page_attn_kernel(

@@ -2125,6 +2125,7 @@ def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
         rows = row_tables[seq_idx][:aligned].tolist()
         expected = [starts[seq_idx] + min(q, query_len - 1) for q in range(aligned)]
         assert rows == expected, f"seq {seq_idx} row table {rows} != {expected}"
+        assert row_tables[seq_idx].storage_offset() == 0
 
 
 @pytest.mark.parametrize(
