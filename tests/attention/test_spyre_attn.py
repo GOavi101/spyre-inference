@@ -29,8 +29,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
+    _batched_decode_kernel,
     _build_query_row_tables,
-    _create_compilable_batched_decode_attn,
     _mirror_mask_tiles,
     _stick_aligned_len,
 )
@@ -463,22 +463,16 @@ def _run_spyre_attn_test(
         logits_soft_cap=soft_cap,
     )
 
-    # store_out is not a cache key, so observe it where it happens: whether the
-    # kernel was handed an `out` buffer to write into.
+    # The fused store is just whether the kernel was handed an `out` buffer.
     fused_calls: list[bool] = []
     if expect_fused_store is not None:
-        _real_get_attn_fn = attn_impl._get_attn_fn
+        _real_attn_fn = attn_impl._attn_fn
 
-        def _spy_get_attn_fn(*args, **kwargs):
-            fn = _real_get_attn_fn(*args, **kwargs)
+        def _spy_attn_fn(*a, **kw):
+            fused_calls.append(a[-1] is not None)
+            return _real_attn_fn(*a, **kw)
 
-            def wrapped(*a, out=None, **kw):
-                fused_calls.append(out is not None)
-                return fn(*a, out=out, **kw)
-
-            return wrapped
-
-        attn_impl._get_attn_fn = _spy_get_attn_fn  # type: ignore[method-assign]
+        attn_impl._attn_fn = _spy_attn_fn
 
     # NaN, not empty_like: every row is expected to be written, so a store that
     # lands nowhere fails below instead of passing on whatever the allocator gave.
@@ -1797,18 +1791,6 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
     lead = num_seqs * num_kv_heads
 
-    def build(cap: float):
-        return _create_compilable_batched_decode_attn(
-            num_seqs=num_seqs,
-            num_blocks=num_blocks,
-            num_kv_heads=num_kv_heads,
-            num_queries_per_kv=qpk,
-            block_size=block_size,
-            head_size=head_size,
-            logits_soft_cap=cap,
-            needs_gather=False,
-        )
-
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
@@ -1818,12 +1800,27 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
     block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
     mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
-    query_row_ids = torch.arange(num_seqs, dtype=torch.int64)
-    # Trailing None is the `out` buffer; unused because store_out defaults to False.
-    args = (query, query_row_ids, k_pages, v_pages, block_ids, mask_by_block, 1.0, None)
 
-    uncapped = build(0.0)(*args)
-    capped = build(5.0)(*args)
+    def run(cap: float):
+        return _batched_decode_kernel(
+            query,
+            None,
+            k_pages,
+            v_pages,
+            block_ids,
+            mask_by_block,
+            1.0,
+            num_seqs,
+            num_blocks,
+            num_kv_heads,
+            qpk,
+            block_size,
+            head_size,
+            logits_soft_cap=cap,
+        )
+
+    uncapped = run(0.0)
+    capped = run(5.0)
 
     assert not torch.allclose(uncapped, capped), (
         "soft-cap did not change the output; the capped kernel may be ignoring it"
@@ -2092,27 +2089,6 @@ def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
     num_blocks = (kv_len + block_size - 1) // block_size
     assert metadata.active_block_indices is not None
     assert metadata.active_block_indices[0] == list(range(first_active, num_blocks))
-
-
-def test_attn_fn_cache_key_is_shape_only(default_vllm_config):
-    """Query lengths in the same bucket must share one compiled kernel."""
-    torch.set_default_device("cpu")
-    impl = SpyreAttentionImpl(
-        num_heads=32,
-        head_size=128,
-        scale=128**-0.5,
-        num_kv_heads=8,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-    )
-
-    impl._get_attn_fn(4, 32)
-    impl._get_attn_fn(4, 32)
-    assert list(impl._attn_fns) == [(4, 32)]
-
-    impl._get_attn_fn(4, 64)
-    assert len(impl._attn_fns) == 2
 
 
 def _num_blocks_buckets(block_size: int = 64) -> list[int]:

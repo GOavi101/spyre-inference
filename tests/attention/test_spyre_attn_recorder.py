@@ -14,22 +14,28 @@
 
 """Tests for the attention graph recorder.
 
-CPU-only: these check that recording populates the kernel cache with exactly
-the keys the bucketer enumerates, and that a subsequent dispatch reuses them
-instead of growing the cache. The kernels run eagerly here (no Spyre), which
-is enough to exercise dummy-arg construction and cache bookkeeping.
+CPU-only: these check that recording compiles a graph for every variant the
+bucketer enumerates, and that a subsequent dispatch compiles nothing more. The
+count comes from Dynamo's own ``unique_graphs`` counter, since Dynamo is what
+decides whether a dispatch reuses a graph. The kernels run on CPU here (no
+Spyre), which is enough to exercise dummy-arg construction and the guards.
 """
 
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from torch._dynamo.utils import counters
+from vllm.config import CompilationMode, get_current_vllm_config
 
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
 )
-from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    SpyreAttnBucket,
+    SpyreAttnBucketer,
+)
 
 pytestmark = pytest.mark.attention
 
@@ -40,9 +46,20 @@ BLOCK_SIZE = 64
 NUM_PAGES = 8
 
 
+def compiles() -> int:
+    """Graphs Dynamo has compiled so far, process-wide."""
+    return counters["stats"]["unique_graphs"]
+
+
 @pytest.fixture()
 def impl(default_vllm_config):
-    impl = SpyreAttentionImpl(
+    # Dynamo caches on the kernel's code object, shared by every impl in the
+    # process, so an earlier test's graphs would hide a recorder that compiled none.
+    torch._dynamo.reset()
+    # The fixture's bare CompilationConfig leaves mode unset, which resolves to
+    # eager. __init__ reads the mode to pick its kernel, so set it before building.
+    get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    return SpyreAttentionImpl(
         num_heads=NUM_HEADS,
         head_size=HEAD_SIZE,
         scale=1.0 / (HEAD_SIZE**0.5),
@@ -50,11 +67,6 @@ def impl(default_vllm_config):
         alibi_slopes=None,
         sliding_window=None,
     )
-    # The fixture's bare CompilationConfig leaves mode unset, which resolves to
-    # eager. Recording is a no-op there by design, so force the compiled path;
-    # _maybe_compile is what actually decides whether Inductor is invoked.
-    impl._compile_attn = True
-    return impl
 
 
 @pytest.fixture()
@@ -74,27 +86,40 @@ def make_bucketer(max_model_len=256, max_num_batched_tokens=64):
     return SpyreAttnBucketer(config)
 
 
+def _recordable(bucketer) -> list[SpyreAttnBucket]:
+    return [v for v in bucketer.variants() if v.num_blocks <= NUM_PAGES]
+
+
+def _dispatch(impl, kv_cache, num_blocks, padded_query_len):
+    """Invoke the kernel the way a batch of this shape would."""
+    impl._record_one(
+        SpyreAttnBucket(num_blocks, padded_query_len),
+        *kv_cache,
+        BLOCK_SIZE,
+        torch.device("cpu"),
+    )
+
+
 class TestRecordGraphs:
-    def test_populates_cache_with_enumerated_keys(self, impl, kv_cache):
+    def test_records_every_enumerated_variant(self, impl, kv_cache):
         bucketer = make_bucketer()
-        assert impl._attn_fns == {}
 
         recorded = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
 
-        assert recorded > 0
-        expected = {v.key for v in bucketer.variants() if v.num_blocks <= NUM_PAGES}
-        assert set(impl._attn_fns) == expected
+        assert recorded == len(_recordable(bucketer)) > 0
 
-    def test_dispatch_after_recording_does_not_grow_the_cache(self, impl, kv_cache):
+    def test_dispatch_after_recording_compiles_nothing(self, impl, kv_cache):
         """The acceptance criterion: no request compiles a new variant.
 
         Rounds sizes the way production does, so a drift between the two copies
         of the rules shows up here.
         """
         bucketer = make_bucketer()
+        before = compiles()
         impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
-        snapshot = len(impl._attn_fns)
+        assert compiles() > before, "recording compiled nothing"
 
+        snapshot = compiles()
         for kv_len in (1, 60, 64, 200, 256):
             for query_len in (1, 5, 32, 64):
                 if query_len > kv_len:
@@ -106,46 +131,41 @@ class TestRecordGraphs:
                 assert padded_query_len is not None and num_blocks is not None
                 if num_blocks > NUM_PAGES:
                     continue
-                impl._get_attn_fn(num_blocks, padded_query_len)
+                _dispatch(impl, kv_cache, num_blocks, padded_query_len)
 
-        assert len(impl._attn_fns) == snapshot
+        assert compiles() == snapshot
 
-    def test_is_idempotent(self, impl, kv_cache):
+    def test_re_recording_compiles_nothing(self, impl, kv_cache):
         bucketer = make_bucketer()
-        impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
-        after_first = len(impl._attn_fns)
+        first = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
 
-        assert impl.record_graphs(torch.device("cpu"), bucketer, kv_cache) == 0
-        assert len(impl._attn_fns) == after_first
+        snapshot = compiles()
+        assert impl.record_graphs(torch.device("cpu"), bucketer, kv_cache) == first
+        assert compiles() == snapshot
 
     def test_skips_variants_exceeding_the_page_allocation(self, impl, kv_cache):
         """Buckets sized from max_model_len can outrun a small KV cache."""
         bucketer = make_bucketer(max_model_len=4096)
-        impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
 
-        assert impl._attn_fns
-        assert all(key[0] <= NUM_PAGES for key in impl._attn_fns)
+        recorded = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
 
-    def test_real_metadata_dispatch_does_not_grow_the_cache(self, impl, kv_cache, monkeypatch):
+        assert 0 < recorded == len(_recordable(bucketer)) < len(bucketer.variants())
+
+    def test_real_metadata_dispatch_compiles_nothing(self, impl, kv_cache):
         """The acceptance criterion, driven from real builder metadata.
 
-        Unlike ``test_dispatch_after_recording_does_not_grow_the_cache``, this
-        builds metadata for unbucketed kv_lens through
-        ``SpyreAttentionMetadataBuilder`` and dispatches on the block counts
-        ``build()`` actually produced.
+        Unlike ``test_dispatch_after_recording_compiles_nothing``, this builds
+        metadata for unbucketed kv_lens through ``SpyreAttentionMetadataBuilder``
+        and dispatches on the block counts ``build()`` actually produced.
         """
-        from vllm.config import get_current_vllm_config
-
         from tests.attention.test_spyre_attn import _padded_mask_metadata
 
         # Built from the live config, not make_bucketer's narrower stand-in, so
         # this bucketer and the builder's derive from the same config.
-        vllm_config = get_current_vllm_config()
-        bucketer = SpyreAttnBucketer(vllm_config)
+        bucketer = SpyreAttnBucketer(get_current_vllm_config())
         impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
-        snapshot = len(impl._attn_fns)
-        assert snapshot > 0
 
+        snapshot = compiles()
         for query_len, kv_len in [(1, 1), (1, 65), (1, 200), (7, 65), (32, 300), (33, 300)]:
             metadata = _padded_mask_metadata(
                 [(query_len, kv_len)],
@@ -160,14 +180,15 @@ class TestRecordGraphs:
             assert num_blocks in bucketer.num_blocks_buckets, (
                 f"kv_len={kv_len} produced an unrecorded block count {num_blocks}"
             )
-            impl._get_attn_fn(num_blocks, metadata.aligned_max_query_len)
+            _dispatch(impl, kv_cache, num_blocks, metadata.aligned_max_query_len)
 
-        assert len(impl._attn_fns) == snapshot
+        assert compiles() == snapshot
 
     def test_eager_records_nothing(self, impl, kv_cache):
         impl._compile_attn = False
+        snapshot = compiles()
         assert impl.record_graphs(torch.device("cpu"), make_bucketer(), kv_cache) == 0
-        assert impl._attn_fns == {}
+        assert compiles() == snapshot
 
     def test_a_failing_variant_does_not_abort_the_pass(self, impl, kv_cache, monkeypatch):
         """One bad variant must not take down engine startup."""
@@ -184,9 +205,7 @@ class TestRecordGraphs:
         monkeypatch.setattr(impl, "_record_one", flaky)
         recorded = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
 
-        assert recorded == calls["n"] - 1
-        # The failed key is left uncached, so it can still compile on first use.
-        assert bucketer.variants()[0].key not in impl._attn_fns
+        assert recorded == calls["n"] - 1 == len(_recordable(bucketer)) - 1
 
 
 class TestRecompileLimit:
