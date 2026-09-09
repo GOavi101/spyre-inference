@@ -204,6 +204,14 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "torch-spyre#4179: FP8 aten._scaled_mm SuperDSC-aborts "
+            "(cost-model n_split + old QFP8WT elemArr). Un-xfail when #4235 "
+            "Fix 1 is in the torch-spyre pin."
+        ),
+    )
     @pytest.mark.parametrize("num_tokens", [1, 4, 128])
     def test_scaled_mm_apply(self, num_tokens):
         """apply_weights runs aten._scaled_mm on Spyre."""
@@ -228,6 +236,14 @@ class TestSpyreFp8LinearKernel:
         assert actual.dtype == torch.float16
         assert actual.shape == (num_tokens, out_features)
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "torch-spyre#4179: FP8 aten._scaled_mm SuperDSC-aborts "
+            "(cost-model n_split + old QFP8WT elemArr). Un-xfail when #4235 "
+            "Fix 1 is in the torch-spyre pin."
+        ),
+    )
     @pytest.mark.parametrize("num_tokens", [1, 4, 128])
     def test_scaled_mm_apply_per_channel(self, num_tokens):
         """apply_weights with Granite per-channel weight scales + per-token acts."""
