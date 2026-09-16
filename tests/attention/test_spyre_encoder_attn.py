@@ -347,8 +347,7 @@ def test_build_key_pad_mask_matches_sliced_square(
     got = build_key_pad_mask(
         len(query_lens),
         aligned_len,
-        query_lens,
-        kv_lens,
+        [min(q, k) for q, k in zip(query_lens, kv_lens)],
         num_kv_heads,
         dtype=dtype,
     )
@@ -747,7 +746,6 @@ def test_packed_path_builds_key_pad_row_not_square(monkeypatch, default_vllm_con
     monkeypatch.setattr(encoder_attn, "host_key_pad_mask", count_slice)
     monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_row)
     impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
-    meta.query_start_loc = torch.tensor([0, 64], dtype=torch.int32)
     meta.seq_lens = torch.tensor([5], dtype=torch.int32)
     meta.num_actual_tokens = 5
     impl.forward(**fwd, output=torch.empty_like(query))

@@ -288,22 +288,18 @@ def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
 def build_key_pad_mask(
     num_seqs: int,
     aligned_len: int,
-    query_lens: list[int],
     kv_lens: list[int],
     num_kv_heads: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Host key-pad ``[B*KV, 1, 1, L]`` from per-seq lengths, without a square mask."""
-    if num_seqs != len(query_lens):
-        raise ValueError(f"num_seqs={num_seqs} != len(query_lens)={len(query_lens)}")
-    kv_len = torch.tensor(
-        [min(q, k) for q, k in zip(query_lens, kv_lens)],
-        dtype=torch.int32,
-    )
+    """Host key-pad ``[B*KV, 1, 1, L]``. Serve's only mask builder; ``build_attention_mask`` and ``host_key_pad_mask`` are test-only."""
+    if num_seqs != len(kv_lens):
+        raise ValueError(f"num_seqs={num_seqs} != len(kv_lens)={len(kv_lens)}")
+    kv_len = torch.tensor(kv_lens, dtype=torch.int32)
     kv_pos = torch.arange(aligned_len, dtype=torch.int32)
     zeros = torch.zeros((), dtype=dtype)
     neg_inf = torch.tensor(torch.finfo(dtype).min, dtype=dtype)
-    # q==0 ⇒ min(q, k)==0 ⇒ all-inf, matching square-mask query row 0.
+    # Length 0 (dummy seq) is all-inf, matching square-mask query row 0.
     row = torch.where(kv_pos.unsqueeze(0) < kv_len.unsqueeze(1), zeros, neg_inf)
     return (
         row.view(num_seqs, 1, 1, aligned_len)
@@ -711,8 +707,7 @@ def _ensure_encoder_pack(
     key_pad = build_key_pad_mask(
         batch_bucket,
         aligned_len,
-        query_lens,
-        kv_lens,
+        kv_pack_lens,
         num_kv_heads,
         dtype=query.dtype,
     )
