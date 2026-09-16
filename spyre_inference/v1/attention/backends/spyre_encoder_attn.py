@@ -264,10 +264,9 @@ def _b1_sdpa_kernel_gqa(
 
 
 def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
-    """CPU ``[B,1,L,L]`` → ``[B*KV, 1, 1, L]``. Tests / square-mask callers.
+    """CPU ``[B,1,L,L]`` → ``[B*KV, 1, 1, L]``, broadcast over the query axis.
 
-    Serve uses ``build_key_pad_mask`` so it never materializes the square. The
-    same key-pad row applies to every query row, so only the KV axis needs
+    The same key-pad row applies to every query row, so only the KV axis needs
     materialising. This shape was previously rejected because an *eager* Spyre
     add cannot broadcast ``1 → L`` on the query axis (no stick-scatter), which
     forced a dense ``[B*KV, 1, L, L]``. The add now happens inside the compiled
@@ -294,13 +293,7 @@ def build_key_pad_mask(
     num_kv_heads: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Additive key-pad ``[B*KV, 1, 1, L]`` from per-seq lengths. Host only.
-
-    0 where ``kv_pos < min(q, k)``, ``-inf`` on pad and dummy seqs (``q==0``).
-    Same values as ``host_key_pad_mask(build_attention_mask(...), num_kv_heads)``
-    without the ``[B, 1, L, L]`` allocation. Compiled ``_packed_pv`` broadcasts
-    the query axis and the GQA head axis.
-    """
+    """Host key-pad ``[B*KV, 1, 1, L]`` from per-seq lengths, without a square mask."""
     if num_seqs != len(query_lens):
         raise ValueError(f"num_seqs={num_seqs} != len(query_lens)={len(query_lens)}")
     kv_len = torch.tensor(
@@ -754,7 +747,6 @@ def build_attention_mask(
 ) -> torch.Tensor:
     """Additive mask ``[B, 1, L, L]``: 0 where attend, ``-inf`` elsewhere.
 
-    Tests / callers that need the full square; serve uses ``build_key_pad_mask``.
     Built on the host (vectorized ``lt`` + nested ``where``), then ``convert``'d.
     On-device materialization is not stick-safe: Spyre cannot produce bool from
     int32 ``lt``, and cannot broadcast ``where`` of ``[B,1,L,1]`` × ``[B,1,1,L]``
