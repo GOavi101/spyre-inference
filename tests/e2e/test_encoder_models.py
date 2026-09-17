@@ -259,9 +259,8 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 
 
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
-    """Only the encoder body used to run on Spyre: fp32 F.linear is missing
-    (torch-spyre#1794). Stick-aligned BERT/RoBERTa heads now use staggered-K
-    upcast GEMM (#868) and can stay on device; this score check still holds."""
+    """Only the encoder body runs on Spyre: the fp32 classifier head has no FP32 batchmatmul
+    (torch-spyre#1794), so the pooling tail stays on CPU even when compiled."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")
