@@ -199,7 +199,7 @@ def test_upcast_linear_matches_fp32_f_linear():
 
 
 def test_upcast_linear_stacked_head_matches_cpu():
-    """Roberta dense then out_proj: first layer D2Hs, second must follow."""
+    """Roberta dense then out_proj: after D2H the second GEMM is host F.linear."""
     from spyre_inference.v1.pool.spyre_upcast_linear import SpyreUpcastLinear
 
     torch.manual_seed(0)

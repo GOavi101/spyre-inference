@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Classifier GEMM via fp32 staggered-K mul+sum (no native fp32 batchmatmul).
+"""Classifier GEMM: staggered-K on Spyre, host ``F.linear`` on CPU.
 
 Spyre has fp32 add/mul/sum but not ``F.linear`` / batchmatmul
 (torch-spyre#1794). BERT/RoBERTa sequence heads are small-N GEMMs
@@ -21,10 +21,13 @@ becomes DL16_T0_FP32 on K; broadcast mul then ``sum`` over K needs no
 fp32 ReStickifyOpHBM. ``.to(fp16)`` destaggers the sparse fp32 output
 (torch-spyre#2971) before D2H.
 
-Bias is added on the host: 1-D ``[N]`` cannot restick onto ``[M, N]``
-(fp32 or destaggered fp16). The GEMM is the expensive part.
+Bias is added on the host: 1-D ``[N]`` cannot restick onto ``[M, N]``.
+After that D2H, later Linears (Roberta ``out_proj``) see CPU activations
+and use ``F.linear`` — staggered-K materializes ``[M, N, K]`` and loses
+to BLAS on the host.
 
-Do not use this for vocab-sized heads: it materializes ``[M, N, K]``.
+Do not use this for vocab-sized heads: the Spyre path materializes
+``[M, N, K]``.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from spyre_inference.custom_ops.utils import convert
 
@@ -109,7 +113,7 @@ def _param_to_fp16(data: torch.Tensor, device: torch.device) -> nn.Parameter:
 
 
 class SpyreUpcastLinear(nn.Module):
-    """``F.linear`` via staggered-K fp32 mul+sum; destagger, D2H, host bias."""
+    """Spyre: staggered-K mul+sum; CPU: ``F.linear``. Destagger, D2H, host bias."""
 
     def __init__(self, weight: nn.Parameter, bias: nn.Parameter | None) -> None:
         super().__init__()
@@ -117,7 +121,7 @@ class SpyreUpcastLinear(nn.Module):
         self.bias = bias
         self.in_features = int(weight.shape[1])
         self.out_features = int(weight.shape[0])
-        # Cached host copy: dense D2Hs, so out_proj sees CPU activations.
+        # Host fp32 copy for out_proj after dense D2Hs (and CPU-only tests).
         self._host_weight: torch.Tensor | None = None
 
     @classmethod
@@ -132,20 +136,24 @@ class SpyreUpcastLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig = x.shape
         x2 = x.reshape(-1, orig[-1])
-        # dense destaggers and D2Hs; out_proj must not mul CPU x by Spyre weight.
-        weight = self.weight
-        if weight.device.type != x2.device.type:
-            if x2.device.type == "cpu":
-                if self._host_weight is None:
-                    self._host_weight = _tensor_on(weight.data, "cpu")
-                weight = self._host_weight
-            else:
+        if x2.device.type == "spyre":
+            weight = self.weight
+            if weight.device.type != "spyre":
                 weight = _tensor_on(weight, x2.device)
-        out = _compile_if_spyre(_upcast_linear_kernel, x2.device.type)(x2, weight)
-        if out.device.type == "spyre":
+            out = _compile_if_spyre(_upcast_linear_kernel, "spyre")(x2, weight)
             out = convert(out, "cpu")
-        if self.bias is not None:
-            out = out + _tensor_on(self.bias, out.device).to(dtype=out.dtype)
+            if self.bias is not None:
+                out = out + _tensor_on(self.bias, out.device).to(dtype=out.dtype)
+            return out.reshape(*orig[:-1], self.out_features)
+
+        # Staggered-K materializes [M, N, K]; host F.linear uses BLAS.
+        if self._host_weight is None:
+            w = self.weight.data
+            if w.device.type == "spyre":
+                w = convert(w, "cpu")
+            self._host_weight = w.float()
+        bias = None if self.bias is None else self.bias.float()
+        out = F.linear(x2.float(), self._host_weight, bias).to(dtype=x2.dtype)
         return out.reshape(*orig[:-1], self.out_features)
 
 

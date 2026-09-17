@@ -389,7 +389,8 @@ def prepare_upcast_heads_for_spyre(
     """Swap small fp32 classifier / pooler-dense linears to staggered-K GEMM.
 
     BERT/RoBERTa sequence heads are the target (issue #868). Already-fp16
-    token heads keep native ``F.linear``. Unaligned-K or wide (vocab-scale)
+    token heads keep native ``F.linear``. After the Spyre GEMM D2Hs, later
+    Linears use host ``F.linear``. Unaligned-K or wide (vocab-scale)
     linears stay fp32 and trigger the CPU fallback.
     """
     replaced = 0
@@ -537,9 +538,9 @@ def configure_pooling_for_spyre(
     CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
     reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
     is garbage (torch-spyre#2971). Small BERT/RoBERTa classifier GEMMs use
-    staggered-K fp32 mul+sum (#868) instead of native fp32 ``F.linear``
-    (torch-spyre#1794). False if the method is unknown or a remaining head
-    is an FP32 linear we cannot wrap.
+    staggered-K on Spyre (#868); after D2H the host tail uses ``F.linear``.
+    Native fp32 ``F.linear`` is missing on Spyre (torch-spyre#1794). False if
+    the method is unknown or a remaining head is an FP32 linear we cannot wrap.
 
     ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
     It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
@@ -575,7 +576,7 @@ def configure_pooling_for_spyre(
         prepare_token_head_for_spyre(model, pooler, spyre_device)
 
     # Native fp32 F.linear is missing (torch-spyre#1794). Small BERT/RoBERTa
-    # heads use staggered-K mul+sum instead of a CPU GEMM (#868).
+    # heads use staggered-K on Spyre (#868); the host tail stays F.linear.
     prepare_upcast_heads_for_spyre(model, pooler, spyre_device)
     classifier = getattr(model, "classifier", None)
 
