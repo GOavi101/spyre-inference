@@ -209,6 +209,12 @@ def _index_copy_kernel(dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor
     return dst
 
 
+def _swap_seq_heads(tokens: torch.Tensor) -> torch.Tensor:
+    # ``[B, L, H, D]`` ↔ ``[B, H, L, D]``. Eager permute+contiguous is a
+    # host-launched ``copy_from_d2d`` per Q/K/V and unpack.
+    return tokens.permute(0, 2, 1, 3).contiguous()
+
+
 _CompiledFn = Callable[..., torch.Tensor]
 
 _compiled_kernels: dict[Callable[..., torch.Tensor], _CompiledFn] = {}
@@ -217,8 +223,9 @@ _compiled_kernels: dict[Callable[..., torch.Tensor], _CompiledFn] = {}
 def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
     """Compile ``kernel`` once on Spyre. CPU always runs ``kernel``.
 
-    Memo is keyed on the Python function, so packed QK, P·V, index_copy_, and
-    the two B=1 SDPA kernels each compile once without caller write-back.
+    Memo is keyed on the Python function, so packed QK, P·V, index_copy_,
+    pack layout, and the two B=1 SDPA kernels each compile once without
+    caller write-back.
     """
     if device_type != "spyre":
         return kernel
@@ -447,11 +454,11 @@ def gather_pack(
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
     if batch == 1 and _is_identity_row_map(pack_indices, flat.shape[0]):
         packed = flat.unsqueeze(0)
-        return packed.permute(0, 2, 1, 3).contiguous()
+        return _compile_if_spyre(_swap_seq_heads, packed.device.type)(packed)
     flat_ext = F.pad(flat, (0, 0, 0, 0, 0, 1))
     gathered = select_rows(flat_ext, pack_indices)  # [B*L, H, Dp]
     packed = gathered.view(batch, aligned_len, num_heads, head_size_padded)
-    return packed.permute(0, 2, 1, 3).contiguous()
+    return _compile_if_spyre(_swap_seq_heads, packed.device.type)(packed)
 
 
 def scatter_pack(
@@ -482,12 +489,14 @@ def scatter_pack(
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
     # Fused QKV views are strided (BGE ``stride=(2304, 64, 1)``). Compiled
-    # ``index_copy_`` from that layout writes the wrong rows.
+    # ``index_copy_`` from that layout writes the wrong rows. In-graph
+    # ``contiguous`` is a no-op at a nonzero storage offset, so this densify
+    # stays eager.
     if not flat.is_contiguous():
         flat = flat.contiguous()
     if _is_b1_dense_body(batch, flat.shape[0], aligned_len):
         packed = flat.unsqueeze(0)
-        return packed.permute(0, 2, 1, 3).contiguous()
+        return _compile_if_spyre(_swap_seq_heads, packed.device.type)(packed)
     packed_rows = batch * aligned_len
     rows = packed_rows + 1
     # Extra row is the dummy dest. Slot-major prefix view is 2c on hardware.
@@ -508,7 +517,7 @@ def scatter_pack(
         workspace.zero_()
     _index_copy(workspace, _dest_on_flat_device(dest_idx, flat), flat)
     packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
-    packed = packed.permute(0, 2, 1, 3).contiguous()
+    packed = _compile_if_spyre(_swap_seq_heads, packed.device.type)(packed)
     if packed.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr():
         packed = packed.clone()
     return packed
@@ -552,7 +561,7 @@ def gather_unpack(
     Identity ``B=1`` (``T == B×L``) is a reshape; pad / multi-seq still gather.
     """
     batch, num_heads, aligned_len, head_size_padded = attn_out.shape
-    tokens = attn_out.permute(0, 2, 1, 3).contiguous()
+    tokens = _compile_if_spyre(_swap_seq_heads, attn_out.device.type)(attn_out)
     flat_padded = tokens.reshape(batch * aligned_len, num_heads, head_size_padded)
     if _is_identity_row_map(unpack_indices, flat_padded.shape[0]) or _is_b1_dense_body(
         batch, unpack_indices.shape[0], aligned_len

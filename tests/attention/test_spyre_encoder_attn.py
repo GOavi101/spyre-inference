@@ -944,6 +944,41 @@ def test_scatter_pack_strided_qkv_source_matches_contiguous():
     torch.testing.assert_close(got, ref)
 
 
+def test_scatter_pack_compiles_layout_transform(monkeypatch) -> None:
+    """Permute+contiguous after pack must enter ``_compile_if_spyre``."""
+    seen: list[str] = []
+    real = encoder_attn._compile_if_spyre
+
+    def rec(kernel, device_type):
+        seen.append(kernel.__name__)
+        return real(kernel, device_type)
+
+    monkeypatch.setattr(encoder_attn, "_compile_if_spyre", rec)
+    torch.manual_seed(0)
+    t, h, d = 8, 4, 8
+    qkv = torch.randn(t, 3 * h * d)
+    q = qkv[:, : h * d].view(t, h, d)
+    dest = host_scatter_pack_dest([0, 4], [4, 4], 8, 8, dummy_row=16)
+    scatter_pack(q, dest, batch=2, aligned_len=8, head_size_padded=d)
+    assert seen.count("_swap_seq_heads") == 1
+    assert "_as_contiguous" not in seen
+
+
+def test_gather_unpack_compiles_layout_transform(monkeypatch) -> None:
+    seen: list[str] = []
+    real = encoder_attn._compile_if_spyre
+
+    def rec(kernel, device_type):
+        seen.append(kernel.__name__)
+        return real(kernel, device_type)
+
+    monkeypatch.setattr(encoder_attn, "_compile_if_spyre", rec)
+    attn_out = torch.randn(1, 2, 8, 8)
+    unpack = torch.arange(8)
+    gather_unpack(attn_out, unpack, head_size=8)
+    assert seen == ["_swap_seq_heads"]
+
+
 def _count_select_rows(monkeypatch):
     """Wrap ``select_rows`` so tests can assert identity B=1 skips gather."""
     real = encoder_attn.select_rows
