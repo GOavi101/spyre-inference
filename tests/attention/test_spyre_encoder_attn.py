@@ -30,9 +30,11 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     _content_query_lens,
     build_attention_mask,
+    build_key_pad_mask,
     dummy_pack_row,
     gather_pack,
     gather_unpack,
+    host_key_pad_mask,
     host_pack_indices,
     host_scatter_pack_dest,
     scatter_pack,
@@ -676,7 +678,7 @@ def _run_b1_padded_forward(monkeypatch, *, seq_len: int, qsl_end: int, actual: i
     packed_calls = {"n": 0}
     index_copy_calls = {"n": 0}
     real_fused = encoder_attn._b1_dense_attention
-    real_scatter = encoder_attn.scatter_pack
+    real_scatter = encoder_attn.scatter_pack_qkv
     real_packed = encoder_attn._packed_masked_attention
     real_index = encoder_attn._index_copy
 
@@ -697,7 +699,7 @@ def _run_b1_padded_forward(monkeypatch, *, seq_len: int, qsl_end: int, actual: i
         return real_index(*args, **kwargs)
 
     monkeypatch.setattr(encoder_attn, "_b1_dense_attention", count_fused)
-    monkeypatch.setattr(encoder_attn, "scatter_pack", count_scatter)
+    monkeypatch.setattr(encoder_attn, "scatter_pack_qkv", count_scatter)
     monkeypatch.setattr(encoder_attn, "_packed_masked_attention", count_packed)
     monkeypatch.setattr(encoder_attn, "_index_copy", count_index)
     impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
@@ -716,7 +718,7 @@ def test_b1_padded_body_uses_packed_mask(monkeypatch, default_vllm_config) -> No
     )
     assert fused == 0
     assert packed == 1
-    assert scatter == 3
+    assert scatter == 1
     assert index_copy == 0
     _assert_pad_mask(meta, 5)
 
@@ -729,7 +731,7 @@ def test_b1_padded_qsl_and_seq_use_actual_tokens(monkeypatch, default_vllm_confi
     )
     assert fused == 0
     assert packed == 1
-    assert scatter == 3
+    assert scatter == 1
     assert index_copy == 0
     _assert_pad_mask(meta, 5)
 
@@ -785,6 +787,183 @@ def test_b1_short_seq_scatter_uses_packed_mask(monkeypatch, default_vllm_config)
     impl.forward(**fwd, output=torch.empty_like(query))
     assert packed["n"] == 1
     assert sdpa["n"] == 0
+
+
+@torch.inference_mode()
+def test_b_full_grid_uses_unmasked_packed_sdpa(monkeypatch, default_vllm_config) -> None:
+    """Fair 8×512 shape: B>1, every sequence fills L → packed F.sdpa, no QK/P·V mask path."""
+    packed = {"n": 0}
+    sdpa = {"n": 0}
+    mask = {"n": 0}
+    real_packed = encoder_attn._packed_masked_attention
+    real_sdpa = encoder_attn._packed_unmasked_attention
+    real_mask = encoder_attn.build_key_pad_mask
+
+    def count_packed(*args, **kwargs):
+        packed["n"] += 1
+        return real_packed(*args, **kwargs)
+
+    def count_sdpa(*args, **kwargs):
+        sdpa["n"] += 1
+        return real_sdpa(*args, **kwargs)
+
+    def count_mask(*args, **kwargs):
+        mask["n"] += 1
+        return real_mask(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "_packed_masked_attention", count_packed)
+    monkeypatch.setattr(encoder_attn, "_packed_unmasked_attention", count_sdpa)
+    monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_mask)
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    batch, length = 2, 64
+    num_heads, num_kv_heads, head_size, block_size = 16, 4, 64, 64
+    dtype = torch.float16
+    total = batch * length
+    query = torch.randn(total, num_heads, head_size, dtype=dtype)
+    key = torch.randn(total, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(total, num_kv_heads, head_size, dtype=dtype)
+    cu = torch.tensor([0, length, 2 * length], dtype=torch.int32)
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([length, length], dtype=torch.int32),
+        query_start_loc=cu,
+        block_table=torch.zeros(batch, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=torch.empty_like(query),
+    )
+    assert not attn_metadata.encoder_fused_sdpa
+    assert attn_metadata.encoder_unmasked_sdpa
+    assert attn_metadata.encoder_key_pad_mask is None
+    assert packed["n"] == 0
+    assert sdpa["n"] == 1
+    assert mask["n"] == 0
+
+
+@torch.inference_mode()
+def test_ragged_full_area_does_not_identity_unpack(monkeypatch, default_vllm_config) -> None:
+    """T==B×L with live pad is concatenated, not a dense grid — must index_select."""
+    identity = {"n": 0}
+    select = {"n": 0}
+    real_identity = encoder_attn._unpack_identity_store_kernel
+    real_select = encoder_attn._unpack_store_kernel
+
+    def count_identity(*args, **kwargs):
+        identity["n"] += 1
+        return real_identity(*args, **kwargs)
+
+    def count_select(*args, **kwargs):
+        select["n"] += 1
+        return real_select(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "_unpack_identity_store_kernel", count_identity)
+    monkeypatch.setattr(encoder_attn, "_unpack_store_kernel", count_select)
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    batch, length = 2, 64
+    num_heads, num_kv_heads, head_size, block_size = 16, 4, 64, 64
+    dtype = torch.float16
+    total = batch * length
+    query = torch.randn(total, num_heads, head_size, dtype=dtype)
+    key = torch.randn(total, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(total, num_kv_heads, head_size, dtype=dtype)
+    # Real tokens 40+24=64; body padded to 128 so T==B×L with live pad.
+    cu = torch.tensor([0, 40, 64], dtype=torch.int32)
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([40, 24], dtype=torch.int32),
+        query_start_loc=cu,
+        block_table=torch.zeros(batch, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=torch.empty_like(query),
+    )
+    assert not attn_metadata.encoder_unmasked_sdpa
+    assert identity["n"] == 0
+    assert select["n"] == 1
+
+
+@pytest.mark.parametrize(
+    "query_lens,kv_lens,aligned_len,num_kv_heads",
+    [
+        pytest.param([32], [32], 64, 12, id="single_32"),
+        pytest.param([9, 70, 5], [9, 70, 5], 128, 12, id="batch_unaligned"),
+        pytest.param([16, 8], [8, 8], 64, 4, id="kv_shorter_than_q"),
+        pytest.param([5, 0], [5, 0], 64, 1, id="dummy_seq"),
+    ],
+)
+@torch.inference_mode()
+def test_build_key_pad_mask_matches_sliced_square(
+    query_lens: list[int],
+    kv_lens: list[int],
+    aligned_len: int,
+    num_kv_heads: int,
+) -> None:
+    """Direct ``[B*KV, 1, 1, L]`` row must match slicing query-row 0 of the square."""
+    dtype = torch.float16
+    square = build_attention_mask(
+        len(query_lens),
+        aligned_len,
+        query_lens,
+        kv_lens,
+        dtype=dtype,
+    )
+    sliced = host_key_pad_mask(square, num_kv_heads)
+    got = build_key_pad_mask(
+        len(query_lens),
+        aligned_len,
+        query_lens,
+        kv_lens,
+        num_kv_heads,
+        dtype=dtype,
+    )
+    assert got.shape == (len(query_lens) * num_kv_heads, 1, 1, aligned_len)
+    torch.testing.assert_close(got, sliced, atol=0, rtol=0)
 
 
 def test_scatter_pack_reused_workspace_zeros_pad_slots():
@@ -945,7 +1124,7 @@ def test_scatter_pack_strided_qkv_source_matches_contiguous():
 
 
 def test_scatter_pack_compiles_layout_transform(monkeypatch) -> None:
-    """Permute+contiguous after pack must enter ``_compile_if_spyre``."""
+    """zero_ + index_copy_ + permute after pack must enter ``_compile_if_spyre``."""
     seen: list[str] = []
     real = encoder_attn._compile_if_spyre
 
@@ -960,7 +1139,7 @@ def test_scatter_pack_compiles_layout_transform(monkeypatch) -> None:
     q = qkv[:, : h * d].view(t, h, d)
     dest = host_scatter_pack_dest([0, 4], [4, 4], 8, 8, dummy_row=16)
     scatter_pack(q, dest, batch=2, aligned_len=8, head_size_padded=d)
-    assert seen.count("_swap_seq_heads") == 1
+    assert seen.count("_pack_kernel") == 1
     assert "_as_contiguous" not in seen
 
 
@@ -992,16 +1171,16 @@ def _count_select_rows(monkeypatch):
     return calls
 
 
-def _count_index_copy(monkeypatch):
-    """Wrap ``_index_copy`` so tests can assert B=1 dense body skips scatter."""
-    real = encoder_attn._index_copy
+def _count_pack_kernel(monkeypatch):
+    """Wrap ``_pack_kernel`` so tests can assert B=1 dense body skips scatter."""
+    real = encoder_attn._pack_kernel
     calls = {"n": 0}
 
     def counting(*args, **kwargs):
         calls["n"] += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(encoder_attn, "_index_copy", counting)
+    monkeypatch.setattr(encoder_attn, "_pack_kernel", counting)
     return calls
 
 
@@ -1062,7 +1241,7 @@ def test_gather_pack_multi_seq_still_index_select(monkeypatch):
 
 def test_scatter_pack_b1_body_bucket_skips_index_copy(monkeypatch):
     """Body-bucket T=64 with 62 real tokens: skip scatter; mask covers pad slots."""
-    calls = _count_index_copy(monkeypatch)
+    calls = _count_pack_kernel(monkeypatch)
     tokens, aligned_len, heads, dim = 62, 64, 2, 8
     extra = aligned_len - tokens
     torch.manual_seed(0)
@@ -1084,7 +1263,7 @@ def test_scatter_pack_b1_body_bucket_skips_index_copy(monkeypatch):
 
 def test_scatter_pack_b1_short_seq_still_index_copy(monkeypatch):
     """T=62, L=64: body is not dense; still scatter."""
-    calls = _count_index_copy(monkeypatch)
+    calls = _count_pack_kernel(monkeypatch)
     _assert_scatter_matches_gather(
         q_starts=[0],
         query_lens=[62],
@@ -1098,7 +1277,7 @@ def test_scatter_pack_b1_short_seq_still_index_copy(monkeypatch):
 
 def test_scatter_pack_multi_seq_still_index_copy(monkeypatch):
     """B>1 still scatters even when T == B×L."""
-    calls = _count_index_copy(monkeypatch)
+    calls = _count_pack_kernel(monkeypatch)
     batch, length, heads, dim = 2, 4, 2, 8
     flat = torch.randn(batch * length, heads, dim)
     dest = torch.arange(batch * length, dtype=torch.int64)
