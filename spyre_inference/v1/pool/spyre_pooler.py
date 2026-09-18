@@ -320,30 +320,37 @@ class SpyreTokenPooler(TokenPooler):
         return trimmed
 
 
-def prepare_token_head_for_spyre(
+def _has_classifier(model: nn.Module, pooler: nn.Module) -> bool:
+    if getattr(model, "classifier", None) is not None:
+        return True
+    return any(getattr(m, "classifier", None) is not None for m in pooler.modules())
+
+
+def _downcast_module_to_fp16(module: nn.Module, spyre_device: torch.device) -> None:
+    """On-device fp32→fp16 is staggered garbage (torch-spyre#2971); go via host."""
+    for child in module.modules():
+        if getattr(child, "head_dtype", None) is not None:
+            child.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
+    for param in module.parameters(recurse=True):
+        if param.dtype != torch.float32:
+            continue
+        # convert() detours via host; CPU unit tests have no spyre_convert.
+        if param.device.type == "spyre" or spyre_device.type == "spyre":
+            param.data = convert(param.data, spyre_device, torch.float16)
+        else:
+            param.data = param.data.to(device=spyre_device, dtype=torch.float16)
+
+
+def prepare_fp32_head_for_spyre(
     model: nn.Module, pooler: nn.Module, spyre_device: torch.device
 ) -> None:
-    """Keep the token-level tail in fp16 so it can run on Spyre.
-
-    Heads cast per chunk to a float32 ``head_dtype`` and the model casts before
-    its own classifier; both are wrong on device, and Spyre has no fp32 matmul.
-    """
-    # Scope to the token sub-poolers: a DispatchPooler can also hold a sequence
-    # pooler whose fp32 head is handled by SpyreEmbeddingPoolerHead instead.
-    targets = [m for m in pooler.modules() if isinstance(m, TokenPooler)]
+    """Downcast classifier weights to fp16; Spyre has no fp32 matmul (torch-spyre#1794)."""
+    _downcast_module_to_fp16(pooler, spyre_device)
     classifier = getattr(model, "classifier", None)
     if classifier is not None:
-        targets.append(classifier)
+        _downcast_module_to_fp16(classifier, spyre_device)
     if getattr(model, "head_dtype", None) is not None:
         model.head_dtype = torch.float16
-    for target in targets:
-        for module in target.modules():
-            if getattr(module, "head_dtype", None) is not None:
-                module.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
-        # A dtype cast on device returns wrong data; convert() detours via host.
-        for param in target.parameters(recurse=True):
-            if param.dtype == torch.float32:
-                param.data = convert(param.data, spyre_device, torch.float16)
 
 
 class SpyreCpuClassifier(nn.Module):
@@ -484,8 +491,9 @@ def configure_pooling_for_spyre(
 
     CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
     reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
-    is garbage (torch-spyre#2971). False if the method is unknown or the
-    head is an FP32 linear.
+    is garbage (torch-spyre#2971). Classifier / reranker heads are downcast
+    to fp16 (no native fp32 matmul, torch-spyre#1794). False if the pooling
+    method is unknown.
 
     ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
     It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
@@ -511,27 +519,22 @@ def configure_pooling_for_spyre(
 
     classifier = getattr(model, "classifier", None)
     token_level = any(isinstance(m, SpyreAllPool) for m in pooler.modules())
-    if token_level:
-        if not len_ladder:
-            logger.warning(
-                "Pooling: token pooling has no length ladder (max_model_len was "
-                "not passed); gathers round to every 64-multiple instead of the "
-                "power-of-two buckets, so more shapes compile than necessary"
-            )
-        prepare_token_head_for_spyre(model, pooler, spyre_device)
+    if token_level and not len_ladder:
+        logger.warning(
+            "Pooling: token pooling has no length ladder (max_model_len was "
+            "not passed); gathers round to every 64-multiple instead of the "
+            "power-of-two buckets, so more shapes compile than necessary"
+        )
+    if token_level or _has_classifier(model, pooler):
+        prepare_fp32_head_for_spyre(model, pooler, spyre_device)
 
-    # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul
-    # (torch-spyre#1794). Reranker / classifier heads stay float32, so those
-    # stay on CPU.
+    # Leftover fp32 (embed projector, no classifier) still has no Spyre matmul.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )
     if fp32_head:
         run_pooling_tail_on_cpu(model, pooler)
-        logger.info(
-            "Pooling: FP32 classifier/head unsupported on Spyre "
-            "(no FP32 batchmatmul); running pooler on CPU"
-        )
+        logger.info("Pooling: leftover FP32 weights have no Spyre matmul; running pooler on CPU")
         return False
 
     num_norm = patch_normalize_for_spyre(pooler)

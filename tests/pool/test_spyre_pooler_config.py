@@ -16,7 +16,8 @@
 
 No Spyre hardware: builds minimal ``SequencePooler`` / ``DispatchPooler`` /
 ``TokenPooler`` graphs and checks CLS/LAST/MEAN/AllPool become Spyre forms.
-FP32 linear heads stay on CPU.
+FP32 linear heads are downcast to fp16 so the GEMM can run on Spyre.
+An embed projector with no classifier still falls back to CPU.
 
 Host MEAN crop lives in ``tests/pool/test_spyre_mean_pool.py``. Destagger
 of a device fp32 sum is ``test_spyre_fp32_reduce_d2h_with_destagger``
@@ -30,7 +31,10 @@ import torch
 import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
-from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
+from vllm.model_executor.layers.pooler.seqwise.heads import (
+    ClassifierPoolerHead,
+    EmbeddingPoolerHead,
+)
 from vllm.model_executor.layers.pooler.seqwise.methods import CLSPool, LastPool, MeanPool
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
@@ -115,12 +119,53 @@ def test_configure_pooling_dispatch_patches_embed_last():
     assert isinstance(embed.pooling, SpyreLastPool)
 
 
-def test_configure_pooling_fp32_classifier_falls_back_to_cpu():
-    model = _model_with_pooler(_embed_pooler(CLSPool()))
-    model.classifier = nn.Linear(8, 2)  # float32 linear still not on Spyre
-    assert configure_pooling_for_spyre(model, _SPYRE) is False
-    # CLS is swapped first; the FP32 linear still forces CPU.
+def test_configure_pooling_fp32_classifier_downcasts_to_fp16():
+    classifier = nn.Linear(8, 2)
+    pooler = SequencePooler(
+        pooling=CLSPool(),
+        head=ClassifierPoolerHead(classifier=classifier, head_dtype=torch.float32),
+    )
+    model = _model_with_pooler(pooler)
+    model.classifier = classifier
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
     assert isinstance(model.pooler.pooling, SpyreCLSPool)
+    assert classifier.weight.dtype == torch.float16
+    assert classifier.bias.dtype == torch.float16
+    assert model.pooler.head.head_dtype == torch.float16
+
+
+def test_configure_pooling_roberta_head_dense_and_out_proj_downcast():
+    class _RobertaHead(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dense = nn.Linear(8, 8)
+            self.out_proj = nn.Linear(8, 1)
+
+    head = _RobertaHead()
+    pooler = SequencePooler(
+        pooling=CLSPool(),
+        head=ClassifierPoolerHead(classifier=head, head_dtype=torch.float32),
+    )
+    model = _model_with_pooler(pooler)
+    model.classifier = head
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
+    assert head.dense.weight.dtype == torch.float16
+    assert head.out_proj.weight.dtype == torch.float16
+    assert model.pooler.head.head_dtype == torch.float16
+
+
+def test_configure_pooling_fp32_embed_projector_falls_back_to_cpu():
+    """No classifier → embed projector stays fp32 and the pooler stays on CPU."""
+    projector = nn.Linear(8, 8)
+    pooler = SequencePooler(
+        pooling=CLSPool(),
+        head=EmbeddingPoolerHead(
+            projector=projector, head_dtype=torch.float32, activation=PoolerNormalize()
+        ),
+    )
+    model = _model_with_pooler(pooler)
+    assert configure_pooling_for_spyre(model, _SPYRE) is False
+    assert projector.weight.dtype == torch.float32
 
 
 def test_configure_pooling_no_pooler_returns_false():
