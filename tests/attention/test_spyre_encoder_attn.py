@@ -866,21 +866,7 @@ def test_b_full_grid_uses_unmasked_packed_sdpa(monkeypatch, default_vllm_config)
 @torch.inference_mode()
 def test_ragged_full_area_does_not_identity_unpack(monkeypatch, default_vllm_config) -> None:
     """T==B×L with live pad is concatenated, not a dense grid — must index_select."""
-    identity = {"n": 0}
-    select = {"n": 0}
-    real_identity = encoder_attn._unpack_identity_store_kernel
-    real_select = encoder_attn._unpack_store_kernel
-
-    def count_identity(*args, **kwargs):
-        identity["n"] += 1
-        return real_identity(*args, **kwargs)
-
-    def count_select(*args, **kwargs):
-        select["n"] += 1
-        return real_select(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "_unpack_identity_store_kernel", count_identity)
-    monkeypatch.setattr(encoder_attn, "_unpack_store_kernel", count_select)
+    calls = _count_select_rows(monkeypatch)
 
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -924,8 +910,7 @@ def test_ragged_full_area_does_not_identity_unpack(monkeypatch, default_vllm_con
         output=torch.empty_like(query),
     )
     assert not attn_metadata.encoder_unmasked_sdpa
-    assert identity["n"] == 0
-    assert select["n"] == 1
+    assert calls["n"] == 1
 
 
 @pytest.mark.parametrize(
@@ -1124,7 +1109,7 @@ def test_scatter_pack_strided_qkv_source_matches_contiguous():
 
 
 def test_scatter_pack_compiles_layout_transform(monkeypatch) -> None:
-    """zero_ + index_copy_ + permute after pack must enter ``_compile_if_spyre``."""
+    """Compiled ``index_copy_`` + permute; the slot-major view stays eager."""
     seen: list[str] = []
     real = encoder_attn._compile_if_spyre
 
@@ -1139,7 +1124,8 @@ def test_scatter_pack_compiles_layout_transform(monkeypatch) -> None:
     q = qkv[:, : h * d].view(t, h, d)
     dest = host_scatter_pack_dest([0, 4], [4, 4], 8, 8, dummy_row=16)
     scatter_pack(q, dest, batch=2, aligned_len=8, head_size_padded=d)
-    assert seen.count("_pack_kernel") == 1
+    assert seen.count("_index_copy_kernel") == 1
+    assert seen.count("_swap_seq_heads") == 1
     assert "_as_contiguous" not in seen
 
 
@@ -1171,16 +1157,16 @@ def _count_select_rows(monkeypatch):
     return calls
 
 
-def _count_pack_kernel(monkeypatch):
-    """Wrap ``_pack_kernel`` so tests can assert B=1 dense body skips scatter."""
-    real = encoder_attn._pack_kernel
+def _count_index_copy(monkeypatch):
+    """Wrap ``_index_copy`` so tests can assert B=1 dense body skips scatter."""
+    real = encoder_attn._index_copy
     calls = {"n": 0}
 
     def counting(*args, **kwargs):
         calls["n"] += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(encoder_attn, "_pack_kernel", counting)
+    monkeypatch.setattr(encoder_attn, "_index_copy", counting)
     return calls
 
 
@@ -1241,7 +1227,7 @@ def test_gather_pack_multi_seq_still_index_select(monkeypatch):
 
 def test_scatter_pack_b1_body_bucket_skips_index_copy(monkeypatch):
     """Body-bucket T=64 with 62 real tokens: skip scatter; mask covers pad slots."""
-    calls = _count_pack_kernel(monkeypatch)
+    calls = _count_index_copy(monkeypatch)
     tokens, aligned_len, heads, dim = 62, 64, 2, 8
     extra = aligned_len - tokens
     torch.manual_seed(0)
@@ -1263,7 +1249,7 @@ def test_scatter_pack_b1_body_bucket_skips_index_copy(monkeypatch):
 
 def test_scatter_pack_b1_short_seq_still_index_copy(monkeypatch):
     """T=62, L=64: body is not dense; still scatter."""
-    calls = _count_pack_kernel(monkeypatch)
+    calls = _count_index_copy(monkeypatch)
     _assert_scatter_matches_gather(
         q_starts=[0],
         query_lens=[62],
@@ -1277,7 +1263,7 @@ def test_scatter_pack_b1_short_seq_still_index_copy(monkeypatch):
 
 def test_scatter_pack_multi_seq_still_index_copy(monkeypatch):
     """B>1 still scatters even when T == B×L."""
-    calls = _count_pack_kernel(monkeypatch)
+    calls = _count_index_copy(monkeypatch)
     batch, length, heads, dim = 2, 4, 2, 8
     flat = torch.randn(batch * length, heads, dim)
     dest = torch.arange(batch * length, dtype=torch.int64)

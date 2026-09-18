@@ -27,8 +27,9 @@ with ``T == L`` and a full prompt compiles permute+SDPA (no ``attn_mask``).
 Spyre default-layout ``view(B, L)`` scrambles — then compiled unmasked
 ``F.sdpa`` on the packed grid (no ``[B*H, L, L]`` scores). Live pad uses
 packed QK + compiled mask/P·V (Inductor ``matmul + mask`` → ``F.sdpa``
-drops the mask; BGE cosine ~0.46). Pack is one compiled
-``zero_``+``index_copy_``+permute for Q/K/V. Dest/mask use
+drops the mask; BGE cosine ~0.46). Pack is compiled ``index_copy_``,
+eager slot-major ``view``, then compiled permute — fusing the view into
+the copy graph scrambles B>1 (torch-spyre#3705). Dest/mask use
 ``min(qsl, seq_lens, num_actual_tokens)``. Dest/unpack stay on host when
 ``T == L``. Pack tensors are built once per step.
 """
@@ -233,52 +234,6 @@ def _swap_seq_heads(tokens: torch.Tensor) -> torch.Tensor:
     return tokens.permute(0, 2, 1, 3).contiguous()
 
 
-def _pack_kernel(
-    workspace: torch.Tensor,
-    dest: torch.Tensor,
-    flat: torch.Tensor,
-    packed_rows: int,
-    batch: int,
-    aligned_len: int,
-    num_heads: int,
-    head_size_padded: int,
-) -> torch.Tensor:
-    """``zero_`` + ``index_copy_`` + permute in one graph (one launch per tensor)."""
-    workspace.zero_()
-    workspace.index_copy_(0, dest, flat)
-    packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
-    return packed.permute(0, 2, 1, 3).contiguous()
-
-
-def _pack_qkv_kernel(
-    q_ws: torch.Tensor,
-    kv_ws: torch.Tensor,
-    v_ws: torch.Tensor,
-    q_dest: torch.Tensor,
-    kv_dest: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    packed_rows: int,
-    batch: int,
-    aligned_len: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size_padded: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Q/K/V pack in one jobplan. MHA and GQA both fit (K/V share dest, not Q)."""
-    q_batched = _pack_kernel(
-        q_ws, q_dest, query, packed_rows, batch, aligned_len, num_heads, head_size_padded
-    )
-    k_batched = _pack_kernel(
-        kv_ws, kv_dest, key, packed_rows, batch, aligned_len, num_kv_heads, head_size_padded
-    )
-    v_batched = _pack_kernel(
-        v_ws, kv_dest, value, packed_rows, batch, aligned_len, num_kv_heads, head_size_padded
-    )
-    return q_batched, k_batched, v_batched
-
-
 def _packed_sdpa_kernel(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, scale: float
 ) -> torch.Tensor:
@@ -294,31 +249,6 @@ def _packed_sdpa_kernel_gqa(
     )
 
 
-def _unpack_store_kernel(
-    output: torch.Tensor, attn_out: torch.Tensor, unpack_idx: torch.Tensor
-) -> torch.Tensor:
-    """Permute-unpack + ``index_select`` + write ``output`` in one graph."""
-    batch, num_heads, aligned_len, dim = attn_out.shape
-    tokens = attn_out.permute(0, 2, 1, 3).contiguous()
-    flat = tokens.reshape(batch * aligned_len, num_heads, dim)
-    output.copy_(flat.index_select(0, unpack_idx))
-    return output
-
-
-def _unpack_identity_store_kernel(output: torch.Tensor, attn_out: torch.Tensor) -> torch.Tensor:
-    """``T == B×L``: permute + reshape + store, no ``index_select``."""
-    batch, num_heads, aligned_len, dim = attn_out.shape
-    tokens = attn_out.permute(0, 2, 1, 3).contiguous()
-    output.copy_(tokens.reshape(batch * aligned_len, num_heads, dim))
-    return output
-
-
-def _maybe_clone_if_aliases(packed: torch.Tensor, workspace: torch.Tensor) -> torch.Tensor:
-    if packed.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr():
-        return packed.clone()
-    return packed
-
-
 _CompiledFn = Callable[..., Any]
 
 _compiled_kernels: dict[Callable[..., Any], _CompiledFn] = {}
@@ -327,8 +257,8 @@ _compiled_kernels: dict[Callable[..., Any], _CompiledFn] = {}
 def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
     """Compile ``kernel`` once on Spyre. CPU always runs ``kernel``.
 
-    Memo is keyed on the Python function, so packed QK, P·V, pack, unpack
-    store, and the SDPA kernels each compile once without caller write-back.
+    Memo is keyed on the Python function, so packed QK, P·V, index_copy_,
+    pack layout, and the SDPA kernels each compile once without caller write-back.
     """
     if device_type != "spyre":
         return kernel
@@ -497,31 +427,6 @@ def _packed_unmasked_attention(
     return _call_kernel("packed encoder SDPA", fn, query, key, value, scale)
 
 
-def _store_packed_output(
-    output: torch.Tensor,
-    attn_out: torch.Tensor,
-    unpack_idx: torch.Tensor,
-    *,
-    identity: bool,
-) -> torch.Tensor:
-    """Fuse unpack permute into the vLLM output buffer.
-
-    ``identity`` is only the dense grid (B=1 ``T==L``, or unmasked B>1 with
-    ``T==B×L``). Ragged ``T==B×L`` still needs ``index_select``: the body is
-    concatenated, not slot-major ``[B, L]``.
-    """
-    if identity:
-        store = _compile_if_spyre(_unpack_identity_store_kernel, output.device.type)
-        return _call_kernel("encoder unpack store", store, output, attn_out)
-    idx = unpack_idx
-    if idx.device != attn_out.device or (
-        attn_out.device.type == "spyre" and idx.dtype != torch.int32
-    ):
-        idx = _indices_for_device(idx, attn_out.device)
-    store = _compile_if_spyre(_unpack_store_kernel, output.device.type)
-    return _call_kernel("encoder unpack store", store, output, attn_out, idx)
-
-
 def _b1_dense_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -682,37 +587,14 @@ def scatter_pack(
             flat.dtype,
             flat.device,
         )
-    dest = _dest_on_flat_device(dest_idx, flat)
-    packed = _compile_if_spyre(_pack_kernel, flat.device.type)(
-        workspace,
-        dest,
-        flat,
-        packed_rows,
-        batch,
-        aligned_len,
-        num_heads,
-        head_size_padded,
-    )
-    return _maybe_clone_if_aliases(packed, workspace)
-
-
-def _densify_qkv(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    head_size_padded: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Eager densify + D-pad. In-graph ``contiguous`` is a no-op at a nonzero offset."""
-    query = _pad_head_dim_to_stick(query, head_size_padded)
-    key = _pad_head_dim_to_stick(key, head_size_padded)
-    value = _pad_head_dim_to_stick(value, head_size_padded)
-    if not query.is_contiguous():
-        query = query.contiguous()
-    if not key.is_contiguous():
-        key = key.contiguous()
-    if not value.is_contiguous():
-        value = value.contiguous()
-    return query, key, value
+    else:
+        workspace.zero_()
+    _index_copy(workspace, _dest_on_flat_device(dest_idx, flat), flat)
+    packed = workspace[:packed_rows].view(batch, aligned_len, num_heads, head_size_padded)
+    packed = _compile_if_spyre(_swap_seq_heads, packed.device.type)(packed)
+    if packed.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr():
+        packed = packed.clone()
+    return packed
 
 
 def scatter_pack_qkv(
@@ -728,35 +610,15 @@ def scatter_pack_qkv(
     kv_ws: torch.Tensor,
     v_ws: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One compiled Q/K/V pack. Workspaces must already match ``[B*L+1, H, Dp]``."""
-    query, key, value = _densify_qkv(query, key, value, head_size_padded)
-    if _is_b1_dense_body(batch, query.shape[0], aligned_len):
-        swap = _compile_if_spyre(_swap_seq_heads, query.device.type)
-        return swap(query.unsqueeze(0)), swap(key.unsqueeze(0)), swap(value.unsqueeze(0))
-    packed_rows = batch * aligned_len
-    q_dest = _dest_on_flat_device(q_dest, query)
-    kv_dest = _dest_on_flat_device(kv_dest, key)
-    pack = _compile_if_spyre(_pack_qkv_kernel, query.device.type)
-    q_batched, k_batched, v_batched = pack(
-        q_ws,
-        kv_ws,
-        v_ws,
-        q_dest,
-        kv_dest,
-        query,
-        key,
-        value,
-        packed_rows,
-        batch,
-        aligned_len,
-        query.shape[1],
-        key.shape[1],
-        head_size_padded,
-    )
+    """Pack Q, K, V. Each pack stays a separate compiled ``index_copy_`` + permute.
+
+    Slot-major ``view(B, L)`` after ``index_copy_`` must stay eager: compiling
+    that view with the mutation scrambles B>1 (torch-spyre#3705).
+    """
     return (
-        _maybe_clone_if_aliases(q_batched, q_ws),
-        _maybe_clone_if_aliases(k_batched, kv_ws),
-        _maybe_clone_if_aliases(v_batched, v_ws),
+        scatter_pack(query, q_dest, batch, aligned_len, head_size_padded, workspace=q_ws),
+        scatter_pack(key, kv_dest, batch, aligned_len, head_size_padded, workspace=kv_ws),
+        scatter_pack(value, kv_dest, batch, aligned_len, head_size_padded, workspace=v_ws),
     )
 
 
@@ -1165,26 +1027,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     key_pad_mask,
                     scale,
                 )
-            use_flat_write = (
-                target_device.type == "spyre" and head_size % ENCODER_SEQ_ALIGNMENT != 0
-            )
-            # Compiled ``copy_`` reads offset 0 (torch-spyre#3770). A viewed
-            # ``empty(T, H*D).view(T, H, D)`` must stay on the eager store.
-            fused_store_ok = (
-                not use_flat_write
-                and attn_out.shape[-1] == head_size
-                and attn_out.dtype == output.dtype
-                and attn_out.device.type == output.device.type
-                and output.storage_offset() == 0
-                and output.is_contiguous()
-            )
-            if fused_store_ok:
-                identity = padded_tokens == batch * aligned_len and (
-                    unmasked or _is_b1_dense_body(batch, padded_tokens, aligned_len)
-                )
-                return _store_packed_output(
-                    output, attn_out, unpack_idx, identity=identity
-                )
             result = gather_unpack(attn_out, unpack_idx, head_size)
         if result.dtype != output.dtype:
             result = convert(result, dtype=output.dtype)
@@ -1267,55 +1109,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     )
                     continue
                 recorded += 1
-            try:
-                dp = _align_up(self.head_size)
-                q_flat = convert(
-                    torch.zeros(num_src, self.num_heads, self.head_size, dtype=self.model_dtype),
-                    device,
-                )
-                k_flat = convert(
-                    torch.zeros(
-                        num_src, self.num_kv_heads, self.head_size, dtype=self.model_dtype
-                    ),
-                    device,
-                )
-                v_flat = convert(
-                    torch.zeros(
-                        num_src, self.num_kv_heads, self.head_size, dtype=self.model_dtype
-                    ),
-                    device,
-                )
-                rows = batch * aligned_len + 1
-                q_ws = _zeros_slot_major(rows, self.num_heads, dp, self.model_dtype, device)
-                kv_ws = _zeros_slot_major(
-                    rows, self.num_kv_heads, dp, self.model_dtype, device
-                )
-                v_ws = _zeros_slot_major(
-                    rows, self.num_kv_heads, dp, self.model_dtype, device
-                )
-                scatter_pack_qkv(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    dest,
-                    dest,
-                    batch,
-                    aligned_len,
-                    dp,
-                    q_ws,
-                    kv_ws,
-                    v_ws,
-                )
-                recorded += 1
-            except Exception:
-                logger.warning(
-                    "Encoder fused QKV pack (B=%d, L=%d, src=%d) failed to record; "
-                    "it will compile on first use instead.",
-                    batch,
-                    aligned_len,
-                    num_src,
-                    exc_info=True,
-                )
             if (batch, aligned_len) in sdpa_seen:
                 continue
             sdpa_seen.add((batch, aligned_len))
@@ -1339,25 +1132,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     ),
                     device,
                 )
-                attn = _packed_unmasked_attention(
+                _packed_unmasked_attention(
                     q, k, v, 1.0, self.num_heads != self.num_kv_heads
-                )
-                out = convert(
-                    torch.zeros(
-                        batch * aligned_len, self.num_heads, dp, dtype=self.model_dtype
-                    ),
-                    device,
-                )
-                _store_packed_output(
-                    out,
-                    attn,
-                    torch.arange(batch * aligned_len, dtype=torch.int64),
-                    identity=True,
                 )
                 recorded += 1
             except Exception:
                 logger.warning(
-                    "Encoder packed SDPA/unpack (B=%d, L=%d) failed to record; "
+                    "Encoder packed SDPA (B=%d, L=%d) failed to record; "
                     "it will compile on first use instead.",
                     batch,
                     aligned_len,
