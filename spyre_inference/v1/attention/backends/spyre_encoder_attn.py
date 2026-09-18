@@ -772,9 +772,7 @@ def _ensure_encoder_pack(
         aligned_len,
         orig_query_lens[0] if orig_query_lens else 0,
     )
-    unmasked = _is_unmasked_packed_sdpa(
-        batch_bucket, num_seqs, aligned_len, orig_query_lens
-    )
+    unmasked = _is_unmasked_packed_sdpa(batch_bucket, num_seqs, aligned_len, orig_query_lens)
     if fused:
         # No dest, unpack, or mask. Compiled SDPA has no attn_mask.
         attn_metadata.encoder_pack_batch = batch_bucket
@@ -1115,26 +1113,18 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             try:
                 dp = _align_up(self.head_size)
                 q = convert(
-                    torch.zeros(
-                        batch, self.num_heads, aligned_len, dp, dtype=self.model_dtype
-                    ),
+                    torch.zeros(batch, self.num_heads, aligned_len, dp, dtype=self.model_dtype),
                     device,
                 )
                 k = convert(
-                    torch.zeros(
-                        batch, self.num_kv_heads, aligned_len, dp, dtype=self.model_dtype
-                    ),
+                    torch.zeros(batch, self.num_kv_heads, aligned_len, dp, dtype=self.model_dtype),
                     device,
                 )
                 v = convert(
-                    torch.zeros(
-                        batch, self.num_kv_heads, aligned_len, dp, dtype=self.model_dtype
-                    ),
+                    torch.zeros(batch, self.num_kv_heads, aligned_len, dp, dtype=self.model_dtype),
                     device,
                 )
-                _packed_unmasked_attention(
-                    q, k, v, 1.0, self.num_heads != self.num_kv_heads
-                )
+                _packed_unmasked_attention(q, k, v, 1.0, self.num_heads != self.num_kv_heads)
                 recorded += 1
             except Exception:
                 logger.warning(
