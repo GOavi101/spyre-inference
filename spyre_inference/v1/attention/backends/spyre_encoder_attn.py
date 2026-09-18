@@ -292,7 +292,11 @@ def build_key_pad_mask(
     num_kv_heads: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Host key-pad ``[B*KV, 1, 1, L]``. Serve's only mask builder; ``build_attention_mask`` and ``host_key_pad_mask`` are test-only."""
+    """Host key-pad ``[B*KV, 1, 1, L]``.
+
+    Serve's only mask builder; ``build_attention_mask`` and
+    ``host_key_pad_mask`` are test-only.
+    """
     if num_seqs != len(kv_lens):
         raise ValueError(f"num_seqs={num_seqs} != len(kv_lens)={len(kv_lens)}")
     kv_len = torch.tensor(kv_lens, dtype=torch.int32)
