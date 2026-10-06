@@ -63,6 +63,17 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-large",
 ]
 
+# Pairs of 513-1024 tokens at the default-derived max_model_len (2048) batch onto the
+# (1024, 2) rectangle, whose fused-QKV attention needs torch-spyre#5069 (#4893).
+LONG_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
+LONG_RERANK_QUERY = "What is the performance of the Spyre accelerator for reranking tasks?"
+LONG_RERANK_DOCUMENTS = [
+    ("the spyre accelerator delivers fast reranking throughput on ibm hardware " * 45).strip(),
+    (
+        "reranking vllm spyre inference benchmark token test document paragraph context " * 45
+    ).strip(),
+]
+
 # Token classification applies its own classifier after a head_dtype cast.
 # Same path as sequence-classify: fp16 x @ Wᵀ and bias on Spyre.
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
@@ -283,8 +294,55 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     )
     outputs = llm.score(ref["query"], documents)
     assert len(outputs) == len(documents)
+    _assert_scores_match(model, documents, [out.outputs.score for out in outputs], ref_scores)
 
-    scores = [out.outputs.score for out in outputs]
+
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+def test_encoder_rerank_default_max_model_len_compiled() -> None:
+    """Warmup at the default max_model_len survives, and a (1024, 2) batch matches HF."""
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    ref = _RERANK_REFERENCES.get(LONG_RERANK_MODEL)
+    if ref is None:
+        pytest.skip(
+            f"No HF ref for {LONG_RERANK_MODEL}; run tests/data/generate_rerank_score_refs.py"
+        )
+    revision = ref["revision"]
+
+    tok = AutoTokenizer.from_pretrained(LONG_RERANK_MODEL, revision=revision)
+    hf = AutoModelForSequenceClassification.from_pretrained(
+        LONG_RERANK_MODEL, revision=revision, dtype=torch.float32
+    )
+    hf.eval()
+    ref_scores = []
+    for document in LONG_RERANK_DOCUMENTS:
+        inputs = tok(text=LONG_RERANK_QUERY, text_pair=document, return_tensors="pt")
+        assert 512 < inputs["input_ids"].shape[1] <= 1024, "pair no longer pads to L=1024"
+        with torch.inference_mode():
+            ref_scores.append(torch.sigmoid(hf(**inputs).logits.reshape(-1))[0].item())
+
+    llm = LLM(
+        model=LONG_RERANK_MODEL,
+        revision=revision,
+        tokenizer_revision=revision,
+        runner="pooling",
+        enforce_eager=False,
+    )
+    assert llm.llm_engine.model_config.max_model_len == 2048
+    outputs = llm.score(LONG_RERANK_QUERY, LONG_RERANK_DOCUMENTS)
+    assert len(outputs) == len(LONG_RERANK_DOCUMENTS)
+    _assert_scores_match(
+        LONG_RERANK_MODEL,
+        LONG_RERANK_DOCUMENTS,
+        [out.outputs.score for out in outputs],
+        ref_scores,
+    )
+
+
+def _assert_scores_match(
+    model: str, documents: list[str], scores: list[float], ref_scores: list[float]
+) -> None:
     assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
 
     # Checked apart from the per-score bound: a pair can swap with both inside tolerance,
@@ -299,8 +357,8 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     for document, score, ref_score in zip(documents, scores, ref_scores, strict=True):
         tol = min(SCORE_ABS_TOL, max(SCORE_REL_TOL * ref_score, SCORE_REL_FLOOR))
         assert abs(score - ref_score) <= tol, (
-            f"{model}: score {score:.6f} vs cached HF {ref_score:.6f} (tol {tol:.6f}) "
-            f"for {document!r}"
+            f"{model}: score {score:.6f} vs HF {ref_score:.6f} (tol {tol:.6f}) "
+            f"for {document[:80]!r}"
         )
 
 
