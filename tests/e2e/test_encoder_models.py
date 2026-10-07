@@ -19,10 +19,12 @@ Regenerate: ``generate_encoder_embed_refs.py``, ``generate_rerank_score_refs.py`
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -100,6 +102,19 @@ _RERANK_REF_PATH = Path(__file__).parent.parent / "data" / "rerank_score_refs.js
 _RERANK_REFERENCES: dict = (
     json.loads(_RERANK_REF_PATH.read_text()) if _RERANK_REF_PATH.exists() else {}
 )
+_RERANK_GENERATOR_PATH = _RERANK_REF_PATH.with_name("generate_rerank_score_refs.py")
+
+
+def _rerank_generator() -> ModuleType:
+    """The reference generator, loaded by path: ``tests`` is a namespace package, so
+    importing it as ``tests.data...`` breaks whenever another ``tests`` package wins."""
+    spec = importlib.util.spec_from_file_location(
+        "generate_rerank_score_refs", _RERANK_GENERATOR_PATH
+    )
+    assert spec is not None and spec.loader is not None, _RERANK_GENERATOR_PATH
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -301,8 +316,6 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
 @pytest.mark.uses_subprocess
 def test_encoder_rerank_default_max_model_len_compiled() -> None:
     """Warmup at the default max_model_len survives, and a (1024, 2) batch matches HF."""
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
     ref = _RERANK_REFERENCES.get(LONG_RERANK_MODEL)
     if ref is None:
         pytest.skip(
@@ -310,17 +323,11 @@ def test_encoder_rerank_default_max_model_len_compiled() -> None:
         )
     revision = ref["revision"]
 
-    tok = AutoTokenizer.from_pretrained(LONG_RERANK_MODEL, revision=revision)
-    hf = AutoModelForSequenceClassification.from_pretrained(
-        LONG_RERANK_MODEL, revision=revision, dtype=torch.float32
+    ref_scores, token_counts = _rerank_generator().score_pairs(
+        LONG_RERANK_MODEL, revision, LONG_RERANK_QUERY, LONG_RERANK_DOCUMENTS
     )
-    hf.eval()
-    ref_scores = []
-    for document in LONG_RERANK_DOCUMENTS:
-        inputs = tok(text=LONG_RERANK_QUERY, text_pair=document, return_tensors="pt")
-        assert 512 < inputs["input_ids"].shape[1] <= 1024, "pair no longer pads to L=1024"
-        with torch.inference_mode():
-            ref_scores.append(torch.sigmoid(hf(**inputs).logits.reshape(-1))[0].item())
+    for count in token_counts:
+        assert 512 < count <= 1024, f"pair of {count} tokens no longer pads to L=1024"
 
     llm = LLM(
         model=LONG_RERANK_MODEL,
