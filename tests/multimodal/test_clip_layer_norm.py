@@ -182,7 +182,7 @@ def test_eager_vision_residual_add_uses_the_patched_forward(monkeypatch):
     layer.mlp = _Mlp()
     vision = types.SimpleNamespace(encoder=types.SimpleNamespace(layers=[layer]))
 
-    apply_clip_patches(vision, torch.device("cpu"))
+    apply_clip_patches(types.SimpleNamespace(vision_model=vision), torch.device("cpu"))
 
     out = layer(torch.zeros(1, 2, 4))
     # identity norms; attention adds 1, then the MLP adds 2 onto that sum:
@@ -205,7 +205,7 @@ def test_compiled_vision_blocks_keep_their_forward(monkeypatch):
     layer.forward = _original  # type: ignore[method-assign]
     vision = types.SimpleNamespace(encoder=types.SimpleNamespace(layers=[layer]))
 
-    apply_clip_patches(vision, torch.device("cpu"))
+    apply_clip_patches(types.SimpleNamespace(vision_model=vision), torch.device("cpu"))
 
     assert layer.forward is _original
 
