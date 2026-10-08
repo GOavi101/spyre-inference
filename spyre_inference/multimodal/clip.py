@@ -171,6 +171,5 @@ def _swap_vision_block_norms(
                 setattr(layer, name, _to_spyre_layer_norm(ln, device))
         _patch_eager_residual(layer)
         logger.info_once(
-            "Spyre: eager CLIP vision residual adds rebuild both operands "
-            "in the default layout."
+            "Spyre: eager CLIP vision residual adds rebuild both operands in the default layout."
         )
