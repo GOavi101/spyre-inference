@@ -125,7 +125,8 @@ def _default_layout(x: torch.Tensor) -> torch.Tensor:
 
 def _patch_eager_residual(layer: torch.nn.Module) -> None:
     """Add the residual only after both operands share the default layout."""
-    if getattr(layer.forward, "_spyre_residual_patched", False):
+    forward = getattr(layer, "forward", None)
+    if forward is None or getattr(forward, "_spyre_residual_patched", False):
         return
     if not hasattr(layer, "self_attn") or not hasattr(layer, "mlp"):
         return
