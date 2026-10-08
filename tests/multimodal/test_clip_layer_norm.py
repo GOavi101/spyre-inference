@@ -74,9 +74,10 @@ def test_apply_swaps_boundary_norms_and_preserves_weights():
     assert isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
     assert isinstance(model.vision_model.pre_layrnorm, SpyreLayerNorm)
     assert isinstance(model.vision_model.post_layernorm, SpyreLayerNorm)
+    # Compiled vision blocks keep stock norms so their kernel matches main.
     for layer in model.vision_model.encoder.layers:
-        assert isinstance(layer.layer_norm1, SpyreLayerNorm)
-        assert isinstance(layer.layer_norm2, SpyreLayerNorm)
+        assert type(layer.layer_norm1) is torch.nn.LayerNorm
+        assert type(layer.layer_norm2) is torch.nn.LayerNorm
     # Text blocks are per-block compiled, so their norms stay stock.
     for layer in model.text_model.encoder.layers:
         assert type(layer.layer_norm1) is torch.nn.LayerNorm
@@ -146,8 +147,12 @@ def test_eager_apply_gathers_pool_rows_on_the_host(monkeypatch):
     from spyre_inference.v1.pool import spyre_pooler as pooler
 
     monkeypatch.setattr(pooler, "_eager_host_pool", False)
-    apply_clip_patches(_fake_clip_model(), torch.device("cpu"))
+    model = _fake_clip_model()
+    apply_clip_patches(model, torch.device("cpu"))
     assert pooler._eager_host_pool is True
+    for layer in model.vision_model.encoder.layers:
+        assert isinstance(layer.layer_norm1, SpyreLayerNorm)
+        assert isinstance(layer.layer_norm2, SpyreLayerNorm)
 
     hidden = torch.arange(8, dtype=torch.float16).reshape(4, 2)
     picked = pooler.pool_rows(hidden, torch.tensor([1, 3]))

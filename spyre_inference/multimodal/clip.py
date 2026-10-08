@@ -95,8 +95,8 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
         logger.info_once("Spyre: eager CLIP CLS/LAST pooling gathers on the host.")
 
     logger.info_once(
-        "Spyre: CLIP vision LayerNorms and the text final norm use SpyreLayerNorm. "
-        "Text-tower in-block norms stay stock; per-block compile covers them."
+        "Spyre: CLIP boundary LayerNorms use SpyreLayerNorm. "
+        "Vision-block norms stay stock on a compiled server."
     )
 
 
@@ -148,9 +148,17 @@ def _patch_eager_residual(layer: torch.nn.Module) -> None:
 def _swap_vision_block_norms(
     vision_model: torch.nn.Module, device: torch.device, eager: bool
 ) -> None:
-    """The vision tower is never per-block compiled, so its block norms take the
-    eager decomposition. ``type is`` rather than ``isinstance``: ``SpyreLayerNorm``
-    subclasses ``nn.LayerNorm``."""
+    """Replace vision-block norms only for an eager load.
+
+    A compiled server keeps the stock norms. They already match Hugging Face
+    there, and ``SpyreLayerNorm`` would install a different kernel on the
+    compiled path. The vision tower is outside per-block compile, so an eager
+    load takes the crashing ``aten.layer_norm`` decomposition instead.
+    ``type is`` rather than ``isinstance``: ``SpyreLayerNorm`` subclasses
+    ``nn.LayerNorm``.
+    """
+    if not eager:
+        return
     encoder = getattr(vision_model, "encoder", None)
     layers = getattr(encoder, "layers", None)
     if layers is None:
@@ -160,9 +168,8 @@ def _swap_vision_block_norms(
             ln = getattr(layer, name, None)
             if type(ln) is torch.nn.LayerNorm:
                 setattr(layer, name, _to_spyre_layer_norm(ln, device))
-        if eager:
-            _patch_eager_residual(layer)
-            logger.info_once(
-                "Spyre: eager CLIP vision residual adds rebuild both operands "
-                "in the default layout."
-            )
+        _patch_eager_residual(layer)
+        logger.info_once(
+            "Spyre: eager CLIP vision residual adds rebuild both operands "
+            "in the default layout."
+        )

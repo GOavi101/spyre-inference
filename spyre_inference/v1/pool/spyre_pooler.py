@@ -202,7 +202,11 @@ class SpyreCLSPool(CLSPool):
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
         idx, n_rows = pad_row_count_to_bucket(cursor.first_token_indices_gpu)
-        pooled = pool_rows(hidden_states, idx)
+        # Compiled gathers call select_rows, the same as main. pool_rows copies
+        # to the host, and only an eager CLIP load arms that.
+        pooled = (
+            pool_rows(hidden_states, idx) if _eager_host_pool else select_rows(hidden_states, idx)
+        )
         if self.defer_trim:
             return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
@@ -218,7 +222,9 @@ class SpyreLastPool(LastPool):
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=True))
-        pooled = pool_rows(hidden_states, idx)
+        pooled = (
+            pool_rows(hidden_states, idx) if _eager_host_pool else select_rows(hidden_states, idx)
+        )
         if self.defer_trim:
             return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
