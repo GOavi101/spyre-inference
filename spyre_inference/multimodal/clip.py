@@ -40,6 +40,8 @@ pass to populate them.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 from vllm.logger import init_logger
 
@@ -132,18 +134,21 @@ def _patch_eager_residual(layer: torch.nn.Module) -> None:
         return
 
     def forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        # The block is a CLIPEncoderLayer. nn.Module does not declare these attributes,
+        # so the checker treats each one as Tensor | Module and rejects the call.
+        block = cast(Any, layer)
         residual = hidden_states
-        hidden_states = layer.layer_norm1(hidden_states)
-        hidden_states, _ = layer.self_attn(hidden_states=hidden_states)
+        hidden_states = block.layer_norm1(hidden_states)
+        hidden_states, _ = block.self_attn(hidden_states=hidden_states)
         hidden_states = _default_layout(residual) + _default_layout(hidden_states)
 
         residual = hidden_states
-        hidden_states = layer.layer_norm2(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
+        hidden_states = block.layer_norm2(hidden_states)
+        hidden_states = block.mlp(hidden_states)
         return _default_layout(residual) + _default_layout(hidden_states)
 
-    forward._spyre_residual_patched = True  # type: ignore[attr-defined]
-    layer.forward = forward  # type: ignore[method-assign]
+    forward._spyre_residual_patched = True
+    layer.forward = forward
 
 
 def _swap_vision_block_norms(
