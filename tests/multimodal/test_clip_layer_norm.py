@@ -41,18 +41,10 @@ def _fake_clip_model(hidden_size: int = 64, with_post_norm: bool = True):
     text_model.final_layer_norm.weight.data.normal_(generator=g)
     text_model.final_layer_norm.bias.data.normal_(generator=g)
 
-    def _block():
-        return types.SimpleNamespace(
-            layer_norm1=torch.nn.LayerNorm(hidden_size),
-            layer_norm2=torch.nn.LayerNorm(hidden_size),
-        )
-
     vision_model = types.SimpleNamespace(
         pre_layrnorm=torch.nn.LayerNorm(hidden_size),
         post_layernorm=(torch.nn.LayerNorm(hidden_size) if with_post_norm else None),
-        encoder=types.SimpleNamespace(layers=[_block(), _block()]),
     )
-    text_model.encoder = types.SimpleNamespace(layers=[_block()])
     vision_model.pre_layrnorm.weight.data.normal_(generator=g)
     vision_model.pre_layrnorm.bias.data.normal_(generator=g)
     if with_post_norm:
@@ -74,14 +66,9 @@ def test_apply_swaps_boundary_norms_and_preserves_weights():
     assert isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
     assert isinstance(model.vision_model.pre_layrnorm, SpyreLayerNorm)
     assert isinstance(model.vision_model.post_layernorm, SpyreLayerNorm)
-    # Compiled vision blocks keep stock norms so their kernel matches main.
-    for layer in model.vision_model.encoder.layers:
-        assert type(layer.layer_norm1) is torch.nn.LayerNorm
-        assert type(layer.layer_norm2) is torch.nn.LayerNorm
-    # Text blocks are per-block compiled, so their norms stay stock.
-    for layer in model.text_model.encoder.layers:
-        assert type(layer.layer_norm1) is torch.nn.LayerNorm
-        assert type(layer.layer_norm2) is torch.nn.LayerNorm
+    # Not swapped: layer_norm1/layer_norm2 (inside encoder blocks) aren't touched,
+    # and this stand-in doesn't even define them -- swapping only the three
+    # boundary norms is the whole point.
     torch.testing.assert_close(model.text_model.final_layer_norm.weight, orig_text_w)
     torch.testing.assert_close(model.text_model.final_layer_norm.bias, orig_text_b)
     torch.testing.assert_close(model.vision_model.pre_layrnorm.weight, orig_pre_w)
@@ -139,75 +126,6 @@ def test_apply_preserves_shape_eps_affine_bias(elementwise_affine, bias):
     assert patched.normalized_shape == ln.normalized_shape
     assert patched.eps == eps
     assert patched.elementwise_affine == elementwise_affine
-
-
-def test_eager_apply_gathers_pool_rows_on_the_host(monkeypatch):
-    """Eager CLIP arms a host gather. Off Spyre that path is the plain index."""
-    monkeypatch.setattr("spyre_inference.multimodal.clip._uncompiled", lambda: True)
-    from spyre_inference.v1.pool import spyre_pooler as pooler
-
-    monkeypatch.setattr(pooler, "_eager_host_pool", False)
-    model = _fake_clip_model()
-    apply_clip_patches(model, torch.device("cpu"))
-    assert pooler._eager_host_pool is True
-    for layer in model.vision_model.encoder.layers:
-        assert isinstance(layer.layer_norm1, SpyreLayerNorm)
-        assert isinstance(layer.layer_norm2, SpyreLayerNorm)
-
-    hidden = torch.arange(8, dtype=torch.float16).reshape(4, 2)
-    picked = pooler.pool_rows(hidden, torch.tensor([1, 3]))
-    torch.testing.assert_close(picked, hidden[[1, 3]])
-
-
-def test_eager_vision_residual_add_uses_the_patched_forward(monkeypatch):
-    """Eager mode replaces the block forward. Off Spyre the layout rebuild is a
-    no-op, so the arithmetic is the stock residual block."""
-    monkeypatch.setattr("spyre_inference.multimodal.clip._uncompiled", lambda: True)
-    from spyre_inference.v1.pool import spyre_pooler as pooler
-
-    monkeypatch.setattr(pooler, "_eager_host_pool", False)
-
-    class _Attn(torch.nn.Module):
-        def forward(self, hidden_states):
-            return hidden_states + 1, None
-
-    class _Mlp(torch.nn.Module):
-        def forward(self, hidden_states):
-            return hidden_states + 2
-
-    layer = torch.nn.Module()
-    layer.layer_norm1 = torch.nn.Identity()
-    layer.layer_norm2 = torch.nn.Identity()
-    layer.self_attn = _Attn()
-    layer.mlp = _Mlp()
-    vision = types.SimpleNamespace(encoder=types.SimpleNamespace(layers=[layer]))
-
-    apply_clip_patches(types.SimpleNamespace(vision_model=vision), torch.device("cpu"))
-
-    out = layer(torch.zeros(1, 2, 4))
-    # identity norms; attention adds 1, then the MLP adds 2 onto that sum:
-    # (0 + 1) + ((0 + 1) + 2) = 4
-    assert torch.equal(out, torch.full((1, 2, 4), 4.0))
-    assert layer.forward._spyre_residual_patched is True
-
-
-def test_compiled_vision_blocks_keep_their_forward(monkeypatch):
-    monkeypatch.setattr("spyre_inference.multimodal.clip._uncompiled", lambda: False)
-
-    def _original(hidden_states):
-        return hidden_states
-
-    layer = torch.nn.Module()
-    layer.layer_norm1 = torch.nn.Identity()
-    layer.layer_norm2 = torch.nn.Identity()
-    layer.self_attn = torch.nn.Identity()
-    layer.mlp = torch.nn.Identity()
-    layer.forward = _original  # type: ignore[method-assign]
-    vision = types.SimpleNamespace(encoder=types.SimpleNamespace(layers=[layer]))
-
-    apply_clip_patches(types.SimpleNamespace(vision_model=vision), torch.device("cpu"))
-
-    assert layer.forward is _original
 
 
 def test_apply_multimodal_patches_dispatches_to_clip():

@@ -52,25 +52,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
 
 logger = init_logger(__name__)
 
-# Armed for an eager CLIP load. On-device index_select of the vision activation
-# fuses an identity the scheduler cannot map (sdsc 0_identity). Compiled runs
-# leave this off and keep the device gather.
-_eager_host_pool = False
-
-
-def arm_eager_host_pool() -> None:
-    """CLS/LAST gathers in this process copy to the host before indexing."""
-    global _eager_host_pool
-    _eager_host_pool = True
-
-
-def pool_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
-    """Gather pool rows. Eager CLIP indexes on the host; everything else stays put."""
-    if _eager_host_pool and hidden_states.device.type == "spyre":
-        flat = row_indices.reshape(-1).to(dtype=torch.long)
-        return torch.index_select(convert(hidden_states, "cpu"), 0, flat)
-    return select_rows(hidden_states, row_indices)
-
 
 def _cpu_cast_if_needed(pooled_data, head_dtype):
     """Host cast when a Spyre tensor's dtype differs. Same-dtype is a no-op.
@@ -202,11 +183,7 @@ class SpyreCLSPool(CLSPool):
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
         idx, n_rows = pad_row_count_to_bucket(cursor.first_token_indices_gpu)
-        # Compiled gathers call select_rows, the same as main. pool_rows copies
-        # to the host, and only an eager CLIP load arms that.
-        pooled = (
-            pool_rows(hidden_states, idx) if _eager_host_pool else select_rows(hidden_states, idx)
-        )
+        pooled = select_rows(hidden_states, idx)
         if self.defer_trim:
             return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
@@ -222,9 +199,7 @@ class SpyreLastPool(LastPool):
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=True))
-        pooled = (
-            pool_rows(hidden_states, idx) if _eager_host_pool else select_rows(hidden_states, idx)
-        )
+        pooled = select_rows(hidden_states, idx)
         if self.defer_trim:
             return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
