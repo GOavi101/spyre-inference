@@ -137,9 +137,6 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
-    # Measured throughput argmax across pooling models; they regress above it.
-    _POOLING_MAX_BATCHED_TOKENS = 2048
-
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
     _BLOCK_SIZE_MULTIPLE = 64
@@ -356,6 +353,7 @@ class TorchSpyrePlatform(CpuPlatform):
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
+            POOLING_FAST_BODY_ROWS,
             encoder_budget_rows,
             encoder_group_shapes,
             encoder_rectangles,
@@ -371,7 +369,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # `encoder_budget_rows` applies is not checked for us. The 2048 cap is the
         # fast body; `encoder_budget_rows` then floors back up to max_model_len when
         # the model is longer, which is the scheduler cap.
-        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        scheduler_config.max_num_batched_tokens = min(prev_budget, POOLING_FAST_BODY_ROWS)
         full_budget = encoder_budget_rows(
             max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
         )

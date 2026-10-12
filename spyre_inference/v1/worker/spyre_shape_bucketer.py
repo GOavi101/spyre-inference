@@ -56,9 +56,10 @@ logger = init_logger(__name__)
 # Spyre stick (64 fp16 elements), and the encoder attention KV block width.
 ENCODER_SEQ_ALIGNMENT = 64
 
-# Measured throughput peak for a pooling body. ``TorchSpyrePlatform`` caps
-# ``max_num_batched_tokens`` here for models that fit; longer models keep this as the
-# smallest body and only step up when the batch does not.
+# Measured throughput peak for a pooling body. The platform caps
+# ``max_num_batched_tokens`` at this for models that fit; longer models keep it as
+# the smallest body and only step up when the batch does not. One constant: the
+# platform reads it from here, so the cap and the tier ladder cannot drift.
 POOLING_FAST_BODY_ROWS = 2048
 
 
@@ -260,13 +261,13 @@ def encoder_body_budgets(
     if full <= POOLING_FAST_BODY_ROWS:
         return (full,)
 
+    # Each smaller body is the power of two itself. The loop only runs while
+    # ``size < full``, and ``full`` never exceeds ``max_num_seqs`` times the model
+    # length, so ``encoder_budget_rows`` of this size returns ``size``.
     tiers: list[int] = []
     size = POOLING_FAST_BODY_ROWS
-    longest = _align_up_pow2(max_model_len)
     while size < full:
-        tier = encoder_budget_rows(min(longest, size), size, max_num_seqs)
-        if tier < full and tier not in tiers:
-            tiers.append(tier)
+        tiers.append(size)
         size *= 2
     tiers.append(full)
     return tuple(tiers)
@@ -303,7 +304,12 @@ def encoder_len_ladder(vllm_config: VllmConfig) -> list[int]:
 
 
 def encoder_width_for(length: int, vllm_config: VllmConfig) -> int:
-    """Widest batch of ``length``-token sequences the budget and the engine allow."""
+    """Widest batch of ``length``-token sequences the largest body allows.
+
+    Divides ``tables.budget``, the scheduler token cap, not the smaller body a short
+    step pads to. A length of 100 on tiers ``(2048, 4096, 8192)`` is ``8192 // 100``
+    here; the 2048-row rectangle for that length is ``2048 // 100``.
+    """
     tables = encoder_shape_tables(vllm_config)
     return min(int(vllm_config.scheduler_config.max_num_seqs), tables.budget // max(1, length))
 

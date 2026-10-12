@@ -60,9 +60,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    encoder_group_width_caps,
     encoder_rectangle_for_batch,
     encoder_shape_tables,
+    group_width_caps,
 )
 
 # One Spyre stick of fp16, in tokens. A padded length that is a multiple of this
@@ -495,7 +495,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         self._rectangles = list(tables.rectangles)
         self._groups_by_rows = dict(tables.tier_groups)
         self._budgets = set(tables.budgets)
-        self._width_caps = encoder_group_width_caps(config)
+        self._width_caps_by_rows = {
+            rows: group_width_caps(groups) for rows, groups in tables.tier_groups
+        }
+        # Largest body. Serving prebuilds a per-body plan; this remains for callers
+        # that pass one cap table, which the single-tier tests do.
+        self._width_caps = self._width_caps_by_rows.get(tables.budget, {})
         self._warmed_rows: set[int] = set()
 
     def record_graphs(self, *args, **kwargs) -> int:
@@ -656,11 +661,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if plan is None:
             # Fallback for a caller that did not pre-build one. Ragged path only: the grid
             # layout is a contract with ``_preprocess``, so a rectangle the runner did
-            # not lay out would read the wrong rows.
+            # not lay out would read the wrong rows. Caps are for this buffer's body;
+            # ``query.shape[0]`` is that row count. An unknown count keeps each group
+            # at width 1 rather than borrowing the largest body's cap.
             plan = build_encoder_plan(
                 attn_metadata,
                 rectangles=(),
-                width_cap_for=self._width_caps,
+                width_cap_for=self._width_caps_by_rows.get(query.shape[0], {}),
                 device=query.device,
                 dtype=query.dtype,
                 batched=self._compile_attn,

@@ -324,6 +324,14 @@ class TestLongContextBodyTiers:
         assert encoder_rectangle_for_batch(1, 5000, long) == (8192, 1)
         assert encoder_rectangle_for_batch(2, 3000, long) == (4096, 2)
 
+    def test_width_for_uses_the_largest_body(self):
+        """A short length can be packed up to the scheduler cap, not just the 2048 body."""
+        cfg = _pooling_vllm_config(
+            max_model_len=8192, max_num_seqs=128, max_num_batched_tokens=8192
+        )
+        assert encoder_width_for(100, cfg) == 8192 // 100
+        assert encoder_width_for(100, cfg) != 2048 // 100
+
     def test_three_long_documents_still_miss_the_rectangle(self):
         """B(4096) on the 8192 body is 2. A wider batch stays ragged; a 16K body
         is the regression the 2048 cap exists to avoid."""
