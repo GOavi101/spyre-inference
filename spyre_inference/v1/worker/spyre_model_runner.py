@@ -1178,11 +1178,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # A rectangle *is* its body, so only the rectangles whose area is this step's
         # padded row count are legal. A step that landed on a smaller body (a short
         # request against an 8K model) must not be offered the 8K grid.
-        rectangles = [] if self._force_encoder_ragged else [
-            (length, batch)
-            for length, batch in self._encoder_rectangles
-            if length * batch == rows
-        ]
+        rectangles = (
+            []
+            if self._force_encoder_ragged
+            else [
+                (length, batch)
+                for length, batch in self._encoder_rectangles
+                if length * batch == rows
+            ]
+        )
 
         per_layer = out[0] if isinstance(out, tuple) else out
         groups = per_layer if isinstance(per_layer, list) else [per_layer]
