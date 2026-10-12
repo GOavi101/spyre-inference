@@ -15,7 +15,7 @@
 """Encoder-only (bidirectional) self-attention for Spyre, without a KV cache.
 
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
-layers. Two paths over one body buffer of ``R`` rows (``encoder_budget_rows``): a
+layers. Two paths over the step's body buffer (``encoder_body_budgets``): a
 rectangle, when the batch fits one, where Q/K/V already *are* the ``[B, L]`` grid the
 runner laid out; otherwise the packed buffer, with requests grouped by their own extent
 and each group a fused gather/attend/scatter. The runner picks once per step and records
@@ -60,10 +60,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    encoder_group_shapes,
     encoder_group_width_caps,
     encoder_rectangle_for_batch,
-    encoder_rectangles,
     encoder_shape_tables,
 )
 
@@ -493,11 +491,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # get_current_vllm_config() only works at construction time; forward() runs
         # through a custom-op boundary that loses the context.
         config = get_current_vllm_config()
-        self._rectangles = encoder_rectangles(config)
-        self._group_shapes = encoder_group_shapes(config)
+        tables = encoder_shape_tables(config)
+        self._rectangles = list(tables.rectangles)
+        self._groups_by_rows = dict(tables.tier_groups)
+        self._budgets = set(tables.budgets)
         self._width_caps = encoder_group_width_caps(config)
-        self._buffer_rows = encoder_shape_tables(config).budget
-        self._warmed = False
+        self._warmed_rows: set[int] = set()
 
     def record_graphs(self, *args, **kwargs) -> int:
         """Nothing to page: ``warm_kernels`` traces every declared shape instead."""
@@ -579,19 +578,25 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         reproduced by a same-shaped fresh tensor. Writing into the caller's ``output`` is
         safe: the real work right after overwrites every real request's rows.
 
-        A buffer that is not the declared body shape warms nothing -- every declared
-        shape is sized against that one buffer, so a smaller one indexes out of bounds.
+        A buffer that is not one of the declared bodies warms nothing -- every shape
+        is sized against its own body, so a different row count indexes out of bounds.
+        Each body is traced once; a longer model has several.
         """
-        if self._warmed or query.shape[0] != self._buffer_rows:
+        rows = query.shape[0]
+        if rows in self._warmed_rows or rows not in self._budgets:
             return 0
-        self._warmed = True
+        self._warmed_rows.add(rows)
         dtype, device = query.dtype, query.device
         index_dtype = encoder_index_dtype(device)
         traced = 0
 
         # Traced in, a rectangle's shape *is* a block graph, warmed by the runner's
         # per-rectangle dummy runs; tracing it here would compile a kernel nothing calls.
-        rectangles = [] if encoder_inline_active() else self._rectangles
+        rectangles = (
+            []
+            if encoder_inline_active()
+            else [(extent, width) for extent, width in self._rectangles if extent * width == rows]
+        )
         for extent, width in rectangles:
             mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype), device)
             self._run_rect(
@@ -599,15 +604,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             )
             traced += 1
 
-        for width, extent in self._group_shapes:
-            rows = convert(
+        for width, extent in self._groups_by_rows.get(rows, ()):
+            row_index = convert(
                 torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * width),
                 device,
             )
             mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype), device)
             self._run_fused(
                 output,
-                rows,
+                row_index,
                 query,
                 key,
                 value,
