@@ -891,8 +891,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         while the rectangular path is opaque. With the rectangular path traced into the
         block graph, ``_warm_encoder_inline_paths`` gives each rectangle its own dummy and
         forces one onto the ragged path, which is what reaches the impl.
-        Eager pooling: one short dummy, then ``mark_warmed_up()``.
-        A pooling model with a vision tower also runs ``embed_multimodal`` at every
+        Eager pooling: one short dummy, then ``mark_warmed_up()``. It does not run the
+        vision tower: those blocks crash while the tower is still eager, and a
+        text-only load would die at startup.
+        Compiled pooling with a vision tower also runs ``embed_multimodal`` at every
         image-batch width up to ``mm_max_items_per_batch``; profile_run only traces
         the widest one, and the tower stays eager.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
@@ -943,8 +945,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
                 self._warmup_input_embedding(num_tokens)
-                if is_pooling:
-                    self._warmup_multimodal_encoder()
+                # No vision warmup here. enforce_eager reaches this branch, and the
+                # eager vision blocks crash. A text load would otherwise die in
+                # embed_multimodal before the first prompt.
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)

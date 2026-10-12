@@ -92,6 +92,23 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
     return runner, vision
 
 
+def test_eager_pooling_does_not_run_the_vision_tower():
+    """An eager pooling load does not run the vision tower.
+
+    Those blocks crash, and a text-only load would die in the engine core
+    before the first prompt.
+    """
+    runner, vision = _runner("pooling", multimodal=True, max_items={"image": 4})
+    runner.model_config.enforce_eager = True
+    runner.max_num_reqs = 4
+    runner.scheduler_config = types.SimpleNamespace(max_num_batched_tokens=64)
+
+    runner.warming_up_model()
+
+    assert vision.batches == []
+    assert runner.spyre_shape_bucketer.warmed_up
+
+
 def test_pooling_warmup_runs_every_image_batch_width(monkeypatch):
     monkeypatch.setattr(
         "spyre_inference.v1.worker.spyre_model_runner.encoder_group_shapes",
