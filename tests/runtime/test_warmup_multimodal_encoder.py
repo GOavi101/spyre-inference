@@ -74,6 +74,9 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
     runner._encoder_budget = 8
     runner._encoder_rectangles = []
     runner._spyre_kv_caches = []
+    # load_model sets this. The fake runner skips load_model, and the compiled
+    # pooling path reads it before deciding whether to warm the embed gather.
+    runner._pooling_on_spyre = False
     runner.spyre_shape_bucketer = _Bucketer()
     runner.mm_budget = (
         types.SimpleNamespace(mm_max_items_per_batch=max_items) if max_items is not None else None
