@@ -73,6 +73,7 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
     runner._spyre_device = torch.device("cpu")
     runner._encoder_budget = 8
     runner._encoder_rectangles = []
+    runner._encoder_groups_by_rows = {}
     runner._spyre_kv_caches = []
     runner.spyre_shape_bucketer = _Bucketer()
     runner.mm_budget = (
@@ -92,11 +93,7 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
     return runner, vision
 
 
-def test_pooling_warmup_runs_every_image_batch_width(monkeypatch):
-    monkeypatch.setattr(
-        "spyre_inference.v1.worker.spyre_model_runner.encoder_group_shapes",
-        lambda config: [],
-    )
+def test_pooling_warmup_runs_every_image_batch_width():
     runner, vision = _runner("pooling", multimodal=True, max_items={"image": 4})
 
     runner.warming_up_model()
