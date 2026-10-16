@@ -452,9 +452,10 @@ class TestBuildAttentionMetadata:
         steps = [({"layer": _encoder_md([5, 7])}, None), ({"layer": _encoder_md([5, 7])}, None)]
         runner = self._runner(monkeypatch, steps)
 
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
+        runner._build_attention_metadata(num_tokens_padded=64 * 2)
         assert runner._encoder_grid is not None
         assert runner._encoder_grid[2] == [5, 7]
+        assert runner._encoder_grid[:2] == (64, 2)
 
         runner._build_attention_metadata(num_tokens_padded=12)
         assert runner._encoder_grid is None
@@ -465,7 +466,7 @@ class TestBuildAttentionMetadata:
         steps = [({"layer": _encoder_md([5, 7])}, None), ({"layer": SimpleNamespace()}, None)]
         runner = self._runner(monkeypatch, steps)
 
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
+        runner._build_attention_metadata(num_tokens_padded=64 * 2)
+        runner._build_attention_metadata(num_tokens_padded=64 * 2)
         assert runner._encoder_grid is None
         assert runner.spyre_encoder_stats.rect_steps == 1

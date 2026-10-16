@@ -130,7 +130,11 @@ class TestWarmKernelsTracesTheDeclaredSet:
         monkeypatch.setattr(impl, "_run_fused", record_fused)
         traced = impl.warm_kernels(*_buffers(impl, rows), impl.num_heads, impl.num_kv_heads, 64)
 
-        assert seen_rects == encoder_rectangles(config)
+        # Only rectangles whose grid is this buffer. A smaller one is warmed by the
+        # dummy that allocates that row count, not by a prefix of the budget tensor.
+        assert seen_rects == [
+            (extent, width) for extent, width in encoder_rectangles(config) if extent * width == rows
+        ]
         assert seen_groups == encoder_group_shapes(config)
         assert traced == len(seen_rects) + len(seen_groups)
 

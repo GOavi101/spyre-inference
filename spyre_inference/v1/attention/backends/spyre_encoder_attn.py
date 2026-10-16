@@ -15,10 +15,11 @@
 """Encoder-only (bidirectional) self-attention for Spyre, without a KV cache.
 
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
-layers. Two paths over one body buffer of ``R`` rows (``encoder_budget_rows``): a
-rectangle, when the batch fits one, where Q/K/V already *are* the ``[B, L]`` grid the
-runner laid out; otherwise the packed buffer, with requests grouped by their own extent
-and each group a fused gather/attend/scatter. The runner picks once per step and records
+layers. Two paths under a token budget of ``R`` rows (``encoder_budget_rows``): a
+rectangle, when the batch fits one, where Q/K/V already *are* the ``[W, L]`` grid the
+runner laid out (``W * L`` rows, not always ``R``); otherwise the packed ``R``-row
+buffer, with requests grouped by their own extent and each group a fused
+gather/attend/scatter. The runner picks once per step and records
 the choice as the type of ``attn_metadata.encoder_plan``, so no compiled region branches
 on it. The ragged path always crosses the opaque ``unified_attention_with_output``. The
 rectangular path does too unless ``install_encoder`` traced it into the block graph
@@ -49,7 +50,7 @@ import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
-from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 
 from spyre_inference.custom_ops.utils import convert
@@ -78,15 +79,15 @@ logger = init_logger(__name__)
 
 
 def _alignment_units_for(length: int) -> int:
-    """Stick-aligned units covering ``length``, rounded up to a power of two.
+    """Stick-aligned units covering ``length``.
 
     Encoder self-attention has ``q_len == kv_len``, so this fixes the sequence's
     padded extent (``units * ENCODER_LEN_ALIGNMENT``) -- the attention kernel's cache
-    has one length axis, not two. Rounding to a power of two keeps that axis to a
-    handful of buckets, at the cost of padding a request up to the next one: a
-    260-token request attends over 512, not 320.
+    has one length axis, not two. One unit is one stick: a 260-token request attends
+    over 320, not 512. The FFN runs on those same rows, so the coarser power-of-two
+    pad was most of the wasted step.
     """
-    return next_power_of_2(cdiv(length, ENCODER_LEN_ALIGNMENT))
+    return cdiv(length, ENCODER_LEN_ALIGNMENT)
 
 
 def encoder_index_dtype(device: torch.device) -> torch.dtype:
@@ -584,7 +585,11 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         self._group_shapes = encoder_group_shapes(config)
         self._width_caps = encoder_group_width_caps(config)
         self._buffer_rows = encoder_shape_tables(config).budget
-        self._warmed = False
+        # One entry per body row-count. A rectangular step is ``W * L``, which is not
+        # always the budget, and the first call at each count traces the rectangles
+        # of that count. Marking the whole impl warmed on the first call would skip
+        # every other body size.
+        self._warmed_rows: set[int] = set()
 
     def record_graphs(self, *args, **kwargs) -> int:
         """Nothing to page: ``warm_kernels`` traces every declared shape instead."""
@@ -667,15 +672,18 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         reproduced by a same-shaped fresh tensor. Writing into the caller's ``output`` is
         safe: the real work right after overwrites every real request's rows.
 
-        A buffer that is not the declared body shape warms nothing -- every declared
-        shape is sized against that one buffer, so a smaller one indexes out of bounds.
-
         ``causal`` is the group's ``apply_causal_mask``: a causal mask is
         ``[N, 1, L, L]`` rather than ``[N, 1, 1, L]``, a different compiled variant.
+
+        A rectangle is traced only when this buffer *is* that rectangle (``W * L``
+        rows). Viewing a smaller grid out of the budget buffer would compile a prefix
+        whose device layout a real ``W * L`` allocation does not share. The ragged
+        groups are traced only against the budget, which is the buffer they index.
         """
-        if self._warmed or query.shape[0] != self._buffer_rows:
+        body_rows = query.shape[0]
+        if body_rows in self._warmed_rows:
             return 0
-        self._warmed = True
+        self._warmed_rows.add(body_rows)
         dtype, device = query.dtype, query.device
         index_dtype = encoder_index_dtype(device)
         traced = 0
@@ -684,13 +692,19 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # per-rectangle dummy runs; tracing it here would compile a kernel nothing calls.
         rectangles = [] if encoder_inline_active() else self._rectangles
         for extent, width in rectangles:
+            if extent * width != body_rows:
+                continue
             mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device)
             self._run_rect(
                 output, query, key, value, mask, width, extent, num_heads, num_kv_heads, head_size
             )
             traced += 1
 
-        for width, extent in self._group_shapes:
+        if body_rows == self._buffer_rows:
+            group_shapes = self._group_shapes
+        else:
+            group_shapes = ()
+        for width, extent in group_shapes:
             rows = convert(
                 torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * width),
                 device,
