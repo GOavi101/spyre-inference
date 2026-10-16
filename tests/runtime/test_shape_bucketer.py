@@ -284,18 +284,21 @@ class TestEncoderRectangles:
         assert (320, 4) in rectangles
         assert all(length * width <= 2048 for length, width in rectangles)
 
-    def test_278m_four_sequences_pad_to_the_next_stick_not_the_budget(self):
-        """granite-embedding-278m bench: max_num_seqs=4, max_model_len=512, budget 2048.
+    def test_278m_mixed_batch_pads_to_the_real_token_total(self):
+        """granite-embedding-278m bench: lengths uniform in [256, 512], batches of 4.
 
-        Four prompts of 300 tokens used to run the (512, 4) rectangle, 2048 rows.
-        They now run (320, 4), 1280 rows: 37% fewer GEMM rows on that step.
+        The body is the next multiple of 64 of the real token count. Four prompts
+        totalling 1650 tokens run 1664 rows, not the old 2048-row budget.
         """
+        from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_body_sizes
+
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
-        rectangles = encoder_rectangles(cfg)
-        assert encoder_rectangle_for_batch(4, 300, rectangles) == (320, 4)
-        assert 320 * 4 == 1280
-        assert encoder_rectangle_for_batch(4, 512, rectangles) == (512, 4)
-        assert encoder_rectangle_for_batch(1, 300, rectangles) == (320, 1)
+        sizes = encoder_body_sizes(cfg)
+        assert sizes == list(range(64, 2049, 64))
+        total = 300 + 400 + 450 + 500
+        padded = next(size for size in sizes if size >= total)
+        assert padded == 1664
+        assert padded < 2048
 
     @pytest.mark.parametrize("max_num_seqs", [1, 4, 32])
     @pytest.mark.parametrize("max_model_len", [64, 100, 320, 384, 512, 576, 1024, 4096])
@@ -354,11 +357,13 @@ class TestEncoderGroupShapes:
             assert width & (width - 1) == 0
             assert width <= encoder_width_for(extent, cfg)
 
-    def test_empty_when_the_rectangle_cannot_miss(self):
-        """``max_num_seqs`` at or below ``R // longest length`` means every batch fits a
-        rectangle, so the group family is unreachable and warming it is pure cost."""
+    def test_packed_batches_declare_groups_even_when_a_rectangle_fits(self):
+        """Serving attends the packed tokens, so max_num_seqs=4 still has group shapes."""
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
-        assert encoder_group_shapes(cfg) == []
+        groups = encoder_group_shapes(cfg)
+        assert (1, 512) in groups
+        assert (4, 320) in groups
+        assert (4, 512) in groups
 
     def test_every_group_extent_is_on_the_length_ladder(self):
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)

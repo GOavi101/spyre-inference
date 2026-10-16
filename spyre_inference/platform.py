@@ -348,8 +348,8 @@ class TorchSpyrePlatform(CpuPlatform):
         """Normalise the pooling limits onto the declared encoder shapes.
 
         The token budget ``R`` is the scheduler cap. ``max_num_seqs`` is lowered to the
-        widest rectangle, and ``compile_sizes`` is every rectangle's ``W * L`` plus
-        ``R`` for the ragged path. A rectangular step pads to its own grid, not to ``R``.
+        widest batch the budget can hold, and ``compile_sizes`` is every multiple of
+        64 up to ``R``. A step pads to the next of those that holds its real tokens.
 
         The scheduler is left alone -- the ragged path means no batch upstream can form
         has to be refused.
@@ -395,9 +395,10 @@ class TorchSpyrePlatform(CpuPlatform):
         budget = encoder_shape_tables(vllm_config).budget
         scheduler_config.max_num_batched_tokens = budget
 
-        # Each rectangle is its own body (`W * L` rows). The ragged path still packs
-        # into `budget`, so that size stays in the list even when no rectangle fills
-        # it. A user-set list still wins, including an empty one to opt out (#911).
+        # One body per multiple of 64 up to the budget. A step pads to the next
+        # entry that holds its real tokens; the budget stays last so the scheduler
+        # cap does not shrink. A user-set list still wins, including an empty one
+        # to opt out (#911).
         if vllm_config.compilation_config.compile_sizes is None:
             vllm_config.compilation_config.compile_sizes = encoder_body_sizes(vllm_config)
 

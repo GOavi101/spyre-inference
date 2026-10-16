@@ -225,17 +225,14 @@ def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batc
     return vllm_config
 
 
-def test_apply_config_gives_pooling_a_body_per_rectangle():
-    """Each rectangle is its own body. The budget stays the largest, so the ragged
-    path and the scheduler cap do not shrink."""
+def test_apply_config_gives_pooling_a_body_per_stick():
+    """The body is every multiple of 64 up to the budget, which stays the scheduler cap."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _pooling_platform_config(max_num_batched_tokens=512)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     sizes = vllm_config.compilation_config.compile_sizes
-    assert max(sizes) == 512
-    assert 512 in sizes
-    assert any(size < 512 for size in sizes)
+    assert sizes == list(range(64, 513, 64))
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
 
 

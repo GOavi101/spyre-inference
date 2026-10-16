@@ -125,7 +125,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
-    encoder_rectangle_for_batch,
     encoder_rectangles,
     encoder_shape_tables,
     expand_packed_token_types,
@@ -922,11 +921,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logits/sampler run at each *sampled-row* width so the lm_head compiles here
         rather than mid-request. The two bucket sets differ: body buckets are packed
         token counts, rows are at most ``max_num_reqs``.
-        Compiled pooling: one dummy per rectangle, at that rectangle's ``W * L`` rows,
-        plus one at the token budget on the ragged path when a group is reachable.
-        Each rectangle is its own block graph once attention is traced in. The first
-        attention call at a body size runs ``SpyreEncoderAttentionImpl.warm_kernels``
-        for the rectangles of that size; the budget dummy is what traces the groups.
+        Compiled pooling: one dummy per body bucket (every 64 tokens up to the
+        budget). The step stays packed, so each bucket is one block graph. The first
+        attention call traces the group kernels on a fixed staging buffer; later
+        buckets reuse those kernels.
         Eager pooling: one short dummy, then ``mark_warmed_up()``. It does not run the
         vision tower, whose eager ops compile per op on first use anyway.
         A compiled pooling model's vision tower, and any model's compiled one, also runs
@@ -940,10 +938,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         if is_pooling and not self.vllm_config.model_config.enforce_eager:
             logger.info(
-                "Warming up model: budget %d rows, %d encoder rectangle(s), "
+                "Warming up model: budget %d rows, %d packed body size(s), "
                 "%d ragged-path group shape(s).",
                 self._encoder_budget,
-                len(self._encoder_rectangles),
+                len(self.spyre_shape_bucketer.bucket_sizes) if self.spyre_shape_bucketer else 0,
                 len(encoder_group_shapes(self.vllm_config)),
             )
             t0 = time.time()
@@ -1207,10 +1205,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         rows = int(kwargs.get("num_tokens_padded") or self._encoder_buffer_rows or 0)
-        # The bucketer pads a rectangular step to that rectangle's ``W * L``. A grid
-        # that is not this step's row count would lay tokens past the tensor, so it
-        # is refused after planning and the step takes the packed path instead.
-        rectangles = [] if self._force_encoder_ragged else self._encoder_rectangles
+        # Serving stays packed: the body is the real token count, and a rectangle
+        # would expand every sequence to the longest one. A forced warmup rectangle
+        # is the only caller that lays that grid out.
+        if self._forced_encoder_rect is None or self._force_encoder_ragged:
+            rectangles = []
+        else:
+            rectangles = self._encoder_rectangles
 
         per_layer = out[0] if isinstance(out, tuple) else out
         groups = per_layer if isinstance(per_layer, list) else [per_layer]
@@ -1285,8 +1286,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         handles padded vs unpadded counts correctly without mutating
         scheduler_output.total_num_scheduled_tokens.
 
-        Decoder: 1D ``compile_sizes`` after warmup. Pooling: the rectangle's ``W * L``
-        when the batch fits one, otherwise the token budget.
+        Decoder: 1D ``compile_sizes`` after warmup. Pooling: the next multiple of 64
+        that holds the real token count.
         """
         pad = self._spyre_bucket_batch_descriptor(num_tokens, num_reqs, num_scheduled_tokens_np)
         if pad is not None:
@@ -1317,27 +1318,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Padded ``BatchDescriptor`` for a warmed 1D body bucket, or None.
 
         Decoder and pooling share this path; the buckets are ``compile_sizes``. A warmed
-        pooling step pads to the rectangle the batch fits, so the GEMMs run on ``W * L``
-        rows. A batch no rectangle holds pads to the token budget, which is the ragged
-        path's buffer.
+        pooling step pads to the next multiple of 64 that holds ``num_tokens``, which
+        is the batch's real token count. Attention then gathers each sequence to its
+        own stick; the GEMMs never see the other prompts' padding.
         """
+        del num_reqs, num_scheduled_tokens_np
         bucketer = self.spyre_shape_bucketer
         if bucketer is None or not bucketer.is_warmed_up:
             return None
-        if self.model_config.runner_type == "pooling" and self._encoder_rectangles:
-            # Only the requests this step scheduled. A longer buffer can hold a
-            # stale length, and padding to that length would disagree with the
-            # plan (which then has to drop the step onto the ragged path).
-            n = min(int(num_reqs), int(num_scheduled_tokens_np.shape[0]))
-            rect = encoder_rectangle_for_batch(
-                n,
-                int(num_scheduled_tokens_np[:n].max()) if n else 0,
-                self._encoder_rectangles,
-            )
-            if rect is not None and rect[0] * rect[1] in bucketer.bucket_sizes:
-                return BatchDescriptor(num_tokens=rect[0] * rect[1])
-            if self._encoder_budget in bucketer.bucket_sizes:
-                return BatchDescriptor(num_tokens=self._encoder_budget)
         padded = bucketer.warmed_bucket(num_tokens)
         return None if padded is None else BatchDescriptor(num_tokens=padded)
 
@@ -1476,14 +1464,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warm_pooling_rectangles(self) -> None:
-        """One dummy per rectangle at ``W * L`` rows, plus the ragged budget when needed.
+        """One dummy per packed body bucket, on the ragged path.
 
-        The block graph specialises on ``(width, extent)``, and the GEMMs specialise on
-        the row count, so a dummy at the token budget only compiles the rectangle that
-        dummy's own batch happens to land on. Forcing each rectangle at its own row
-        count compiles the shape serving will pad to. The ragged dummy is what reaches
-        ``warm_kernels`` for the group shapes; it is skipped when that family is empty
-        and the budget was already covered by a rectangle of the same row count.
+        The block graph specialises on the row count, and serving pads to the next
+        multiple of 64 of the real tokens, so each of those totals needs its own
+        dummy. Attention stays packed and is staged onto one fixed buffer, which
+        ``warm_kernels`` traces on the first dummy; the later dummies only compile
+        the GEMMs.
         """
         seen_rows: set[int] = set()
 
@@ -1496,24 +1483,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self._warm_pooler_row_widths(hidden_states)
             self._warm_encoder_unpack(hidden_states)
 
-        logger.info("Warming %d encoder rectangle(s).", len(self._encoder_rectangles))
-        for extent, width in sorted(self._encoder_rectangles, reverse=True):
-            self._forced_encoder_rect = (extent, width)
-            try:
-                rows = extent * width
+        sizes = [self._encoder_budget]
+        if self.spyre_shape_bucketer is not None:
+            sizes.extend(self.spyre_shape_bucketer.bucket_sizes)
+        logger.info("Warming %d packed encoder body size(s).", len(set(sizes)))
+        self._force_encoder_ragged = True
+        try:
+            for rows in sorted(set(sizes), reverse=True):
                 hidden_states, _ = self._dummy_run(rows, force_attention=True)
                 _warm_sides(rows, hidden_states)
-            finally:
-                self._forced_encoder_rect = None
-
-        groups = encoder_group_shapes(self.vllm_config)
-        if groups or self._encoder_budget not in seen_rows:
-            self._force_encoder_ragged = True
-            try:
-                hidden_states, _ = self._dummy_run(self._encoder_budget, force_attention=True)
-                _warm_sides(self._encoder_budget, hidden_states)
-            finally:
-                self._force_encoder_ragged = False
+        finally:
+            self._force_encoder_ragged = False
         self._warm_encoder_embed_gather()
 
     @torch.inference_mode()

@@ -70,27 +70,17 @@ argmax across pooling models), floored at `--max-model-len` rounded up to a mult
 floored to a whole multiple of that longest length. `--max-num-seqs` is then lowered to
 `R / 64` if it was higher, since no batch wider than that fits.
 
-- **Body** (Linear / LN): one compiled shape per rectangle, `W * L` rows. A step pads
-  to the rectangle it fits, not to `R`. The ragged path is the one that still fills `R`.
+- **Body** (Linear / LN): every multiple of 64 from one stick up to `R`. A step pads
+  to the next entry that holds its real tokens. Four prompts totalling 1650 tokens
+  run 1664 rows, not `R`.
 - **Lengths**: every multiple of 64 from one stick up to `--max-model-len`, rounded up
-  to a whole stick. A 300-token prompt runs at 320, not 512. `SPYRE_ATTN_QUERY_BUCKETS`
-  overrides the ladder, rounded the same way.
-- **Attention, rectangular path**: for each length `L`, widths that are powers of two
-  up to the most sequences of that length the budget holds (plus that cap when it is
-  not a power of two). The runner picks the shortest `L` and the narrowest such width
-  `W`, and pads every sequence to `L` and the batch to `W`, so Q/K/V *are* the grid:
-  one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
-  inside the layer.
-- **Attention, ragged path**: for a batch too wide for any rectangle, Q/K/V stay
-  packed and requests are split into *groups* — the requests sharing one padded
-  length. Each group is one fused gather/attend/scatter keyed on `(group width,
-  extent)`, so a ragged step makes one kernel call per group rather than per
-  request. Widths are powers of two up to the cap; a wider group is chunked into
-  descending powers of two.
-
-At `--max-num-seqs 4` the group family is empty — no batch that narrow can miss the
-rectangular path. Those rectangles are block graphs of their own when attention is
-traced in (see below), and attention kernels when it stays opaque.
+  to a whole stick. Attention pads each sequence to that length on its own; the other
+  sequences in the batch do not inherit it. `SPYRE_ATTN_QUERY_BUCKETS` overrides the
+  ladder, rounded the same way.
+- **Attention**: Q/K/V stay packed. Requests are split into *groups* — the requests
+  sharing one padded length. Each group is one fused gather/attend/scatter, staged
+  on a fixed buffer so the kernel does not recompile for every body size. Widths are
+  powers of two up to the cap; a wider group is chunked into descending powers of two.
 
 The choice is made once per step from the step's metadata, before the forward, and the
 runner counts it in `spyre_encoder_stats` (`rect_steps` / `ragged_steps`). The
@@ -101,11 +91,9 @@ opaque, with no block graph; a compiled, unpadded sub-stick head size also keeps
 both paths opaque, sharing one block graph. Pooling models such as granite-30m
 pad their native 32-wide heads to 64 before construction.
 
-Compiled pooling warmup runs one dummy per rectangle at that rectangle's `W * L` rows,
-plus one at `R` on the ragged path when any group is reachable. Each dummy traces the
-block (and, while attention is opaque, the rectangles of that row count) against that
-call's own tensors, because a Spyre tensor's device layout is part of its cache key.
-Eager pooling uses one short dummy and always takes the packed path.
+Compiled pooling warmup runs one dummy per body bucket. The first dummy traces the
+group kernels on the fixed staging buffer; the rest compile the GEMMs at that row
+count. Eager pooling uses one short dummy and always takes the packed path.
 
 Example:
 

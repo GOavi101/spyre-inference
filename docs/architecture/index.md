@@ -423,9 +423,9 @@ the decoder needs.
 Everything hangs off one number, `R = encoder_budget_rows(...)`: the token budget, capped
 at 2048, floored at `max_model_len` rounded up to a multiple of 64, capped at
 what `max_num_seqs` sequences of that length could carry, and finally floored to a whole
-multiple of that longest length. `R` is the most rows a step may run. A rectangular step
-runs `W * L` rows, the shortest stick length and narrowest width that hold the batch.
-The ragged path is what still fills `R`.
+multiple of that longest length. `R` is the most rows a step may run. A step runs the
+next multiple of 64 of its real token count. Attention gathers each sequence to its
+own stick length out of that packed buffer.
 
 On top of that budget sit two paths over a stick-aligned length ladder
 (`ENCODER_LEN_ALIGNMENT = 64`, every stick up to `max_model_len`, rounded up to a whole
@@ -440,18 +440,20 @@ exactly the extents a request can be assigned):
    inside the layer. For packed-order pooling, `_unpad_encoder_hidden` compacts the grid
    at a fixed row count so the gather does not specialise per token total. Homogeneous
    CLS pooling instead reads each sequence's first grid row and skips the gather.
-2. **Ragged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
-   are grouped by their own padded extent; `_encoder_fused_kernel` does gather, attend and
-   scatter for one group in a single graph, keyed on `(width, extent)`. Request boundaries
-   ride in int32 row-index tables, so a card never does offset arithmetic on *shapes* —
-   offsets are data. A group wider than the widest declared width is chunked into
-   descending powers of two, so every dispatch lands on a warmed pair.
+2. **Ragged path** — what serving runs. Q/K/V stay packed at the real token count and
+   requests are grouped by their own padded extent; `_encoder_fused_kernel` does gather,
+   attend and scatter for one group in a single graph, keyed on `(width, extent)` against
+   a fixed staging buffer, not the body's row count. Request boundaries ride in int32
+   row-index tables, so a card never does offset arithmetic on *shapes* — offsets are
+   data. A group wider than the widest declared width is chunked into descending powers
+   of two, so every dispatch lands on a warmed pair.
 
-The runner picks between them once per step in `_build_attention_metadata`, through
+The runner builds the plan once per step in `_build_attention_metadata`, through
 `plan_encoder_step`, and records the choice as the *type* of `attn_metadata.encoder_plan`
-(`EncoderRectPlan` versus a list of `EncoderGroupPlan`). It has to run there rather than
-in `forward`: the builder does a D2H read and H2D conversions, which inside a traced
-region become graph nodes.
+(`EncoderRectPlan` versus a list of `EncoderGroupPlan`). Serving passes no rectangles, so
+the plan is the ragged one and `_preprocess` does not expand the batch. It has to run
+there rather than in `forward`: the builder does a D2H read and H2D conversions, which
+inside a traced region become graph nodes.
 
 The ragged path always stays behind the opaque `unified_attention_with_output`: it
 dispatches once per group, so tracing it in would make the block graph's structure depend on

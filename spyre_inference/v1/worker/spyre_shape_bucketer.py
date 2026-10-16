@@ -18,11 +18,11 @@ Body (1D, decoder): sorted ``compile_sizes`` token counts; pad the packed batch 
 the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, …]``.
 
 Pooling's token budget ``R`` (``encoder_budget_rows``) is the most rows a step may
-run, not the row count of every step. The rectangular path pads to the shortest stick
-length that covers the batch and the narrowest declared width that covers its sequence
-count, so Q/K/V and the FFN see ``W * L`` rows instead of a full ``R``-row body. The
-ragged path, used when no rectangle holds the batch, still packs into the ``R``-row
-buffer.
+run, not the row count of every step. A step pads to the next multiple of 64 of its
+real token count, and attention gathers each sequence out to its own stick length.
+Q/K/V and the FFN therefore see that packed total, not a rectangle of the longest
+prompt. The ragged kernels are staged on one fixed buffer so they do not recompile
+for every total.
 
 Both families come from one stick-aligned length ladder (every 64 tokens up to
 ``max_model_len``):
@@ -30,8 +30,8 @@ Both families come from one stick-aligned length ladder (every 64 tokens up to
 * ``encoder_rectangles`` -- the rectangular path. Several ``(L, W)`` per length, ``W`` a
   power of two up to the widest batch that length can hold (plus that cap when it is
   not itself a power of two).
-* ``encoder_group_shapes`` -- the ragged path, for batches too wide for a rectangle.
-  One ``(width, extent)`` per group of equal-extent requests.
+* ``encoder_group_shapes`` -- attention's gather shapes. One ``(width, extent)`` per
+  group of equal-extent requests. The body itself is not one of these.
 """
 
 from __future__ import annotations
@@ -203,18 +203,14 @@ def _encoder_groups(
 ) -> tuple[tuple[int, int], ...]:
     """Ragged-path ``(width, extent)`` pairs, widths powers of two up to ``B(e)``.
 
-    Empty when the rectangular path cannot miss. Dispatch takes the ragged path only when
-    ``num_seqs > budget // L``, and ``L`` is largest -- so ``budget // L`` smallest --
-    at the top of the ladder; if ``max_num_seqs`` does not exceed that, no schedulable
-    batch reaches this family and warming it would compile the most expensive graphs
-    in the run for nothing.
+    Serving pads the body to the real token count, so attention always gathers
+    equal-extent groups out of that packed buffer. The family is declared even when
+    a rectangle could also hold the batch: the rectangle would pad every sequence
+    to the longest one, and that padding is what the GEMMs would spend the step on.
 
-    Several widths per extent, unlike the rectangular path's one: a ragged-path step has
-    several groups, and padding each up to ``B(e)`` would cost ``budget`` rows per
-    group rather than per step.
+    Several widths per extent. A ragged step has several groups, and padding each
+    up to ``B(e)`` would cost a full extra sequence per group.
     """
-    if max_num_seqs <= budget // lengths[-1]:
-        return ()
     pairs: list[tuple[int, int]] = []
     for extent in lengths:
         cap = _floor_pow2(min(max_num_seqs, budget // extent))
@@ -265,19 +261,19 @@ def encoder_rectangles(vllm_config: VllmConfig) -> list[tuple[int, int]]:
 
 
 def encoder_body_sizes(vllm_config: VllmConfig) -> list[int]:
-    """Row counts a pooling step can compile: each rectangle, plus the ragged budget.
+    """Row counts a pooling step can compile: every stick from 64 through the budget.
 
-    The ragged path packs into the budget even when no rectangle's ``W * L`` equals it,
-    so the budget stays in the list when it is not already a rectangle.
+    A step pads to the next one of these that holds its real tokens. The budget is
+    the last entry, so the scheduler cap stays ``R``.
     """
-    tables = encoder_shape_tables(vllm_config)
-    sizes = {length * width for length, width in tables.rectangles}
-    sizes.add(tables.budget)
-    return sorted(sizes)
+    budget = encoder_shape_tables(vllm_config).budget
+    sizes = list(range(ENCODER_SEQ_ALIGNMENT, budget, ENCODER_SEQ_ALIGNMENT))
+    sizes.append(budget)
+    return sizes
 
 
 def encoder_group_shapes(vllm_config: VllmConfig) -> list[tuple[int, int]]:
-    """Ragged-path ``(width, extent)`` table; empty when the rectangular path cannot miss."""
+    """Ragged-path ``(width, extent)`` table."""
     return list(encoder_shape_tables(vllm_config).groups)
 
 
