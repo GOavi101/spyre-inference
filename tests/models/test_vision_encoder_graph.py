@@ -675,22 +675,22 @@ def test_output_cache_clear_del_and_update_release_rows():
     Those dict mutators would otherwise skip the release and leak until store raises.
     """
     table = _table()
-    first = table.store(torch.zeros(2, 8))
+    first = table.store(torch.zeros(2, 8, dtype=torch.float16))
     cache = EncoderOutputCache(table)
     cache["a"] = first
     del cache["a"]
     assert len(table._free) == 8
 
-    second = table.store(torch.ones(2, 8))
+    second = table.store(torch.ones(2, 8, dtype=torch.float16))
     cache.update({"a": second})
     assert len(table._free) == 6
-    replacement = table.store(torch.full((2, 8), 3))
+    replacement = table.store(torch.full((2, 8), 3, dtype=torch.float16))
     cache.update({"a": replacement})
     assert len(table._free) == 6
     assert cache.popitem()[0] == "a"
     assert len(table._free) == 8
 
-    fresh = table.store(torch.zeros(2, 8))
+    fresh = table.store(torch.zeros(2, 8, dtype=torch.float16))
     cache.setdefault("b", fresh)
     assert len(table._free) == 6
     cache.setdefault("b", second)
@@ -729,14 +729,14 @@ def test_store_pads_a_short_pack_up_to_a_warmed_write():
 
 def test_embed_rejects_handles_mixed_with_embeddings():
     table = _table()
-    handles = table.store(torch.ones(2, 8))
+    handles = table.store(torch.ones(2, 8, dtype=torch.float16))
     model = _FakeVisionModel()
     model.output_table = table
     input_ids, is_multimodal = _prompt([1, 2, 3, 4])
     with pytest.raises(RuntimeError, match="mixes floating-point prompt embeddings"):
         model.embed_input_ids(
             input_ids,
-            [handles, torch.ones(2, 8)],
+            [handles, torch.ones(2, 8, dtype=torch.float16)],
             is_multimodal=is_multimodal,
         )
 
@@ -744,7 +744,7 @@ def test_embed_rejects_handles_mixed_with_embeddings():
 def test_output_table_refuses_more_rows_than_the_cache():
     table = _table(cache_size=2, rows=4)
     with pytest.raises(RuntimeError, match="free rows"):
-        table.store(torch.zeros(3, 8))
+        table.store(torch.zeros(3, 8, dtype=torch.float16))
 
 
 def test_warmup_write_caps_a_budget_at_the_cache():
