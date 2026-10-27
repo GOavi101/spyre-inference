@@ -200,9 +200,13 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        """Slice the projected rows into ``dest``. With a table, store them and scatter handles."""
+        """Slice the projected rows into ``dest``. With a table, store them and scatter handles.
+
+        The tail sees the whole encoder output. Slicing it on the card first is a narrowed
+        view, and downloading that faults; the prefix is taken on the host afterwards.
+        """
         num_tokens = sum(per_item_out_tokens[i] for i in indices)
-        tokens = self.encoder_cache_rows(outputs["default"][:num_tokens])
+        tokens = self.encoder_cache_rows(outputs["default"])[:num_tokens]
         table = getattr(self, "output_table", None)
         if table is not None:
             tokens = table.store(tokens)

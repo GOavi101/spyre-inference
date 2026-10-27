@@ -142,6 +142,17 @@ def _copy_encoder_rows(
     return table
 
 
+def _gather_cached_rows(
+    table: torch.Tensor, text: torch.Tensor, src_idx: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    """``where(mask, table.index_select(0, src_idx), text)``.
+
+    ``table`` is an argument so the compiled graph reads it on every call, including rows
+    written after the graph was compiled. ``mask`` is ``[T, 1]``, built on the host.
+    """
+    return torch.where(mask, table.index_select(0, src_idx), text)
+
+
 class EncoderOutputTable:
     """Device-resident ``[C + pad, H]`` table of encoder outputs, plus one trash row.
 
@@ -420,8 +431,7 @@ class SpyreVisionEncoderMixin:
         """
         table = self.output_table
         assert table is not None, "vision_gather_merge needs an encoder output table"
-        image = table.table.index_select(0, src_idx)
-        return torch.where(mask, image, text)
+        return _gather_cached_rows(table.table, text, src_idx, mask)
 
     # --- 3. Used by the runner ---
 
@@ -442,10 +452,7 @@ class SpyreVisionEncoderMixin:
         self._spyre_vision_embed = torch.compile(self.vision_embed, **compile_kwargs)
         self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
         self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
-        if getattr(self, "output_table", None) is not None:
-            self._spyre_vision_gather_merge = torch.compile(
-                self.vision_gather_merge, **compile_kwargs
-            )
+        self.compile_output_merge()
         for name in ("vision_embed", "vision_project", "vision_merge", "vision_gather_merge"):
             compiled = getattr(self, f"_spyre_{name}", None)
             if compiled is not None:
@@ -453,6 +460,24 @@ class SpyreVisionEncoderMixin:
         for block in self.vision_blocks():
             block.compile(**compile_kwargs)
             compile_guard.watch(block, f"{type(block).__name__} (vision block)")
+
+    def compile_output_merge(self) -> None:
+        """Compile the table gather. The tower may stay eager; this op cannot.
+
+        Eager ``index_select`` rejects the int32 index and falls back to the CPU, and an
+        eager gather of this layout has faulted the card. ``enforce_eager`` still comes
+        through here: only the tower stays eager.
+        """
+        if getattr(self, "output_table", None) is None:
+            return
+        if hasattr(self, "_spyre_vision_gather_merge"):
+            return
+        self._spyre_vision_gather_merge = torch.compile(
+            _gather_cached_rows, backend="inductor", fullgraph=True, dynamic=False
+        )
+        compile_guard.watch(
+            self._spyre_vision_gather_merge, f"{type(self).__name__}.vision_gather_merge"
+        )
 
     # --- 4. Upstream's SupportsEncoderCudaGraph, in the order the manager calls it ---
 
@@ -591,8 +616,10 @@ class SpyreVisionEncoderMixin:
         table = getattr(self, "output_table", None)
         if table is not None:
             num_tokens = sum(per_item_out_tokens[i] for i in indices)
-            # Prefix at offset 0: a non-zero device offset reads as row 0 (torch-spyre#3770).
-            output = table.store(self.encoder_cache_rows(output[:num_tokens]))
+            # Project or pass the whole output, then keep the real prefix. Slicing on the
+            # card first is a narrowed view, and downloading that faults.
+            rows = self.encoder_cache_rows(output)
+            output = table.store(rows[:num_tokens])
         scatter_output_slices(output, indices, per_item_out_tokens, dest, clone)
 
     def embed_multimodal(self, **kwargs: object) -> Any:
@@ -670,10 +697,9 @@ class SpyreVisionEncoderMixin:
         table = self.output_table
         src_idx = torch.full((text.shape[0],), table.trash, dtype=_index_dtype(text.device))
         src_idx[mask] = handles.to(dtype=src_idx.dtype)
-        merge = getattr(self, "_spyre_vision_gather_merge", None)
-        if merge is None:
-            merge = self.vision_gather_merge
+        merge = getattr(self, "_spyre_vision_gather_merge", _gather_cached_rows)
         return merge(
+            table.table,
             text,
             convert(src_idx, device=text.device),
             convert(mask_col, device=text.device),

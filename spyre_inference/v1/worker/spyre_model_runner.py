@@ -1073,7 +1073,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _record_vision_graphs(self) -> None:
-        """Compile the vision encoder at every budget; serving then runs through the manager."""
+        """Compile the vision encoder at every budget; serving then runs through the manager.
+
+        ``enforce_eager`` leaves the tower eager, but the output-table gather is not an
+        eager op, so that one graph is still compiled and warmed.
+        """
+        if self.compilation_config.mode is CompilationMode.NONE:
+            model = getattr(self.model, "_model", self.model)
+            if isinstance(model, SpyreVisionEncoderMixin) and model.output_table is not None:
+                with _set_spyre_compilation_settings(self.vllm_config):
+                    model.compile_output_merge()
+                    self._warmup_vision_merge(model)
+            return
         model = self._compiled_vision_model()
         if model is None:
             return

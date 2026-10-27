@@ -233,6 +233,15 @@ def test_warmup_stores_the_projected_rows_not_the_vision_width():
     table.warmup_write(rows)
     assert len(table._free) == 8
 
+    # The tail runs on the whole output; the real prefix is what gets stored. Slicing a
+    # device tensor first is the download that faulted eager Gemma 4.
+    model.output_table = table
+    padded = torch.randn(8, HIDDEN)
+    dest: list[torch.Tensor | None] = [None]
+    model.postprocess_encoder_output({"default": padded}, [0], [3], dest)
+    assert dest[0] is not None and dest[0].shape == (3, 1)
+    assert len(table._free) == 5
+
 
 def test_offset_major_sum_matches_the_stock_pooler():
     """Summed offset groups, scaled, equal stock's position-driven average."""
