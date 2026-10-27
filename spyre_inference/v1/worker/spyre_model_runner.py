@@ -1079,6 +1079,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         eager op, so that one graph is still compiled and warmed.
         """
         if self.compilation_config.mode is CompilationMode.NONE:
+            # Text-only warmup builds a runner with no model. Nothing to gather.
+            if not self.supports_mm_inputs or not hasattr(self, "model"):
+                return
             model = getattr(self.model, "_model", self.model)
             if isinstance(model, SpyreVisionEncoderMixin) and model.output_table is not None:
                 with _set_spyre_compilation_settings(self.vllm_config):
