@@ -177,6 +177,20 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
             )
         return super().embed_multimodal(**kwargs)
 
+    def encoder_cache_rows(self, output: torch.Tensor) -> torch.Tensor:
+        """The tail in fp32 on the host, as upstream: its scale can overflow fp16.
+
+        ``vision_project`` only pools, so its rows are the vision width. The table and the
+        prompt merge are the text width; this is the projection that gets them there.
+        """
+        tail = self._spyre_vision_tail
+        x = convert(output, device="cpu").float() * tail.scale
+        if tail.std_bias is not None and tail.std_scale is not None:
+            x = (x - tail.std_bias) * tail.std_scale
+        # embed_vision: a weightless RMSNorm, then the projection.
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
+        return (x @ tail.weight.t()).to(tail.dtype)
+
     def postprocess_encoder_output(
         self,
         outputs: dict[str, torch.Tensor],
@@ -186,20 +200,12 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        """The tail in fp32 on the host, as upstream: its scale can overflow fp16."""
+        """Slice the projected rows into ``dest``. With a table, store them and scatter handles."""
         num_tokens = sum(per_item_out_tokens[i] for i in indices)
-        tail = self._spyre_vision_tail
-        x = outputs["default"][:num_tokens].float() * tail.scale
-        if tail.std_bias is not None and tail.std_scale is not None:
-            x = (x - tail.std_bias) * tail.std_scale
-        # embed_vision: a weightless RMSNorm, then the projection.
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
-        tokens = (x @ tail.weight.t()).to(tail.dtype)
+        tokens = self.encoder_cache_rows(outputs["default"][:num_tokens])
         table = getattr(self, "output_table", None)
         if table is not None:
-            # The tail is fp32 on the host (its scale overflows fp16). One upload of the
-            # projected tokens; the prompt merge then gathers them from the table.
-            tokens = table.store(convert(tokens, device=table.table.device))
+            tokens = table.store(tokens)
         scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:

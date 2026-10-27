@@ -216,6 +216,24 @@ def test_padding_does_not_leak_into_images():
     torch.testing.assert_close(tight[:n], loose[:n], atol=2e-2, rtol=1e-2)
 
 
+def test_warmup_stores_the_projected_rows_not_the_vision_width():
+    """The table is the text width. ``vision_project`` is still the vision width, and warmup
+    writes ``encoder_cache_rows``, the same projection serving stores."""
+    from spyre_inference.models._vision_encoder import EncoderOutputTable
+
+    model = _spyre_model(_tower_config(num_layers=1))
+    pooled = torch.randn(8, HIDDEN)
+    rows = model.encoder_cache_rows(pooled)
+    assert rows.shape == (8, TEXT_HIDDEN)
+    assert rows.dtype == torch.float16
+
+    table = EncoderOutputTable(8, TEXT_HIDDEN, torch.float16, torch.device("cpu"), rows=9)
+    with pytest.raises(RuntimeError, match="table rows"):
+        table.store(pooled)
+    table.warmup_write(rows)
+    assert len(table._free) == 8
+
+
 def test_offset_major_sum_matches_the_stock_pooler():
     """Summed offset groups, scaled, equal stock's position-driven average."""
     from spyre_inference.models._vision_encoder import offset_major

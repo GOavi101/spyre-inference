@@ -190,6 +190,9 @@ class EncoderOutputTable:
         n = rows.shape[0]
         if n == 0:
             return torch.empty(0, 1, dtype=torch.int64)
+        # A host projection (Gemma 4's tail) arrives on the CPU. The write runs where the table is.
+        if rows.device != self.table.device:
+            rows = convert(rows, device=self.table.device, dtype=self.table.dtype)
         if n > len(self._free):
             raise RuntimeError(
                 f"Encoder output table has {len(self._free)} free rows, this call needs {n}. "
@@ -559,6 +562,16 @@ class SpyreVisionEncoderMixin:
             {key: convert(value, device=device) for key, value in padded.items()}
         )
 
+    def encoder_cache_rows(self, output: torch.Tensor) -> torch.Tensor:
+        """The rows stored in the output table.
+
+        Default: ``vision_project`` already returns ``[tokens, out_hidden_size]``. Override when
+        the cached rows are a projection of that output (Gemma 4's tail widens the vision width
+        to the text width). Warmup writes whatever this returns, so the compiled write matches
+        the rows serving stores.
+        """
+        return output
+
     def postprocess_encoder_output(
         self,
         outputs: dict[str, torch.Tensor],
@@ -579,7 +592,7 @@ class SpyreVisionEncoderMixin:
         if table is not None:
             num_tokens = sum(per_item_out_tokens[i] for i in indices)
             # Prefix at offset 0: a non-zero device offset reads as row 0 (torch-spyre#3770).
-            output = table.store(output[:num_tokens])
+            output = table.store(self.encoder_cache_rows(output[:num_tokens]))
         scatter_output_slices(output, indices, per_item_out_tokens, dest, clone)
 
     def embed_multimodal(self, **kwargs: object) -> Any:
