@@ -712,6 +712,33 @@ def test_store_keep_writes_the_budget_and_frees_the_tail():
     torch.testing.assert_close(gathered, rows[:2])
 
 
+def test_store_pads_an_unwarmed_budget_up_to_a_warmed_write():
+    """A tensor longer than the real prefix is not compiled when a warmed write fits.
+
+    The tail is a copied row with its own slots. A repeated trash index does not compile.
+    """
+    table = _table(cache_size=8, rows=10)
+    table._writes[6] = object()
+    rows = torch.arange(4 * 8, dtype=torch.float16).view(4, 8)
+    handles = table.store(rows, keep=2)
+    assert handles.shape == (2, 1)
+    assert len(table._free) == 6
+    assert int((table.table[:8].abs().sum(-1) > 0).sum()) == 6
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows[:2])
+
+
+def test_warmup_write_records_its_own_count_beside_a_larger_one():
+    """Each budget is its own write, including when a larger one is already warmed."""
+    table = _table(cache_size=8, rows=10)
+    table._writes[8] = object()
+    rows = torch.arange(4 * 8, dtype=torch.float16).view(4, 8)
+    table.warmup_write(rows)
+    assert len(table._free) == 8
+    assert len(table._in_use) == 0
+    assert int((table.table[:8].abs().sum(-1) > 0).sum()) == 4
+
+
 def test_store_pads_a_short_pack_up_to_a_warmed_write():
     """A real token count that was not warmed reuses the next warmed write.
 

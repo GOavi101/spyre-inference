@@ -198,15 +198,18 @@ class EncoderOutputTable:
         self._free = list(range(cache_size))
         self._writes: dict[int, Any] = {}
 
-    def store(self, rows: torch.Tensor, *, keep: int | None = None) -> torch.Tensor:
+    def store(
+        self, rows: torch.Tensor, *, keep: int | None = None, exact: bool = False
+    ) -> torch.Tensor:
         """Copy ``rows`` ``[n, H]`` into free slots. Returns host handles ``[keep, 1]``.
 
-        ``keep`` defaults to every row. Passing the budget-length tensor with a shorter
-        ``keep`` writes the shape warmup compiled and frees the tail, so the real token
-        count does not compile a graph of its own. A tensor shorter than a warmed write
-        is padded with a copied last row (its own slots, then freed) when that write
-        fits. Repeating one index, including the trash row, does not compile: dbo-opt
-        rejects external allocations with repeated dimensions.
+        ``keep`` defaults to every row. The copy is a length warmup already compiled:
+        the budget tensor itself when that length was warmed, otherwise the next warmed
+        length that fits. The tail slots are freed, so the real token count does not
+        compile a graph. A short tensor is padded with a copied last row. Pointing the
+        tail at the trash row does not compile: dbo-opt rejects an index that repeats.
+        ``exact`` is warmup, which has to record its own length even when a larger write
+        is already compiled.
         """
         if rows.ndim != 2 or rows.shape[1] != self.hidden:
             raise RuntimeError(
@@ -223,7 +226,12 @@ class EncoderOutputTable:
                 f"Encoder output table has {len(self._free)} free rows, this call needs {keep}. "
                 f"The table holds {self.cache_size} image tokens (the scheduler's encoder cache)."
             )
-        target = self._write_count(keep, total)
+        target = total if exact else self._write_count(keep, total)
+        if target > len(self._free):
+            raise RuntimeError(
+                f"Encoder output table has {len(self._free)} free rows, this write needs "
+                f"{target}."
+            )
         body = self._rows_for_write(rows, target)
         # A host projection (Gemma 4's tail) arrives on the CPU. The write runs where the table is.
         if body.device != self.table.device:
@@ -241,12 +249,12 @@ class EncoderOutputTable:
     def _write_count(self, keep: int, total: int) -> int:
         """Rows this write copies: at least ``keep``, and no more than the free list.
 
-        The tensor's own length is the budget warmup compiled, so it is written whole
-        when it fits. Otherwise the smallest already-compiled write that can hold
-        ``keep`` and still fits. A count that fits in none of those compiles once.
+        A length warmup compiled is written whole. Anything else grows to the smallest
+        already-compiled write that can hold ``keep`` and still fits, so a new image
+        size does not compile. A count that fits in none of those compiles once.
         """
         free = len(self._free)
-        if total <= free and (not self._writes or total in self._writes or keep < total):
+        if total <= free and (not self._writes or total in self._writes):
             return total
         warmed = [n for n in self._writes if keep <= n <= free]
         if warmed:
@@ -287,15 +295,18 @@ class EncoderOutputTable:
         if n == 0:
             return
         # Prefix at offset 0. A non-zero device offset reads as row 0 (torch-spyre#3770).
-        self.release(self.store(rows if n == rows.shape[0] else rows[:n]))
+        # exact: a larger warmed write must not swallow this budget, or serving a
+        # smaller budget would compile it on the first request.
+        prefix = rows if n == rows.shape[0] else rows[:n]
+        self.release(self.store(prefix, exact=True))
 
     def _write(self, rows: torch.Tensor, index: torch.Tensor) -> None:
         # Eager int32 index_copy_ falls back to the CPU, so the card always runs the compiled
-        # function, including under enforce_eager. One function per row count. store() pads a
-        # short pack up to a count warmup already compiled, so a new image size does not
-        # compile while a warmed write still fits. A count that fits in none of them compiles
-        # once and is not on the compile guard: the guard would treat it as a missed warmup,
-        # and the count is data, not a shape we can list up front.
+        # function, including under enforce_eager. One function per row count. The count is a
+        # budget warmup compiled, not the real token total: store() pads a short pack up to
+        # one of those. A count that fits in none of them compiles once and is not on the
+        # compile guard. The guard would treat it as a missed warmup, and it only happens
+        # when the free list cannot reach a warmed length.
         if rows.device.type != "spyre":
             _copy_encoder_rows(self.table, index, rows)
             return
