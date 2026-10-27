@@ -202,11 +202,13 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
     ) -> None:
         """Slice the projected rows into ``dest``. With a table, store them and scatter handles.
 
-        The tail sees the whole encoder output. Slicing it on the card first is a narrowed
-        view, and downloading that faults; the prefix is taken on the host afterwards.
+        Download the whole encoder output (offset 0) and drop the budget's padding on the
+        host before the fp32 tail. Slicing on the card is a narrowed view, and running the
+        tail over that padding is a budget/actual multiple of host matmul.
         """
         num_tokens = sum(per_item_out_tokens[i] for i in indices)
-        tokens = self.encoder_cache_rows(outputs["default"])[:num_tokens]
+        downloaded = convert(outputs["default"], device="cpu")
+        tokens = self.encoder_cache_rows(downloaded[:num_tokens])
         table = getattr(self, "output_table", None)
         if table is not None:
             tokens = table.store(tokens)

@@ -233,7 +233,7 @@ def test_warmup_stores_the_projected_rows_not_the_vision_width():
     table.warmup_write(rows)
     assert len(table._free) == 8
 
-    # The tail runs on the whole output; the real prefix is what gets stored. Slicing a
+    # The tail runs on the real prefix after a full-tensor host download. Slicing a
     # device tensor first is the download that faulted eager Gemma 4.
     model.output_table = table
     padded = torch.randn(8, HIDDEN)

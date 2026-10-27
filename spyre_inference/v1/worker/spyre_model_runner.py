@@ -1075,19 +1075,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _record_vision_graphs(self) -> None:
         """Compile the vision encoder at every budget; serving then runs through the manager.
 
-        ``enforce_eager`` leaves the tower eager, but the output-table gather is not an
-        eager op, so that one graph is still compiled and warmed.
+        ``enforce_eager`` has no shape bucketer, so warmup returns before this runs. The
+        gather is compiled when the output table is installed.
         """
-        if self.compilation_config.mode is CompilationMode.NONE:
-            # Text-only warmup builds a runner with no model. Nothing to gather.
-            if not self.supports_mm_inputs or not hasattr(self, "model"):
-                return
-            model = getattr(self.model, "_model", self.model)
-            if isinstance(model, SpyreVisionEncoderMixin) and model.output_table is not None:
-                with _set_spyre_compilation_settings(self.vllm_config):
-                    model.compile_output_merge()
-                    self._warmup_vision_merge(model)
-            return
         model = self._compiled_vision_model()
         if model is None:
             return
@@ -1097,6 +1087,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             assert self.encoder_cudagraph_manager is not None
             self.encoder_cudagraph_manager.capture(graph_pool=None)
             self._warmup_vision_merge(model)
+
+    def _multimodal_pruning_enabled(self, model: Any) -> bool:
+        """Upstream's check: the model implements pruning and the config turns it on.
+
+        A pruning rate on Pixtral or Gemma 4, which do not implement it, is ignored.
+        ``load_model`` is overridden here, so the flag upstream sets on the runner may
+        be absent; the config is only consulted for a model that supports pruning.
+        """
+        flag = bool(getattr(self, "is_multimodal_pruning_enabled", False))
+        if not flag:
+            mm_config = getattr(self.model_config, "multimodal_config", None)
+            enabled = getattr(mm_config, "is_multimodal_pruning_enabled", None)
+            flag = bool(enabled()) if callable(enabled) else bool(enabled)
+        if not flag:
+            return False
+        # Upstream ignores the rate on a model that does not implement pruning.
+        from vllm.model_executor.models.interfaces import supports_multimodal_pruning
+
+        return bool(supports_multimodal_pruning(model))
 
     def _install_encoder_output_table(self) -> None:
         """Allocate the on-card encoder-output table and point ``encoder_cache`` at its rows.
@@ -1108,15 +1117,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model = self.model
         if not isinstance(model, SpyreVisionEncoderMixin):
             return
-        cache_size = int(getattr(self.scheduler_config, "encoder_cache_size", 0) or 0)
+        # The scheduler's EncoderCacheManager sizes from mm_budget.encoder_cache_size:
+        # max(scheduler_config.encoder_cache_size, max_tokens_per_mm_item). The scheduler
+        # field alone is max_num_batched_tokens, which Spyre caps at 512, while one
+        # Ministral image is about 3025 tokens. Several images over that cap overflow
+        # the same way.
+        mm_budget = getattr(self, "mm_budget", None)
+        cache_size = int(getattr(mm_budget, "encoder_cache_size", 0) or 0)
+        if cache_size <= 0:
+            cache_size = int(getattr(self.scheduler_config, "encoder_cache_size", 0) or 0)
         if cache_size <= 0 or model.out_hidden_size <= 0:
             return
-        mm_config = getattr(self.model_config, "multimodal_config", None)
-        pruning = getattr(self, "is_multimodal_pruning_enabled", False)
-        if not pruning and mm_config is not None:
-            enabled = getattr(mm_config, "is_multimodal_pruning_enabled", None)
-            pruning = bool(enabled()) if callable(enabled) else bool(enabled)
-        if pruning:
+        if self._multimodal_pruning_enabled(model):
             raise NotImplementedError(
                 "Multimodal pruning expects embeddings in the encoder cache. Spyre stores "
                 "row handles into an on-card table; turn pruning off."
@@ -1149,6 +1161,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise
         model.output_table = table
         self.encoder_cache = EncoderOutputCache(table)
+        # enforce_eager never reaches _record_vision_graphs (no shape bucketer, so warmup
+        # returns first). The gather cannot run eager, so install the compiled wrapper
+        # with the table. A compiled tower still warms one graph per token bucket.
+        if self._spyre_device.type == "spyre":
+            # Eager has no buckets to warm, so the first prompt length traces this
+            # after the guard is armed. Leave it unwatched there. A compiled tower
+            # warms every bucket in _warmup_vision_merge, which does watch it.
+            eager = self.compilation_config.mode is CompilationMode.NONE
+            model.compile_output_merge(watch=not eager)
         nbytes = table.table.numel() * table.table.element_size()
         logger.info(
             "Encoder output table: %d image tokens, %d rows x %d (%s), %.1f MiB. "

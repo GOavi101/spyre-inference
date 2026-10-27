@@ -669,6 +669,78 @@ def test_output_table_round_trips_and_releases_on_cache_pop():
     torch.testing.assert_close(got[~is_multimodal], text[~is_multimodal])
 
 
+def test_output_cache_clear_del_and_update_release_rows():
+    """clear, del, update, setdefault and popitem free rows.
+
+    Those dict mutators would otherwise skip the release and leak until store raises.
+    """
+    table = _table()
+    first = table.store(torch.zeros(2, 8))
+    cache = EncoderOutputCache(table)
+    cache["a"] = first
+    del cache["a"]
+    assert len(table._free) == 8
+
+    second = table.store(torch.ones(2, 8))
+    cache.update({"a": second})
+    assert len(table._free) == 6
+    replacement = table.store(torch.full((2, 8), 3))
+    cache.update({"a": replacement})
+    assert len(table._free) == 6
+    assert cache.popitem()[0] == "a"
+    assert len(table._free) == 8
+
+    fresh = table.store(torch.zeros(2, 8))
+    cache.setdefault("b", fresh)
+    assert len(table._free) == 6
+    cache.setdefault("b", second)
+    assert cache["b"] is fresh
+    assert len(table._free) == 6
+    cache.clear()
+    assert len(table._free) == 8
+    assert not cache
+
+
+def test_store_keep_writes_the_budget_and_frees_the_tail():
+    """A budget-length write keeps the real prefix and returns the padding rows."""
+    table = _table(cache_size=8, rows=10)
+    rows = torch.arange(6 * 8, dtype=torch.float16).view(6, 8)
+    handles = table.store(rows, keep=2)
+    assert handles.shape == (2, 1)
+    assert len(table._free) == 6
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows[:2])
+
+
+def test_store_pads_a_short_pack_up_to_a_warmed_write():
+    """A real token count that was not warmed reuses the next warmed write.
+
+    The extra rows are copies with their own slots, not a repeated trash index.
+    """
+    table = _table(cache_size=8, rows=10)
+    table._writes[6] = object()
+    rows = torch.arange(3 * 8, dtype=torch.float16).view(3, 8)
+    handles = table.store(rows)
+    assert handles.shape == (3, 1)
+    assert len(table._free) == 5
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows)
+
+
+def test_embed_rejects_handles_mixed_with_embeddings():
+    table = _table()
+    handles = table.store(torch.ones(2, 8))
+    model = _FakeVisionModel()
+    model.output_table = table
+    input_ids, is_multimodal = _prompt([1, 2, 3, 4])
+    with pytest.raises(RuntimeError, match="mixes floating-point prompt embeddings"):
+        model.embed_input_ids(
+            input_ids,
+            [handles, torch.ones(2, 8)],
+            is_multimodal=is_multimodal,
+        )
+
+
 def test_output_table_refuses_more_rows_than_the_cache():
     table = _table(cache_size=2, rows=4)
     with pytest.raises(RuntimeError, match="free rows"):
