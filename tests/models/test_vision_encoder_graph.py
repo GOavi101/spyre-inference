@@ -675,6 +675,17 @@ def test_output_table_refuses_more_rows_than_the_cache():
         table.store(torch.zeros(3, 8))
 
 
+def test_warmup_write_caps_a_budget_at_the_cache():
+    """A padded encoder budget can be far larger than the cache. Warmup compiles a write of
+    the free rows only; serving never stores more than that, and a repeated index does not
+    compile."""
+    table = _table(cache_size=4, rows=6)
+    rows = torch.arange(20 * 8, dtype=torch.float16).view(20, 8)
+    table.warmup_write(rows)
+    assert len(table._free) == 4
+    assert len(table._in_use) == 0
+
+
 def test_duplicate_index_copy_keeps_the_last_row():
     """On CPU a repeated index keeps the last row. The compiled card write never repeats one:
 

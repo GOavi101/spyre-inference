@@ -230,27 +230,18 @@ class EncoderOutputTable:
             self._free.append(row)
 
     def warmup_write(self, rows: torch.Tensor) -> None:
-        """Compile the write for this row count.
+        """Compile the largest write serving can make from this output, then free it.
 
-        A token budget can be larger than the cache: the scheduler never stores that many
-        real tokens, the extra rows are padding. That kernel is compiled with unique indices
-        below the trash row. A repeated index does not compile. A budget that fits is written
-        into real rows and freed, which is the same write a full pack uses.
+        The encoder's padded budget can be thousands of rows while the cache holds far
+        fewer. The scheduler never stores more real tokens than the cache, and a compiled
+        ``index_copy_`` cannot repeat an index, so this writes one unique row per free slot.
+        A budget that fits is written in full.
         """
-        n = rows.shape[0]
-        if n <= len(self._free):
-            self.release(self.store(rows))
+        n = min(rows.shape[0], len(self._free))
+        if n == 0:
             return
-        if n > self.trash:
-            raise RuntimeError(
-                f"Encoder budget has {n} rows but the table only has {self.trash} slots below "
-                "the trash row. A compiled index_copy_ cannot repeat an index; raise "
-                "--encoder-cache-size or the token buckets the table is sized from."
-            )
-        index = torch.arange(n, dtype=_index_dtype(rows.device))
-        if rows.device.type != "cpu":
-            index = convert(index, device=rows.device)
-        self._write(rows, index)
+        # Prefix at offset 0. A non-zero device offset reads as row 0 (torch-spyre#3770).
+        self.release(self.store(rows if n == rows.shape[0] else rows[:n]))
 
     def _write(self, rows: torch.Tensor, index: torch.Tensor) -> None:
         # Eager int32 index_copy_ falls back to the CPU, so the card always runs the compiled
