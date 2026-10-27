@@ -586,8 +586,8 @@ class _SpyreModelWrapper:
                 is_multimodal = F.pad(is_multimodal, (0, padded_tokens - num_tokens))
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
-        # These place their image tokens on the host (``SpyreVisionEncoderMixin.embed_input_ids``),
-        # where their encoder output already is, so neither goes to the card here.
+        # A mixin model merges on the card. Handles stay on the host until it builds
+        # ``src_idx``; embeddings (no output table) are placed on the host there too.
         if not vision:
             is_multimodal = self._to_spyre(is_multimodal)
             multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
@@ -787,6 +787,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = SpyreShapeBucketer.for_config(self.vllm_config)
+        # Before the wrapper: the table lives on the vision model, and its row count has to
+        # clear every token bucket.
+        self._install_encoder_output_table()
 
         # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
         bucketer = self.spyre_shape_bucketer
@@ -1119,13 +1122,80 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.encoder_cudagraph_manager.capture(graph_pool=None)
             self._warmup_vision_merge(model)
 
+    def _install_encoder_output_table(self) -> None:
+        """Allocate the on-card encoder-output table and point ``encoder_cache`` at its rows.
+
+        The KV cache is left as sized. Fails here, before warmup, if the table does not fit.
+        """
+        from spyre_inference.models._vision_encoder import EncoderOutputCache, EncoderOutputTable
+
+        model = self.model
+        if not isinstance(model, SpyreVisionEncoderMixin):
+            return
+        cache_size = int(getattr(self.scheduler_config, "encoder_cache_size", 0) or 0)
+        if cache_size <= 0 or model.out_hidden_size <= 0:
+            return
+        mm_config = getattr(self.model_config, "multimodal_config", None)
+        pruning = getattr(self, "is_multimodal_pruning_enabled", False)
+        if not pruning and mm_config is not None:
+            enabled = getattr(mm_config, "is_multimodal_pruning_enabled", None)
+            pruning = bool(enabled()) if callable(enabled) else bool(enabled)
+        if pruning:
+            raise NotImplementedError(
+                "Multimodal pruning expects embeddings in the encoder cache. Spyre stores "
+                "row handles into an on-card table; turn pruning off."
+            )
+        ec = getattr(self.vllm_config, "ec_transfer_config", None)
+        if ec is not None and getattr(ec, "ec_connector", None):
+            raise NotImplementedError(
+                "The encoder-cache connector expects embeddings in the encoder cache. "
+                "Spyre stores row handles into an on-card table; run without an EC connector."
+            )
+        buckets = ()
+        bucketer = getattr(self, "spyre_shape_bucketer", None)
+        if bucketer is not None:
+            buckets = tuple(bucketer.bucket_sizes)
+        # One past the longer of the cache and any token bucket, so a gather of a step is
+        # never the whole table (torch-spyre#4033). Only ``cache_size`` rows are allocatable.
+        rows = max(cache_size, max(buckets, default=0)) + 1
+        dtype = self._model_dtype()
+        try:
+            table = EncoderOutputTable(
+                cache_size, model.out_hidden_size, dtype, self._spyre_device, rows=rows
+            )
+        except RuntimeError:
+            logger.error(
+                "Failed to allocate the encoder output table (%d x %d %s).",
+                rows,
+                model.out_hidden_size,
+                dtype,
+            )
+            raise
+        model.output_table = table
+        self.encoder_cache = EncoderOutputCache(table)
+        nbytes = table.table.numel() * table.table.element_size()
+        logger.info(
+            "Encoder output table: %d image tokens, %d rows x %d (%s), %.1f MiB. "
+            "The KV cache is unchanged.",
+            cache_size,
+            rows,
+            model.out_hidden_size,
+            dtype,
+            nbytes / (1024 * 1024),
+        )
+
     def _warmup_vision_merge(self, model: SpyreVisionEncoderMixin) -> None:
-        """Compile ``vision_merge`` at every token bucket an image step can land on."""
+        """Compile the image merge at every token bucket an image step can land on."""
         bucketer = self.spyre_shape_bucketer
         if bucketer is None:
             return
         wrapper = cast(_SpyreModelWrapper, self.model)
-        image_rows = [torch.zeros(1, model.out_hidden_size, dtype=self._model_dtype())]
+        table = getattr(model, "output_table", None)
+        if table is None:
+            image_rows = [torch.zeros(1, model.out_hidden_size, dtype=self._model_dtype())]
+        else:
+            # The trash row: warmup only needs the gather's shape, not a real image.
+            image_rows = [torch.full((1, 1), table.trash, dtype=torch.int64)]
         # Image steps stage at least two rows (see _SpyreModelWrapper.embed_input_ids), so a
         # bucket below two is never reached.
         for size in bucketer.bucket_sizes:

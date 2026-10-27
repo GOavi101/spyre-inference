@@ -195,6 +195,11 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
         # embed_vision: a weightless RMSNorm, then the projection.
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
         tokens = (x @ tail.weight.t()).to(tail.dtype)
+        table = getattr(self, "output_table", None)
+        if table is not None:
+            # The tail is fp32 on the host (its scale overflows fp16). One upload of the
+            # projected tokens; the prompt merge then gathers them from the table.
+            tokens = table.store(convert(tokens, device=table.table.device))
         scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
 
     def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:

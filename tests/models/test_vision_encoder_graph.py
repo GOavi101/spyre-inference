@@ -24,7 +24,13 @@ import torch
 import torch.nn as nn
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
-from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin, VisionBuffer
+from spyre_inference.models._vision_encoder import (
+    EncoderOutputCache,
+    EncoderOutputTable,
+    SpyreVisionEncoderMixin,
+    VisionBuffer,
+    _copy_encoder_rows,
+)
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 
 MERGE_PATCHES = 4  # 2x2 merge
@@ -632,3 +638,82 @@ def test_eager_path_respects_the_items_per_call_cap():
     assert [o.shape[0] for o in outputs] == [5, 10, 15, 20, 25]
     for i, out in enumerate(outputs):
         torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
+def _table(cache_size: int = 8, rows: int = 16) -> EncoderOutputTable:
+    return EncoderOutputTable(cache_size, 8, torch.float16, torch.device("cpu"), rows=rows)
+
+
+def test_output_table_round_trips_and_releases_on_cache_pop():
+    """Stored rows are gathered back by handle, and popping the cache frees them."""
+    table = _table()
+    rows = torch.arange(16, dtype=torch.float16).view(2, 8)
+    handles = table.store(rows)
+    assert handles.shape == (2, 1)
+    assert len(table._free) == 6
+
+    cache = EncoderOutputCache(table)
+    cache["img"] = handles
+    cache["img"] = handles
+    assert len(table._free) == 6
+    cache.pop("img")
+    assert len(table._free) == 8
+
+    model = _FakeVisionModel()
+    model.output_table = table
+    again = table.store(rows)
+    input_ids, is_multimodal = _prompt([4, 5])
+    got = model.embed_input_ids(input_ids, [again], is_multimodal=is_multimodal)
+    torch.testing.assert_close(got[4:6], rows)
+    text = input_ids.to(torch.float16)[:, None].expand(-1, 8)
+    torch.testing.assert_close(got[~is_multimodal], text[~is_multimodal])
+
+
+def test_output_table_refuses_more_rows_than_the_cache():
+    table = _table(cache_size=2, rows=4)
+    with pytest.raises(RuntimeError, match="free rows"):
+        table.store(torch.zeros(3, 8))
+
+
+def test_duplicate_index_copy_keeps_the_last_row():
+    """The table write overwrites. Duplicate indices keep the last row, including the trash row.
+
+    Eager int32 ``index_copy_`` on Spyre falls back to the CPU, so the serving write is the
+    compiled ``_copy_encoder_rows``. This is that function.
+    """
+    table = torch.zeros(4, 2)
+    index = torch.tensor([3, 3])
+    rows = torch.tensor([[1.0, 0.0], [2.0, 5.0]])
+    _copy_encoder_rows(table, index, rows)
+    torch.testing.assert_close(table[3], torch.tensor([2.0, 5.0]))
+    assert table[:3].eq(0).all()
+
+
+def test_compiled_duplicate_trash_write_on_spyre():
+    """Same probe as above, compiled, which is how the table write runs on the card."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    from spyre_inference.custom_ops.utils import convert
+
+    table = convert(torch.zeros(4, 64), device="spyre")
+    index = convert(torch.tensor([3, 3], dtype=torch.int32), device="spyre")
+    rows = convert(torch.tensor([[1.0] * 64, [2.0] * 64]).half(), device="spyre")
+    compiled = torch.compile(_copy_encoder_rows, backend="inductor", fullgraph=True, dynamic=False)
+    compiled(table, index, rows)
+    got = convert(table, device="cpu")
+    torch.testing.assert_close(got[3], torch.full((64,), 2.0).half())
+    assert got[:3].eq(0).all()
+
+
+def test_manager_caches_row_handles_and_capture_frees_its_warmup_rows():
+    """Capture compiles a write per budget and releases those rows; execute returns handles."""
+    model = _FakeVisionModel(max_tokens=16)
+    model.output_table = _table(cache_size=64, rows=80)
+    manager = _manager(model, budgets=[16])
+    manager.capture(graph_pool=None)
+    assert len(model.output_table._free) == 64
+
+    outputs = manager.execute({"tokens": [4]})
+    assert len(outputs) == 1 and outputs[0].shape == (4, 1)
+    gathered = model.output_table.table.index_select(0, outputs[0].view(-1))
+    torch.testing.assert_close(gathered, torch.full_like(gathered, 1.0))

@@ -100,7 +100,12 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         ).values
         t0 = time.time()
         with torch.inference_mode():
-            self.model.encoder_cudagraph_forward(self._upload(values), path=path)
+            output = self.model.encoder_cudagraph_forward(self._upload(values), path=path)
+        table = getattr(self.model, "output_table", None)
+        if table is not None:
+            # One compiled table write per budget, beside the encoder graphs. The rows are
+            # dummy, so they go straight back to the free list.
+            table.warmup_write(output)
         logger.info("Vision encoder budget %d compiled in %.1fs.", token_budget, time.time() - t0)
         self._staging.setdefault(path, {})[token_budget] = values
 
