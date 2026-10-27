@@ -137,7 +137,12 @@ def _index_dtype(device: torch.device) -> torch.dtype:
 def _copy_encoder_rows(
     table: torch.Tensor, index: torch.Tensor, rows: torch.Tensor
 ) -> torch.Tensor:
-    """Overwrite ``table`` rows. Duplicate indices keep the last row (not an accumulating put)."""
+    """Overwrite ``table`` rows.
+
+    On CPU a repeated index keeps the last row. The compiled Spyre kernel cannot repeat one:
+    dbo-opt rejects it ("external allocations with repeated dimensions"), so every compiled
+    write uses unique indices.
+    """
     table.index_copy_(0, index, rows)
     return table
 
@@ -228,15 +233,23 @@ class EncoderOutputTable:
         """Compile the write for this row count.
 
         A token budget can be larger than the cache: the scheduler never stores that many
-        real tokens, the extra rows are padding. That kernel is compiled with every index
-        on the trash row. A budget that fits is written into real rows and freed, which is
-        the same write a full pack uses.
+        real tokens, the extra rows are padding. That kernel is compiled with unique indices
+        below the trash row. A repeated index does not compile. A budget that fits is written
+        into real rows and freed, which is the same write a full pack uses.
         """
         n = rows.shape[0]
         if n <= len(self._free):
             self.release(self.store(rows))
             return
-        index = torch.full((n,), self.trash, dtype=_index_dtype(rows.device), device=rows.device)
+        if n > self.trash:
+            raise RuntimeError(
+                f"Encoder budget has {n} rows but the table only has {self.trash} slots below "
+                "the trash row. A compiled index_copy_ cannot repeat an index; raise "
+                "--encoder-cache-size or the token buckets the table is sized from."
+            )
+        index = torch.arange(n, dtype=_index_dtype(rows.device))
+        if rows.device.type != "cpu":
+            index = convert(index, device=rows.device)
         self._write(rows, index)
 
     def _write(self, rows: torch.Tensor, index: torch.Tensor) -> None:

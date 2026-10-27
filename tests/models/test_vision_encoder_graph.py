@@ -676,10 +676,10 @@ def test_output_table_refuses_more_rows_than_the_cache():
 
 
 def test_duplicate_index_copy_keeps_the_last_row():
-    """The table write overwrites. Duplicate indices keep the last row, including the trash row.
+    """On CPU a repeated index keeps the last row. The compiled card write never repeats one:
 
-    Eager int32 ``index_copy_`` on Spyre falls back to the CPU, so the serving write is the
-    compiled ``_copy_encoder_rows``. This is that function.
+    dbo-opt rejects it ("external allocations with repeated dimensions"), so warmup and serving
+    use unique indices only.
     """
     table = torch.zeros(4, 2)
     index = torch.tensor([3, 3])
@@ -689,20 +689,18 @@ def test_duplicate_index_copy_keeps_the_last_row():
     assert table[:3].eq(0).all()
 
 
-def test_compiled_duplicate_trash_write_on_spyre():
-    """Same probe as above, compiled, which is how the table write runs on the card."""
+def test_compiled_unique_index_copy_on_spyre():
+    """The write serving compiles: unique rows, in the table's gathered layout."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops.utils import convert
 
-    table = convert(torch.zeros(4, 64), device="spyre")
-    index = convert(torch.tensor([3, 3], dtype=torch.int32), device="spyre")
-    rows = convert(torch.tensor([[1.0] * 64, [2.0] * 64]).half(), device="spyre")
-    compiled = torch.compile(_copy_encoder_rows, backend="inductor", fullgraph=True, dynamic=False)
-    compiled(table, index, rows)
-    got = convert(table, device="cpu")
-    torch.testing.assert_close(got[3], torch.full((64,), 2.0).half())
-    assert got[:3].eq(0).all()
+    table = EncoderOutputTable(4, 64, torch.float16, torch.device("spyre"), rows=5)
+    rows = torch.tensor([[1.0] * 64, [2.0] * 64], dtype=torch.float16)
+    handles = table.store(rows)
+    got = convert(table.table, device="cpu")
+    for handle, row in zip(handles.view(-1).tolist(), rows, strict=True):
+        torch.testing.assert_close(got[handle], row)
 
 
 def test_manager_caches_row_handles_and_capture_frees_its_warmup_rows():
