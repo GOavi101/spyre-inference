@@ -229,8 +229,7 @@ class EncoderOutputTable:
         target = total if exact else self._write_count(keep, total)
         if target > len(self._free):
             raise RuntimeError(
-                f"Encoder output table has {len(self._free)} free rows, this write needs "
-                f"{target}."
+                f"Encoder output table has {len(self._free)} free rows, this write needs {target}."
             )
         body = self._rows_for_write(rows, target)
         # A host projection (Gemma 4's tail) arrives on the CPU. The write runs where the table is.
