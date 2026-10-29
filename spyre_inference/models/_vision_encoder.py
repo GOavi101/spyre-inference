@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.v1.worker.encoder_cudagraph_defs import (
@@ -54,6 +55,8 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
 from spyre_inference.custom_ops.utils import convert, place_row_gathered
 from spyre_inference.multimodal.utils import STICK, align_up
 from spyre_inference.v1.worker import compile_guard
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -163,8 +166,9 @@ class EncoderOutputTable:
 
     ``C`` is upstream's encoder cache bound, in image tokens. The trash row is last, so a
     gather of a prompt is a strict subset of the table (torch-spyre#4033). Rows between
-    ``C`` and the trash row exist only so a token bucket can never be as long as the table.
-    The host cache stores ``[n, 1]`` row handles, not the embeddings.
+    ``C`` and the trash row are not cache slots: a short write pads onto them so a partly
+    full cache reuses a warmed ``index_copy_`` instead of compiling a new one. The host
+    cache stores ``[n, 1]`` row handles, not the embeddings.
     """
 
     def __init__(
@@ -205,11 +209,10 @@ class EncoderOutputTable:
 
         ``keep`` defaults to every row. The copy is a length warmup already compiled:
         the budget tensor itself when that length was warmed, otherwise the next warmed
-        length that fits. The tail slots are freed, so the real token count does not
-        compile a graph. A short tensor is padded with a copied last row. Pointing the
-        tail at the trash row does not compile: dbo-opt rejects an index that repeats.
-        ``exact`` is warmup, which has to record its own length even when a larger write
-        is already compiled.
+        length. Padding past the free list uses the spare rows, which are not cache slots,
+        so a partly full cache does not compile a new graph. A short tensor is padded with
+        a copied last row. Pointing the tail at one repeated index, including the trash
+        row, does not compile. ``exact`` is warmup, which records its own length.
         """
         if rows.ndim != 2 or rows.shape[1] != self.hidden:
             raise RuntimeError(
@@ -227,35 +230,52 @@ class EncoderOutputTable:
                 f"The table holds {self.cache_size} image tokens (the scheduler's encoder cache)."
             )
         target = total if exact else self._write_count(keep, total)
-        if target > len(self._free):
+        spare = self.trash - self.cache_size
+        use_spare = not exact and target > len(self._free)
+        if (exact and target > len(self._free)) or (use_spare and target - keep > spare):
             raise RuntimeError(
-                f"Encoder output table has {len(self._free)} free rows, this write needs {target}."
+                f"Encoder output table has {len(self._free)} free rows and {spare} spare "
+                f"rows, this write needs {target}."
             )
         body = self._rows_for_write(rows, target)
         # A host projection (Gemma 4's tail) arrives on the CPU. The write runs where the table is.
         if body.device != self.table.device:
             body = convert(body, device=self.table.device, dtype=self.table.dtype)
-        chosen = [self._free.pop() for _ in range(target)]
+        n_cache = keep if use_spare else target
+        chosen = [self._free.pop() for _ in range(n_cache)]
         self._in_use.update(chosen)
+        if use_spare:
+            # Distinct rows, so the index does not repeat. They are not cache slots.
+            chosen.extend(range(self.cache_size, self.cache_size + (target - keep)))
         index = torch.tensor(chosen, dtype=_index_dtype(body.device), device=body.device)
         self._write(body, index)
         handles = torch.tensor(chosen, dtype=torch.int64).view(-1, 1)
-        if keep < target:
+        if not use_spare and keep < target:
             self.release(handles[keep:])
-            handles = handles[:keep]
-        return handles
+        return handles[:keep]
 
     def _write_count(self, keep: int, total: int) -> int:
-        """Rows this write copies: at least ``keep``, and no more than the free list.
+        """Rows this write copies: at least ``keep``.
 
         A length warmup compiled is written whole. Anything else grows to the smallest
-        already-compiled write that can hold ``keep`` and still fits, so a new image
-        size does not compile. A count that fits in none of those compiles once.
+        already-compiled write that can hold ``keep``. The extra rows come from the free
+        list when it has room, and otherwise from the spare rows, so the real token
+        count does not compile a graph of its own.
         """
         free = len(self._free)
-        if total <= free and (not self._writes or total in self._writes):
+        spare = self.trash - self.cache_size
+
+        def fits(n: int) -> bool:
+            if n < keep:
+                return False
+            extra = n - keep
+            return n <= free or extra <= spare
+
+        if not self._writes:
+            return total if total <= free else keep
+        if total in self._writes and fits(total):
             return total
-        warmed = [n for n in self._writes if keep <= n <= free]
+        warmed = [n for n in self._writes if fits(n)]
         if warmed:
             return min(warmed)
         return keep
@@ -278,6 +298,9 @@ class EncoderOutputTable:
         for row in handles.detach().cpu().view(-1).tolist():
             row = int(row)
             if row not in self._in_use:
+                logger.debug(
+                    "Encoder output table skipped releasing row %s; it is not in use.", row
+                )
                 continue
             self._in_use.remove(row)
             self._free.append(row)
@@ -288,7 +311,8 @@ class EncoderOutputTable:
         The encoder's padded budget can be thousands of rows while the cache holds fewer.
         The scheduler never stores more real tokens than the cache, and a compiled
         ``index_copy_`` cannot repeat an index, so this writes one unique row per free
-        slot. A budget that fits is written in full, which is the shape serving reuses.
+        slot. Every budget that fits is its own shape. Every budget past the cache shares
+        that one cache-sized write, so those do not add another graph.
         """
         n = min(rows.shape[0], len(self._free))
         if n == 0:
@@ -301,15 +325,15 @@ class EncoderOutputTable:
 
     def _write(self, rows: torch.Tensor, index: torch.Tensor) -> None:
         # Eager int32 index_copy_ falls back to the CPU, so the card always runs the compiled
-        # function, including under enforce_eager. One function per row count. The count is a
-        # budget warmup compiled, not the real token total: store() pads a short pack up to
-        # one of those. A count that fits in none of them compiles once and is not on the
-        # compile guard. The guard would treat it as a missed warmup, and it only happens
-        # when the free list cannot reach a warmed length.
+        # function, including under enforce_eager. One function per warmed row count.
+        # store() pads onto a warmed count, using spare rows when the free list is short,
+        # so serving does not compile a new length. The size is recorded on every device
+        # so a later call can see that this length was already written.
+        n = rows.shape[0]
         if rows.device.type != "spyre":
             _copy_encoder_rows(self.table, index, rows)
+            self._writes.setdefault(n, None)
             return
-        n = rows.shape[0]
         fn = self._writes.get(n)
         if fn is None:
             fn = torch.compile(
@@ -555,7 +579,8 @@ class SpyreVisionEncoderMixin:
         self._spyre_vision_project = torch.compile(self.vision_project, **compile_kwargs)
         self._spyre_vision_merge = torch.compile(self.vision_merge, **compile_kwargs)
         self.compile_output_merge()
-        for name in ("vision_embed", "vision_project", "vision_merge", "vision_gather_merge"):
+        # vision_gather_merge is watched inside compile_output_merge.
+        for name in ("vision_embed", "vision_project", "vision_merge"):
             compiled = getattr(self, f"_spyre_{name}", None)
             if compiled is not None:
                 compile_guard.watch(compiled, f"{type(self).__name__}.{name}")
@@ -809,11 +834,13 @@ class SpyreVisionEncoderMixin:
         src_idx = torch.full((text.shape[0],), table.trash, dtype=_index_dtype(text.device))
         src_idx[mask] = handles.to(dtype=src_idx.dtype)
         merge = getattr(self, "_spyre_vision_gather_merge", None)
-        # Installed with the table on Spyre. A CPU test gathers with the plain function.
-        if merge is None and text.device.type == "spyre":
-            self.compile_output_merge(watch=False)
-            merge = getattr(self, "_spyre_vision_gather_merge", None)
-        if merge is None:
+        if text.device.type == "spyre":
+            # Installed with the table. Compiling here would be an unwatched graph on
+            # the serving path.
+            assert merge is not None, (
+                "encoder output table gather was not compiled when the table was installed"
+            )
+        else:
             merge = _gather_cached_rows
         return merge(
             table.table,

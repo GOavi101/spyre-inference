@@ -774,6 +774,44 @@ def test_output_table_refuses_more_rows_than_the_cache():
         table.store(torch.zeros(3, 8, dtype=torch.float16))
 
 
+def test_partly_full_cache_reuses_the_capped_budget_write():
+    """A budget above the cache warms one write of ``cache_size``.
+
+    With some of those rows still held, the next image pads onto the spare rows.
+    ``_writes`` gains no new length.
+    """
+    table = _table(cache_size=4, rows=8)
+    budget = torch.arange(1120 * 8, dtype=torch.float16).view(1120, 8)
+    table.warmup_write(budget)
+    assert set(table._writes) == {4}
+    assert len(table._free) == 4
+
+    held = table.store(torch.ones(2, 8, dtype=torch.float16))
+    assert held.shape == (2, 1)
+    assert set(table._writes) == {4}
+    assert len(table._free) == 2
+
+    rows = torch.full((2, 8), 2, dtype=torch.float16)
+    handles = table.store(rows)
+    assert handles.shape == (2, 1)
+    assert set(table._writes) == {4}
+    assert len(table._free) == 0
+    assert len(table._in_use) == 4
+    gathered = table.table.index_select(0, handles.view(-1))
+    torch.testing.assert_close(gathered, rows)
+
+
+def test_release_skips_a_stale_handle():
+    """Releasing a row twice does not put it on the free list twice."""
+    table = _table()
+    handles = table.store(torch.zeros(1, 8, dtype=torch.float16))
+    table.release(handles)
+    assert len(table._free) == 8
+    table.release(handles)
+    assert len(table._free) == 8
+    assert len(table._in_use) == 0
+
+
 def test_warmup_write_caps_a_budget_at_the_cache():
     """A padded encoder budget can be far larger than the cache. Warmup compiles a write of
     the free rows only; serving never stores more than that, and a repeated index does not

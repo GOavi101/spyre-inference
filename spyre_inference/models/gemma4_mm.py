@@ -182,6 +182,11 @@ class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForCond
 
         ``vision_project`` only pools, so its rows are the vision width. The table and the
         prompt merge are the text width; this is the projection that gets them there.
+
+        Known gap for the on-card encoder table: the whole encoder output is downloaded,
+        the tail runs here, and ``store`` uploads the projected rows. A budget of 1120
+        tokens moves about four times the rows of a 280-token image, both ways. The tail
+        stays on the host until it can run on the card without that fp16 overflow.
         """
         tail = self._spyre_vision_tail
         x = convert(output, device="cpu").float() * tail.scale

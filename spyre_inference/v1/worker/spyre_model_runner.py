@@ -1143,22 +1143,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         bucketer = getattr(self, "spyre_shape_bucketer", None)
         if bucketer is not None:
             buckets = tuple(bucketer.bucket_sizes)
-        # One past the longer of the cache and any token bucket, so a gather of a step is
-        # never the whole table (torch-spyre#4033). Only ``cache_size`` rows are allocatable.
-        rows = max(cache_size, max(buckets, default=0)) + 1
+        # Spare rows between the cache and the trash row pad a short write up to a warmed
+        # length without taking cache slots. ``cache_size - 1`` of them cover a warmed
+        # write of ``cache_size`` from a single real token. One past that, or past any
+        # token bucket, so a gather is never the whole table (torch-spyre#4033).
+        spare = max(cache_size - 1, 0)
+        rows = max(cache_size + spare, max(buckets, default=0)) + 1
         dtype = self._model_dtype()
-        try:
-            table = EncoderOutputTable(
-                cache_size, model.out_hidden_size, dtype, self._spyre_device, rows=rows
-            )
-        except RuntimeError:
-            logger.error(
-                "Failed to allocate the encoder output table (%d x %d %s).",
-                rows,
-                model.out_hidden_size,
-                dtype,
-            )
-            raise
+        table = EncoderOutputTable(
+            cache_size, model.out_hidden_size, dtype, self._spyre_device, rows=rows
+        )
         model.output_table = table
         self.encoder_cache = EncoderOutputCache(table)
         # enforce_eager never reaches _record_vision_graphs (no shape bucketer, so warmup
@@ -1172,9 +1166,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             model.compile_output_merge(watch=not eager)
         nbytes = table.table.numel() * table.table.element_size()
         logger.info(
-            "Encoder output table: %d image tokens, %d rows x %d (%s), %.1f MiB. "
-            "The KV cache is unchanged.",
+            "Encoder output table: %d image tokens, %d spare rows, %d rows x %d (%s), "
+            "%.1f MiB. The KV cache is unchanged.",
             cache_size,
+            spare,
             rows,
             model.out_hidden_size,
             dtype,
