@@ -405,6 +405,32 @@ def _use_packed_prefill(tokens: int) -> bool:
     return bool(envs.SPYRE_MOE_PACKED_PREFILL) and tokens > envs.SPYRE_MOE_GATHERED_MAX_TOKENS
 
 
+# 512 x 8 x 2816 fp16 spanned 352MB, over the 256MB per-core limit. An eighth of
+# that element count is a 64-token chunk at Gemma width, about 44MB on the same layout.
+_PACKED_REDUCE_ELEMENTS = (512 * 8 * 2816) // 8
+
+
+def _packed_reduce_chunk(top_k: int, hidden: int) -> int:
+    """How many tokens to reduce at once so the routed sum stays under the span limit."""
+    per_token = max(top_k, 1) * max(hidden, 1)
+    return max(1, _PACKED_REDUCE_ELEMENTS // per_token)
+
+
+def _sum_packed_slots(weighted: torch.Tensor, tokens: int, top_k: int, hidden: int) -> torch.Tensor:
+    """Sum each token's contiguous top-k rows.
+
+    One pointwise over the whole ``[tokens, top_k, hidden]`` tensor is what spanned
+    352MB. The rows for one token sit together, so a chunk is a contiguous slice.
+    """
+    chunk = _packed_reduce_chunk(top_k, hidden)
+    parts = []
+    for start in range(0, tokens, chunk):
+        end = min(start + chunk, tokens)
+        block = weighted[start * top_k : end * top_k]
+        parts.append(block.reshape(end - start, top_k, hidden).sum(1))
+    return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
+
+
 def _packed_capacity(assignments: int, experts: int) -> int:
     """Per-expert slot count, the same rule as ``torch_spyre`` ``_grouped_mm_capacity``.
 
@@ -486,17 +512,11 @@ def _moe_packed_body(
     up_out = up_out + up_bias
     activated = _activation(gate_out, up_out, activation)
     expert_out = torch.bmm(activated, down) + down_bias
-    # One slot at a time. Folding every slot into a [tokens, top_k, hidden] pointwise
-    # puts top_k outermost (device [8, 2816, 1, 512, 64] at Gemma width) and the
-    # per-core span stays 352MB, past the 256MB limit. [tokens, hidden] is the
-    # product the all-expert loop already compiles.
+    # One contiguous gather. A per-slot column of dst is stride top_k, and Spyre
+    # rejects that stick coordinate (4*(Mod(d0, 8)) for the card's int32 index).
     flat = expert_out.reshape(experts * capacity, hidden)
-    slots = dst.reshape(tokens, top_k)
-    acc = torch.index_select(flat, 0, slots[:, 0].contiguous()) * weights[:, :1]
-    for slot in range(1, top_k):
-        selected = torch.index_select(flat, 0, slots[:, slot].contiguous())
-        acc = acc + selected * weights[:, slot : slot + 1]
-    return acc
+    gathered = torch.index_select(flat, 0, dst)
+    return _sum_packed_slots(gathered * weights.reshape(rows, 1), tokens, top_k, hidden)
 
 
 def _packed_fallback(

@@ -148,6 +148,26 @@ def test_packed_prefill_matches_the_dense_reference(monkeypatch, activation, rou
     assert layer.spyre_moe_packed_overflows == 0
 
 
+def test_packed_slot_sum_matches_across_chunk_boundaries(monkeypatch):
+    """A short last chunk has to land on the same rows as one sum over the whole prefill."""
+    from spyre_inference import moe as moe_module
+
+    _install_eager_regions(monkeypatch)
+    # top_k * hidden = 16, so the budget of 32 reduces two tokens, then two, then one.
+    monkeypatch.setattr(moe_module, "_PACKED_REDUCE_ELEMENTS", 32)
+    experts, hidden, inter, top_k, tokens = 4, 8, 6, 2, 5
+    gate, up, down, biases = _weights(experts, hidden, inter, torch.float32, seed=3, bias=False)
+    generator = torch.Generator().manual_seed(11)
+    x = torch.randn(tokens, hidden, generator=generator)
+    logits = torch.randn(tokens, experts, generator=generator)
+    layer = _layer("gelu_tanh", "full_softmax", gate, up, down, biases, top_k)
+
+    actual = _moe_packed_prefill(layer, x, logits)
+
+    expected = _reference(x, logits, gate, up, down, top_k, "full_softmax", "gelu_tanh", None)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_apply_uses_packed_prefill_when_the_flag_is_on(monkeypatch):
     monkeypatch.setenv("SPYRE_MOE_PACKED_PREFILL", "1")
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "1")
