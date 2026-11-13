@@ -699,7 +699,10 @@ def test_packed_prefill_flag_dispatches_to_the_packed_region(monkeypatch):
     monkeypatch.setenv("SPYRE_MOE_PACKED_PREFILL", "1")
     calls, resets = _dispatch_recorder(monkeypatch)
     layer = _dispatch_layer("full_softmax")
+    # A layer with no stored bias still builds a zero bias from each pool.
     layer.spyre_moe_gate = torch.zeros(EXPERTS, 1, 1)
+    layer.spyre_moe_up = torch.zeros(EXPERTS, 1, 1)
+    layer.spyre_moe_down = torch.zeros(EXPERTS, 1, 1)
     _apply(layer, tokens=16)
     assert calls == [("packed", "_moe_packed_body")]
     assert resets == []
