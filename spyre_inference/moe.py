@@ -435,11 +435,11 @@ def _sum_packed_slots(
     top_k: int,
     hidden: int,
 ) -> torch.Tensor:
-    """Weight each slot and sum it, with the stick on hidden.
+    """Weight each slot and sum it.
 
     A flat ``[tokens * top_k, 1]`` weight is read as ``floor(d0/top_k)``, which Spyre
-    rejects. The product stays ``[chunk, top_k, hidden]``. One chunk over a Gemma-width
-    prefill spanned 352MB, so a long prefill is split into pieces of that budget.
+    rejects, so the weight stays ``[tokens, top_k, 1]``. One ``[tokens, top_k, hidden]``
+    product at Gemma width spanned 352MB, so a long prefill is split into pieces.
     """
     chunk = _packed_reduce_chunk(top_k, hidden)
     if chunk >= tokens:
@@ -449,6 +449,39 @@ def _sum_packed_slots(
         end = min(start + chunk, tokens)
         block = gathered[start * top_k : end * top_k].reshape(end - start, top_k, hidden)
         parts.append((block * weights[start:end].unsqueeze(-1)).sum(1))
+    return torch.cat(parts, 0)
+
+
+def _sum_packed_sticks(
+    gathered: torch.Tensor,
+    weights: torch.Tensor,
+    tokens: int,
+    top_k: int,
+    nstick: int,
+    stick: int,
+) -> torch.Tensor:
+    """Same routed sum, with the fp16 stick left as its own axis.
+
+    ``gathered`` is ``[tokens * top_k, nstick, stick]``. Fusing the last two axes
+    before the gather makes Spyre pad a fake stick and then reject the index select
+    as a restickify.
+    """
+    hidden = nstick * stick
+    chunk = _packed_reduce_chunk(top_k, hidden)
+
+    def reduce(block: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        weighted = block * scale.unsqueeze(-1).unsqueeze(-1)
+        return weighted.sum(1).reshape(block.shape[0], hidden)
+
+    if chunk >= tokens:
+        block = gathered.reshape(tokens, top_k, nstick, stick)
+        return reduce(block, weights)
+    parts = []
+    for start in range(0, tokens, chunk):
+        end = min(start + chunk, tokens)
+        rows = gathered[start * top_k : end * top_k]
+        block = rows.reshape(end - start, top_k, nstick, stick)
+        parts.append(reduce(block, weights[start:end]))
     return torch.cat(parts, 0)
 
 
@@ -536,6 +569,14 @@ def _moe_packed_body(
     # One contiguous gather. A per-slot column of dst is stride top_k, and Spyre
     # rejects that stick coordinate (4*(Mod(d0, 8)) for the card's int32 index).
     flat = expert_out.reshape(experts * capacity, hidden)
+    # 128 bytes. A last dim wider than one stick (Gemma hidden 2816) is gathered as
+    # [rows, nstick, stick]; a fused [rows, hidden] index_select is lowered as a
+    # restickify, which has no index argument.
+    stick = 128 // flat.dtype.itemsize
+    if stick > 1 and hidden % stick == 0 and hidden // stick > 1:
+        nstick = hidden // stick
+        gathered = torch.index_select(flat.reshape(flat.shape[0], nstick, stick), 0, dst)
+        return _sum_packed_sticks(gathered, weights, tokens, top_k, nstick, stick)
     gathered = torch.index_select(flat, 0, dst)
     return _sum_packed_slots(gathered, weights, tokens, top_k, hidden)
 

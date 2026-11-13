@@ -168,6 +168,42 @@ def test_packed_slot_sum_matches_across_chunk_boundaries(monkeypatch):
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_packed_prefill_gathers_hidden_as_separate_sticks(monkeypatch):
+    """Hidden wider than one stick is gathered as [rows, nstick, stick], same values."""
+    _install_eager_regions(monkeypatch)
+    experts, hidden, inter, top_k, tokens = 4, 128, 32, 2, 5
+    gate, up, down, biases = _weights(experts, hidden, inter, torch.float16, seed=3, bias=False)
+    generator = torch.Generator().manual_seed(11)
+    x = torch.randn(tokens, hidden, dtype=torch.float16, generator=generator)
+    logits = torch.randn(tokens, experts, dtype=torch.float16, generator=generator)
+    layer = _layer("gelu_tanh", "full_softmax", gate, up, down, biases, top_k)
+
+    actual = _moe_packed_prefill(layer, x, logits)
+
+    expected = _reference(x, logits, gate, up, down, top_k, "full_softmax", "gelu_tanh", None)
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_packed_stick_sum_matches_across_chunk_boundaries(monkeypatch):
+    """A stick-split gather still sums a short last token chunk onto the right rows."""
+    from spyre_inference import moe as moe_module
+
+    _install_eager_regions(monkeypatch)
+    # top_k * hidden = 256, so a budget of 512 reduces two tokens and leaves a tail of one.
+    monkeypatch.setattr(moe_module, "_PACKED_REDUCE_ELEMENTS", 512)
+    experts, hidden, inter, top_k, tokens = 4, 128, 32, 2, 5
+    gate, up, down, biases = _weights(experts, hidden, inter, torch.float16, seed=3, bias=False)
+    generator = torch.Generator().manual_seed(11)
+    x = torch.randn(tokens, hidden, dtype=torch.float16, generator=generator)
+    logits = torch.randn(tokens, experts, dtype=torch.float16, generator=generator)
+    layer = _layer("gelu_tanh", "full_softmax", gate, up, down, biases, top_k)
+
+    actual = _moe_packed_prefill(layer, x, logits)
+
+    expected = _reference(x, logits, gate, up, down, top_k, "full_softmax", "gelu_tanh", None)
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+
 def test_apply_uses_packed_prefill_when_the_flag_is_on(monkeypatch):
     monkeypatch.setenv("SPYRE_MOE_PACKED_PREFILL", "1")
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "1")
