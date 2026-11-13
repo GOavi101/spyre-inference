@@ -34,7 +34,7 @@ from spyre_inference.moe import (
     _moe_packed_prefill,
     _pack_assignment_tables,
     _packed_capacity,
-    _packed_stick_token_chunk,
+    _routing_scale_sticks,
     _routing_weights,
 )
 
@@ -45,14 +45,22 @@ _RECIPES = [
 ]
 
 
-def test_stick_token_chunk_stays_under_one_stick(monkeypatch):
-    """64 tokens would be one fp16 stick of weights, which cannot fan out over hidden."""
-    assert _packed_stick_token_chunk(8, 2816, 64) == 32
-    from spyre_inference import moe as moe_module
-
-    monkeypatch.setattr(moe_module, "_PACKED_REDUCE_ELEMENTS", 512)
-    # Already under a stick: top_k * hidden = 256 and the budget reduces two tokens.
-    assert _packed_stick_token_chunk(2, 128, 64) == 2
+def test_routing_scale_repeats_each_weight_across_one_stick():
+    """The compiled multiply reads this tensor, not a slice of the ``[tokens, top_k]`` weights."""
+    weights = torch.tensor([[0.5, 1.0], [0.25, 0.75]])
+    scale = _routing_scale_sticks(weights, 4, dtype=weights.dtype, device=weights.device)
+    assert scale.shape == (4, 1, 4)
+    assert torch.equal(
+        scale[:, 0, :],
+        torch.tensor(
+            [
+                [0.5, 0.5, 0.5, 0.5],
+                [1.0, 1.0, 1.0, 1.0],
+                [0.25, 0.25, 0.25, 0.25],
+                [0.75, 0.75, 0.75, 0.75],
+            ]
+        ),
+    )
 
 
 def test_packed_capacity_follows_the_grouped_mm_rule():
@@ -180,7 +188,7 @@ def test_packed_slot_sum_matches_across_chunk_boundaries(monkeypatch):
 
 
 def test_packed_prefill_gathers_hidden_as_separate_sticks(monkeypatch):
-    """Hidden wider than one stick is gathered as [rows, nstick, stick], same values."""
+    """Hidden wider than one stick is gathered per stick and scaled by a repeated weight."""
     _install_eager_regions(monkeypatch)
     experts, hidden, inter, top_k, tokens = 4, 128, 32, 2, 5
     gate, up, down, biases = _weights(experts, hidden, inter, torch.float16, seed=3, bias=False)

@@ -704,7 +704,8 @@ def test_packed_prefill_flag_dispatches_to_the_packed_region(monkeypatch):
     layer.spyre_moe_up = torch.zeros(EXPERTS, 1, 1)
     layer.spyre_moe_down = torch.zeros(EXPERTS, 1, 1)
     _apply(layer, tokens=16)
-    assert calls == [("packed", "_moe_packed_body")]
+    # Hidden 256 is several fp32 sticks, so the scale is a repeated stick, not the weight view.
+    assert calls == [("packed_sticks", "_moe_packed_body_sticks")]
     assert resets == []
     assert layer.spyre_moe_packed_overflows == 0
 

@@ -452,53 +452,65 @@ def _sum_packed_slots(
     return torch.cat(parts, 0)
 
 
-def _packed_stick_token_chunk(top_k: int, hidden: int, stick: int) -> int:
-    """Token group for a stick-split sum.
+def _routing_scale_sticks(
+    weights: torch.Tensor, stick: int, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Copy each routing weight across one stick: ``[tokens * top_k, 1, stick]``.
 
-    A group of ``stick`` tokens is one stick of routing weights. Spyre cannot
-    scatter that stick onto the hidden sticks, so a full stick is halved. A
-    smaller group from the element budget is left alone.
+    ``weights`` is ``[tokens, top_k]``. On Spyre that stick is the token axis, and a
+    slice keeps the parent layout, so those lanes cannot fan out over the hidden
+    sticks. Repeating the scalar on the host, in the activation dtype, makes the last
+    dim the stick the gather already uses. The size-1 dim broadcasts across hidden
+    sticks, the same way an expert bias does.
     """
-    chunk = _packed_reduce_chunk(top_k, hidden)
-    if chunk < stick:
-        return chunk
-    half = stick // 2
-    period = 64 // math.gcd(max(top_k, 1), 64)
-    if period <= half:
-        return max(period, half - (half % period))
-    return max(half, 1)
+    flat = weights.detach().to(device="cpu", dtype=dtype).reshape(-1, 1, 1)
+    repeated = flat.expand(-1, 1, stick).contiguous()
+    if device.type != "spyre":
+        return repeated.to(device=device)
+    return _to_stick_scale(repeated)
 
 
-def _sum_packed_sticks(
+def _to_stick_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Place ``[rows, 1, stick]`` so the stick is the last dimension."""
+    from torch_spyre._C import SpyreTensorLayout
+
+    scale = scale.contiguous()
+    layout = SpyreTensorLayout(list(scale.shape), list(scale.stride()), scale.dtype, [0, 1, 2])
+    assert scale.shape[-1] == layout.elems_per_stick(), "the scale must fill one stick"
+    if not torch.spyre.is_initialized():
+        torch.empty(0, dtype=scale.dtype, device="spyre")
+    return scale.to(device_layout=layout)  # ty: ignore[no-matching-overload]
+
+
+def _sum_scaled_sticks(
     gathered: torch.Tensor,
-    weights: torch.Tensor,
+    scale: torch.Tensor,
     tokens: int,
     top_k: int,
     nstick: int,
     stick: int,
 ) -> torch.Tensor:
-    """Same routed sum, with the fp16 stick left as its own axis.
+    """Weight each gathered stick by a scale that already lives on that stick.
 
-    ``gathered`` is ``[tokens * top_k, nstick, stick]``. Fusing the last two axes
-    before the gather makes Spyre pad a fake stick and then reject the index select
-    as a restickify.
+    ``gathered`` is ``[tokens * top_k, nstick, stick]`` and ``scale`` is
+    ``[tokens * top_k, 1, stick]``. The multiply reads this scale, not a slice of
+    the ``[tokens, top_k]`` weights, whose stick is the token axis.
     """
     hidden = nstick * stick
-    chunk = _packed_stick_token_chunk(top_k, hidden, stick)
+    chunk = _packed_reduce_chunk(top_k, hidden)
 
-    def reduce(block: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        weighted = block * scale.unsqueeze(-1).unsqueeze(-1)
-        return weighted.sum(1).reshape(block.shape[0], hidden)
+    def reduce(block: torch.Tensor, scale_block: torch.Tensor) -> torch.Tensor:
+        weighted = block * scale_block
+        group = weighted.shape[0] // top_k
+        return weighted.reshape(group, top_k, hidden).sum(1)
 
     if chunk >= tokens:
-        block = gathered.reshape(tokens, top_k, nstick, stick)
-        return reduce(block, weights)
+        return reduce(gathered, scale)
     parts = []
     for start in range(0, tokens, chunk):
         end = min(start + chunk, tokens)
-        rows = gathered[start * top_k : end * top_k]
-        block = rows.reshape(end - start, top_k, nstick, stick)
-        parts.append(reduce(block, weights[start:end]))
+        rows = slice(start * top_k, end * top_k)
+        parts.append(reduce(gathered[rows], scale[rows]))
     return torch.cat(parts, 0)
 
 
@@ -552,11 +564,10 @@ def _pack_assignment_tables(
     return src, dst
 
 
-def _moe_packed_body(
+def _packed_expert_out(
     x: torch.Tensor,
-    weights: torch.Tensor,
+    top_k: int,
     src: torch.Tensor,
-    dst: torch.Tensor,
     gate: torch.Tensor,
     up: torch.Tensor,
     down: torch.Tensor,
@@ -565,9 +576,8 @@ def _moe_packed_body(
     down_bias: torch.Tensor,
     activation: str,
 ) -> torch.Tensor:
-    """Batched expert matmuls for the packed slots, then the routed sum."""
+    """Batched gate/up/down for the packed slots. ``[experts, capacity, hidden]``."""
     tokens, hidden = x.shape
-    top_k = weights.shape[-1]
     experts = gate.shape[0]
     rows = tokens * top_k
     capacity = src.shape[0] // experts
@@ -582,20 +592,63 @@ def _moe_packed_body(
     gate_out = gate_out + gate_bias
     up_out = up_out + up_bias
     activated = _activation(gate_out, up_out, activation)
-    expert_out = torch.bmm(activated, down) + down_bias
+    return torch.bmm(activated, down) + down_bias
+
+
+def _moe_packed_body(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    gate_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_bias: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    """Packed expert matmuls, then the routed sum. Hidden is one stick wide."""
+    tokens, hidden = x.shape
+    top_k = weights.shape[-1]
+    expert_out = _packed_expert_out(
+        x, top_k, src, gate, up, down, gate_bias, up_bias, down_bias, activation
+    )
     # One contiguous gather. A per-slot column of dst is stride top_k, and Spyre
     # rejects that stick coordinate (4*(Mod(d0, 8)) for the card's int32 index).
-    flat = expert_out.reshape(experts * capacity, hidden)
-    # 128 bytes. A last dim wider than one stick (Gemma hidden 2816) is gathered as
-    # [rows, nstick, stick]; a fused [rows, hidden] index_select is lowered as a
-    # restickify, which has no index argument.
-    stick = 128 // flat.dtype.itemsize
-    if stick > 1 and hidden % stick == 0 and hidden // stick > 1:
-        nstick = hidden // stick
-        gathered = torch.index_select(flat.reshape(flat.shape[0], nstick, stick), 0, dst)
-        return _sum_packed_sticks(gathered, weights, tokens, top_k, nstick, stick)
-    gathered = torch.index_select(flat, 0, dst)
+    gathered = torch.index_select(expert_out.reshape(-1, hidden), 0, dst)
     return _sum_packed_slots(gathered, weights, tokens, top_k, hidden)
+
+
+def _moe_packed_body_sticks(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    gate_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_bias: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    """Packed expert matmuls when hidden is several sticks.
+
+    ``scale`` is the host-repeated ``[tokens * top_k, 1, stick]`` routing weight.
+    The gather keeps each stick as its own axis; a fused ``[rows, hidden]`` index
+    select is lowered as a restickify, which has no index argument.
+    """
+    tokens, hidden = x.shape
+    top_k = scale.shape[0] // tokens
+    stick = scale.shape[-1]
+    nstick = hidden // stick
+    expert_out = _packed_expert_out(
+        x, top_k, src, gate, up, down, gate_bias, up_bias, down_bias, activation
+    )
+    flat = expert_out.reshape(-1, nstick, stick)
+    gathered = torch.index_select(flat, 0, dst)
+    return _sum_scaled_sticks(gathered, scale, tokens, top_k, nstick, stick)
 
 
 def _packed_fallback(
@@ -655,19 +708,30 @@ def _moe_packed_prefill(
         down_bias = _zero_expert_bias(layer.spyre_moe_down)
     else:
         gate_bias, up_bias, down_bias = biases.gate, biases.up, biases.down
+    device_src = src.to(device=x.device)
+    device_dst = dst.to(device=x.device)
+    pools = (
+        layer.spyre_moe_gate,
+        layer.spyre_moe_up,
+        layer.spyre_moe_down,
+        gate_bias,
+        up_bias,
+        down_bias,
+        recipe.activation,
+    )
+    # 128 bytes. Gemma hidden 2816 is 44 fp16 sticks. One stick stays on the weight
+    # tensor; several sticks need a scale whose stick is the hidden lane.
+    stick = 128 // x.dtype.itemsize
+    hidden = x.shape[-1]
+    if stick > 1 and hidden % stick == 0 and hidden // stick > 1:
+        scale = _routing_scale_sticks(weights, stick, dtype=x.dtype, device=x.device)
+        with moe_scope:
+            return _region(layer, "packed_sticks", _moe_packed_body_sticks)(
+                x, scale, device_src, device_dst, *pools
+            )
     with moe_scope:
         return _region(layer, "packed", _moe_packed_body)(
-            x,
-            weights,
-            src.to(device=x.device),
-            dst.to(device=x.device),
-            layer.spyre_moe_gate,
-            layer.spyre_moe_up,
-            layer.spyre_moe_down,
-            gate_bias,
-            up_bias,
-            down_bias,
-            recipe.activation,
+            x, weights, device_src, device_dst, *pools
         )
 
 
