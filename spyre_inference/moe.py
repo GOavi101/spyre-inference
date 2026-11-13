@@ -21,6 +21,7 @@ adapters opt a layer in with a ``SpyreMoERecipe``.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
@@ -411,24 +412,44 @@ _PACKED_REDUCE_ELEMENTS = (512 * 8 * 2816) // 8
 
 
 def _packed_reduce_chunk(top_k: int, hidden: int) -> int:
-    """How many tokens to reduce at once so the routed sum stays under the span limit."""
+    """How many tokens to reduce at once so the routed sum stays under the span limit.
+
+    A later chunk starts at a whole fp16 stick in the ``[tokens, top_k]`` weights.
+    ``start * top_k`` has to be a multiple of 64, or that slice is read as ``floor(d0/top_k)``.
+    """
     per_token = max(top_k, 1) * max(hidden, 1)
-    return max(1, _PACKED_REDUCE_ELEMENTS // per_token)
+    chunk = max(1, _PACKED_REDUCE_ELEMENTS // per_token)
+    period = 64 // math.gcd(top_k, 64)
+    aligned = chunk - (chunk % period)
+    if aligned >= 1:
+        return aligned
+    if period * per_token <= _PACKED_REDUCE_ELEMENTS:
+        return period
+    return chunk
 
 
-def _sum_packed_slots(weighted: torch.Tensor, tokens: int, top_k: int, hidden: int) -> torch.Tensor:
-    """Sum each token's contiguous top-k rows.
+def _sum_packed_slots(
+    gathered: torch.Tensor,
+    weights: torch.Tensor,
+    tokens: int,
+    top_k: int,
+    hidden: int,
+) -> torch.Tensor:
+    """Weight each slot and sum it, with the stick on hidden.
 
-    One pointwise over the whole ``[tokens, top_k, hidden]`` tensor is what spanned
-    352MB. The rows for one token sit together, so a chunk is a contiguous slice.
+    A flat ``[tokens * top_k, 1]`` weight is read as ``floor(d0/top_k)``, which Spyre
+    rejects. The product stays ``[chunk, top_k, hidden]``. One chunk over a Gemma-width
+    prefill spanned 352MB, so a long prefill is split into pieces of that budget.
     """
     chunk = _packed_reduce_chunk(top_k, hidden)
+    if chunk >= tokens:
+        return (gathered.reshape(tokens, top_k, hidden) * weights.unsqueeze(-1)).sum(1)
     parts = []
     for start in range(0, tokens, chunk):
         end = min(start + chunk, tokens)
-        block = weighted[start * top_k : end * top_k]
-        parts.append(block.reshape(end - start, top_k, hidden).sum(1))
-    return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
+        block = gathered[start * top_k : end * top_k].reshape(end - start, top_k, hidden)
+        parts.append((block * weights[start:end].unsqueeze(-1)).sum(1))
+    return torch.cat(parts, 0)
 
 
 def _packed_capacity(assignments: int, experts: int) -> int:
@@ -516,7 +537,7 @@ def _moe_packed_body(
     # rejects that stick coordinate (4*(Mod(d0, 8)) for the card's int32 index).
     flat = expert_out.reshape(experts * capacity, hidden)
     gathered = torch.index_select(flat, 0, dst)
-    return _sum_packed_slots(gathered * weights.reshape(rows, 1), tokens, top_k, hidden)
+    return _sum_packed_slots(gathered, weights, tokens, top_k, hidden)
 
 
 def _packed_fallback(
