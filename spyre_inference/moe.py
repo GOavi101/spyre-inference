@@ -400,6 +400,166 @@ def _moe_persistent_selected_routing(
     return (packed @ route_identity)[..., :1]
 
 
+def _use_packed_prefill(tokens: int) -> bool:
+    """Prefill-sized batches opt into the packed expert path when the flag is on."""
+    return bool(envs.SPYRE_MOE_PACKED_PREFILL) and tokens > envs.SPYRE_MOE_GATHERED_MAX_TOKENS
+
+
+def _packed_capacity(assignments: int, experts: int) -> int:
+    """Per-expert slot count, the same rule as ``torch_spyre`` ``_grouped_mm_capacity``.
+
+    ``2 * ceil_to_64(assignments / experts)``, then ``max(64, min(assignments, that))``.
+    Fewer than 64 assignments still reserve 64 slots; the extras read a zero row.
+    """
+    per_expert = (assignments + experts - 1) // experts
+    return max(64, min(assignments, ((per_expert + 63) // 64) * 64 * 2))
+
+
+def _assignment_index(indices: torch.Tensor) -> torch.Tensor:
+    """Expert ids as an int64 CPU tensor. Spyre top-k can leave them in fp16."""
+    idx = indices.detach()
+    if idx.device.type != "cpu":
+        idx = idx.to("cpu")
+    if idx.dtype.is_floating_point:
+        idx = idx.round()
+    return idx.to(torch.int64)
+
+
+def _pack_assignment_tables(
+    indices: torch.Tensor, experts: int, capacity: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Map each top-k assignment into a fixed ``[experts, capacity]`` slot.
+
+    ``src`` indexes the flattened ``[tokens * top_k, hidden]`` rows, with ``tokens * top_k``
+    meaning the appended zero row. ``dst`` indexes the packed ``[experts * capacity, hidden]``
+    rows. Returns ``None`` when one expert is over capacity; the caller uses the all-expert loop.
+    """
+    flat = _assignment_index(indices).reshape(-1)
+    rows = flat.numel()
+    if experts < 1 or int(flat.min()) < 0 or int(flat.max()) >= experts:
+        raise ValueError(
+            f"expert ids must lie in [0, {experts}), got min={int(flat.min())} "
+            f"max={int(flat.max())}"
+        )
+    counts = torch.bincount(flat, minlength=experts)
+    if rows and int(counts.max()) > capacity:
+        return None
+    src = torch.full((experts * capacity,), rows, dtype=torch.int32)
+    dst = torch.empty(rows, dtype=torch.int32)
+    seen = torch.zeros(experts, dtype=torch.int64)
+    for row, expert in enumerate(flat.tolist()):
+        slot = int(seen[expert])
+        seen[expert] = slot + 1
+        src[expert * capacity + slot] = row
+        dst[row] = expert * capacity + slot
+    return src, dst
+
+
+def _moe_packed_body(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    gate_bias: torch.Tensor | None,
+    up_bias: torch.Tensor | None,
+    down_bias: torch.Tensor | None,
+    activation: str,
+) -> torch.Tensor:
+    """Batched expert matmuls for the packed slots, then the routed sum."""
+    tokens, hidden = x.shape
+    top_k = weights.shape[-1]
+    experts = gate.shape[0]
+    rows = tokens * top_k
+    capacity = src.shape[0] // experts
+    assignments = x[:, None, :].expand(tokens, top_k, hidden).reshape(rows, hidden)
+    zero = torch.zeros(1, hidden, dtype=x.dtype, device=x.device)
+    packed = torch.index_select(torch.cat([assignments, zero], 0), 0, src)
+    packed = packed.reshape(experts, capacity, hidden)
+    gate_out = torch.bmm(packed, gate)
+    up_out = torch.bmm(packed, up)
+    if gate_bias is not None:
+        gate_out = gate_out + gate_bias
+        up_out = up_out + up_bias
+    activated = _activation(gate_out, up_out, activation)
+    expert_out = torch.bmm(activated, down)
+    if down_bias is not None:
+        expert_out = expert_out + down_bias
+    gathered = torch.index_select(expert_out.reshape(experts * capacity, hidden), 0, dst)
+    return (gathered.reshape(tokens, top_k, hidden) * weights.unsqueeze(-1)).sum(1)
+
+
+def _packed_fallback(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    persistent_scope: Any,
+) -> torch.Tensor:
+    """All-expert loop, used when one expert is assigned more slots than capacity."""
+    experts = layer.spyre_moe_gate.shape[0]
+    tokens, top_k = indices.shape
+    dense = torch.zeros(tokens, experts, dtype=torch.float32)
+    dense.scatter_(
+        -1, _assignment_index(indices).view(tokens, top_k), weights.detach().cpu().float()
+    )
+    route = dense.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+    _name_persistent_dims(x, layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down)
+    try:
+        with persistent_scope:
+            return _region(layer, "experts", _experts)(layer, x, route)
+    finally:
+        _reset_named_dims()
+
+
+def _moe_packed_prefill(
+    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+) -> torch.Tensor:
+    """Prefill that multiplies only the selected token-expert pairs.
+
+    The slot tables are built on the host from the top-k ids, then the card packs those
+    rows, runs one batched gate/up/down, and unpacks. An expert past the static capacity
+    takes the all-expert loop instead, so a skewed prompt still returns a result.
+    """
+    recipe = layer.spyre_moe_recipe
+    weights, indices = _routing_weights(
+        router_logits, layer.top_k, recipe.routing, layer.spyre_moe_route_dtype
+    )
+    experts = layer.spyre_moe_gate.shape[0]
+    capacity = _packed_capacity(x.shape[0] * layer.top_k, experts)
+    tables = _pack_assignment_tables(indices, experts, capacity)
+    moe_scope, persistent_scope = _compiler_scopes()
+    if tables is None:
+        layer.spyre_moe_packed_overflows = getattr(layer, "spyre_moe_packed_overflows", 0) + 1
+        logger.info_once(
+            "Spyre MoE packed prefill exceeded per-expert capacity %d; "
+            "this shape uses the all-expert loop.",
+            capacity,
+        )
+        return _packed_fallback(layer, x, weights, indices, persistent_scope)
+    layer.spyre_moe_packed_overflows = getattr(layer, "spyre_moe_packed_overflows", 0)
+    src, dst = tables
+    biases = layer.spyre_moe_biases
+    # None-vs-tensor is a different graph, so the two bias forms keep their own compiled regions.
+    region = "packed" if biases is None else "packed_bias"
+    with moe_scope:
+        return _region(layer, region, _moe_packed_body)(
+            x,
+            weights,
+            src.to(device=x.device),
+            dst.to(device=x.device),
+            layer.spyre_moe_gate,
+            layer.spyre_moe_up,
+            layer.spyre_moe_down,
+            None if biases is None else biases.gate,
+            None if biases is None else biases.up,
+            None if biases is None else biases.down,
+            recipe.activation,
+        )
+
+
 def _name_persistent_dims(
     x: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor
 ) -> None:
@@ -858,7 +1018,8 @@ class SpyreMoERunner(MoERunner):
 
     A compiled block then compiles the MoE dispatch along with the rest of its graph. In-graph
     routing only lowers when the token axis spans whole sticks, so other batch sizes keep the
-    opaque ``torch.ops.vllm.moe_forward`` op and its compiled regions.
+    opaque ``torch.ops.vllm.moe_forward`` op and its compiled regions. Packed prefill also stays
+    on that op: its slot tables are built on the host.
     """
 
     def _select_forward(self) -> Callable:
@@ -872,7 +1033,8 @@ class SpyreMoERunner(MoERunner):
 
     def _entry_for(self, tokens: int) -> Callable:
         shared = self.shared_experts is not None
-        if tokens % self._spyre_stick == 0:
+        # Packed prefill reads its slot tables on the host, so it cannot be traced into the block.
+        if tokens % self._spyre_stick == 0 and not _use_packed_prefill(tokens):
             return _moe_forward_shared if shared else _moe_forward
         return torch.ops.vllm.moe_forward_shared if shared else torch.ops.vllm.moe_forward
 
@@ -942,6 +1104,8 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 if tokens == 1:
                     return _region(layer, "gathered", _gathered)(layer, x, router_logits)
                 return _region(layer, "gathered_batch", _gathered_tokens)(layer, x, router_logits)
+        if _use_packed_prefill(tokens):
+            return _moe_packed_prefill(layer, x, router_logits)
         with moe_scope:
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":

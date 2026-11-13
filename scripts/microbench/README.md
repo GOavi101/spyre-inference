@@ -314,3 +314,22 @@ which are reported separately as `memcpy_memset_event_sum_ms`. Device-event sums
 not critical-path wall time. The profiler-enabled torch-spyre build is required for
 device events. Compilation and warmup are outside timed samples, and results are
 written after every batch size when `--output` is supplied.
+
+## Gemma 4 MoE prefill micro-benchmark
+
+`gemma4_prefill_moe_microbench.py` times one prefill layer two ways: the all-expert
+loop, and the packed path behind `SPYRE_MOE_PACKED_PREFILL` (selected token-expert
+pairs only, including the host slot-table sync). Defaults are 512 and 1024 tokens,
+at the unsharded intermediate 704 and the TP4 shard 176. It also times one dense
+MLP of intermediate `8 * 704` (the width of the eight selected experts, not a
+checkpoint size) so MoE can be compared with that MLP. Attention is measured by
+`spyre_attn_microbench.py`. Gemma 4 has 30 layers; the script multiplies the layer
+median by 30 and labels that product as MoE only.
+
+`SPYRE_MOE_PACKED_PREFILL` stays `0` until this script shows the packed median wall
+time is lower than the all-expert loop on a card.
+
+```bash
+SPYRE_NUM_CPUS=8 uv run --no-sync python scripts/microbench/gemma4_prefill_moe_microbench.py \
+    --output /tmp/gemma4-prefill-moe.json
+```

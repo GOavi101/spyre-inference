@@ -678,6 +678,49 @@ def test_moe_runner_traces_only_stick_aligned_batches():
     assert runner._entry_for(3) is torch.ops.vllm.moe_forward_shared
 
 
+def test_packed_prefill_keeps_stick_aligned_prefill_on_the_opaque_op(monkeypatch):
+    """The host slot tables cannot be traced, so a prefill batch stays on the opaque op."""
+    from spyre_inference.moe import SpyreMoERunner
+
+    monkeypatch.setenv("SPYRE_MOE_PACKED_PREFILL", "1")
+    runner = object.__new__(SpyreMoERunner)
+    runner.moe_config = SimpleNamespace(in_dtype=torch.float16)
+    runner._shared_experts = None
+    runner._select_forward()
+    assert runner._entry_for(512) is torch.ops.vllm.moe_forward
+    assert runner._entry_for(64) is torch.ops.vllm.moe_forward
+    assert runner._entry_for(8) is torch.ops.vllm.moe_forward
+    runner._shared_experts = object()
+    assert runner._entry_for(64) is torch.ops.vllm.moe_forward_shared
+
+
+def test_packed_prefill_flag_dispatches_to_the_packed_region(monkeypatch):
+    """Above the gathered bound, the flag selects the packed region."""
+    monkeypatch.setenv("SPYRE_MOE_PACKED_PREFILL", "1")
+    calls, resets = _dispatch_recorder(monkeypatch)
+    layer = _dispatch_layer("full_softmax")
+    layer.spyre_moe_gate = torch.zeros(EXPERTS, 1, 1)
+    _apply(layer, tokens=16)
+    assert calls == [("packed", "_moe_packed_body")]
+    assert resets == []
+    assert layer.spyre_moe_packed_overflows == 0
+
+
+def test_packed_prefill_over_capacity_falls_back_to_the_all_expert_loop(monkeypatch):
+    """One expert past the slot count still returns, through the existing all-expert region."""
+    from spyre_inference import moe as moe_module
+
+    monkeypatch.setenv("SPYRE_MOE_PACKED_PREFILL", "1")
+    monkeypatch.setattr(moe_module, "_packed_capacity", lambda assignments, experts: 1)
+    calls, resets = _dispatch_recorder(monkeypatch)
+    layer = _dispatch_layer("topk_softmax")
+    layer.spyre_moe_gate = torch.zeros(EXPERTS, 1, 1)
+    _apply(layer, tokens=16)
+    assert calls == [("experts", "_experts")]
+    assert resets == [1]
+    assert layer.spyre_moe_packed_overflows == 1
+
+
 def test_post_load_builds_the_quant_config_before_the_first_traced_call(monkeypatch):
     """Built lazily in a traced block, it becomes a guard warmup flips: a re-trace mid-serving."""
     from types import MethodType

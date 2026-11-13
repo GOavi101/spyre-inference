@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
+    SPYRE_MOE_PACKED_PREFILL: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -147,6 +148,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_MOE_CHUNKS": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
     ),
+    # When "1", prefill runs only the selected token-expert pairs (pack, batched matmul,
+    # unpack) instead of every expert. Default "0": the host routing tables and the extra
+    # graph break are not yet shown to beat the all-expert loop on a card. Measure with
+    # scripts/microbench/gemma4_prefill_moe_microbench.py before turning this on.
+    # A faster device-side version needs torch-spyre work: fp16 and bias in
+    # torch._grouped_mm, routing tables without a host sync, and overflow that does not
+    # raise (torch-spyre#5534).
+    "SPYRE_MOE_PACKED_PREFILL": lambda: os.getenv("SPYRE_MOE_PACKED_PREFILL", "0") == "1",
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),
