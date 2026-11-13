@@ -486,8 +486,17 @@ def _moe_packed_body(
     up_out = up_out + up_bias
     activated = _activation(gate_out, up_out, activation)
     expert_out = torch.bmm(activated, down) + down_bias
-    gathered = torch.index_select(expert_out.reshape(experts * capacity, hidden), 0, dst)
-    return (gathered.reshape(tokens, top_k, hidden) * weights.unsqueeze(-1)).sum(1)
+    # One slot at a time. Folding every slot into a [tokens, top_k, hidden] pointwise
+    # puts top_k outermost (device [8, 2816, 1, 512, 64] at Gemma width) and the
+    # per-core span stays 352MB, past the 256MB limit. [tokens, hidden] is the
+    # product the all-expert loop already compiles.
+    flat = expert_out.reshape(experts * capacity, hidden)
+    slots = dst.reshape(tokens, top_k)
+    acc = torch.index_select(flat, 0, slots[:, 0].contiguous()) * weights[:, :1]
+    for slot in range(1, top_k):
+        selected = torch.index_select(flat, 0, slots[:, slot].contiguous())
+        acc = acc + selected * weights[:, slot : slot + 1]
+    return acc
 
 
 def _packed_fallback(
