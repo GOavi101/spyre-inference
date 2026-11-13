@@ -236,7 +236,7 @@ def test_packed_prefill_matches_reference_on_card(activation, routing, bias):
 
     expected = _reference(x, logits, gate, up, down, top_k, routing, activation, biases)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
-    assert ("packed_bias" if bias else "packed") in layer.spyre_moe_regions
+    assert "packed" in layer.spyre_moe_regions
     assert layer.spyre_moe_packed_overflows == 0
 
 

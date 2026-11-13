@@ -165,8 +165,15 @@ def _time_call(fn: Any, args: tuple[Any, ...], iterations: int, warmup: int, pro
     memory_ms = []
     counts = []
     events_by_iter = []
+    profile_error = None
     for profile_iteration in range(profile_iters):
-        span_ms, events = _profile_once(fn, args)
+        try:
+            span_ms, events = _profile_once(fn, args)
+        except RuntimeError as exc:
+            if "no Spyre device events" not in str(exc):
+                raise
+            profile_error = str(exc)
+            break
         memory_us = sum(
             float(event["duration_us"])
             for event in events
@@ -178,14 +185,20 @@ def _time_call(fn: Any, args: tuple[Any, ...], iterations: int, warmup: int, pro
         memory_ms.append(memory_us / 1000)
         counts.append(len(events))
         events_by_iter.append({"iteration": profile_iteration + 1, "events": events})
-    return {
-        "latency_ms": _stats(wall_ms),
-        "profiled_cpu_span_ms": _stats(profile_span_ms),
-        "compute_device_event_sum_ms": _stats(compute_ms),
-        "memcpy_memset_event_sum_ms": _stats(memory_ms),
-        "device_event_counts": counts,
-        "profiled_device_events": events_by_iter,
-    }
+    timed = {"latency_ms": _stats(wall_ms)}
+    if profile_error is None:
+        timed.update(
+            {
+                "profiled_cpu_span_ms": _stats(profile_span_ms),
+                "compute_device_event_sum_ms": _stats(compute_ms),
+                "memcpy_memset_event_sum_ms": _stats(memory_ms),
+                "device_event_counts": counts,
+                "profiled_device_events": events_by_iter,
+            }
+        )
+    else:
+        timed["device_profile"] = profile_error
+    return timed
 
 
 def _apply(layer: SimpleNamespace, x: torch.Tensor, logits: torch.Tensor, packed: bool):
@@ -348,6 +361,7 @@ def main() -> None:
                         "packed_median_ms": packed_ms,
                         "packed_over_persistent": result["packed_over_persistent"],
                         "fallback_clean": True,
+                        "device_profile": result["packed"].get("device_profile", "recorded"),
                     }
                 ),
                 flush=True,

@@ -463,9 +463,9 @@ def _moe_packed_body(
     gate: torch.Tensor,
     up: torch.Tensor,
     down: torch.Tensor,
-    gate_bias: torch.Tensor | None,
-    up_bias: torch.Tensor | None,
-    down_bias: torch.Tensor | None,
+    gate_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_bias: torch.Tensor,
     activation: str,
 ) -> torch.Tensor:
     """Batched expert matmuls for the packed slots, then the routed sum."""
@@ -480,13 +480,12 @@ def _moe_packed_body(
     packed = packed.reshape(experts, capacity, hidden)
     gate_out = torch.bmm(packed, gate)
     up_out = torch.bmm(packed, up)
-    if gate_bias is not None:
-        gate_out = gate_out + gate_bias
-        up_out = up_out + up_bias
+    # A bare batched-matmul result has no stick the activation pointwise can use.
+    # The add supplies one on the last dimension. Callers with no expert bias pass zeros.
+    gate_out = gate_out + gate_bias
+    up_out = up_out + up_bias
     activated = _activation(gate_out, up_out, activation)
-    expert_out = torch.bmm(activated, down)
-    if down_bias is not None:
-        expert_out = expert_out + down_bias
+    expert_out = torch.bmm(activated, down) + down_bias
     gathered = torch.index_select(expert_out.reshape(experts * capacity, hidden), 0, dst)
     return (gathered.reshape(tokens, top_k, hidden) * weights.unsqueeze(-1)).sum(1)
 
@@ -542,10 +541,14 @@ def _moe_packed_prefill(
     layer.spyre_moe_packed_overflows = getattr(layer, "spyre_moe_packed_overflows", 0)
     src, dst = tables
     biases = layer.spyre_moe_biases
-    # None-vs-tensor is a different graph, so the two bias forms keep their own compiled regions.
-    region = "packed" if biases is None else "packed_bias"
+    if biases is None:
+        gate_bias = _zero_expert_bias(layer.spyre_moe_gate)
+        up_bias = _zero_expert_bias(layer.spyre_moe_up)
+        down_bias = _zero_expert_bias(layer.spyre_moe_down)
+    else:
+        gate_bias, up_bias, down_bias = biases.gate, biases.up, biases.down
     with moe_scope:
-        return _region(layer, region, _moe_packed_body)(
+        return _region(layer, "packed", _moe_packed_body)(
             x,
             weights,
             src.to(device=x.device),
@@ -553,11 +556,19 @@ def _moe_packed_prefill(
             layer.spyre_moe_gate,
             layer.spyre_moe_up,
             layer.spyre_moe_down,
-            None if biases is None else biases.gate,
-            None if biases is None else biases.up,
-            None if biases is None else biases.down,
+            gate_bias,
+            up_bias,
+            down_bias,
             recipe.activation,
         )
+
+
+def _zero_expert_bias(pool: torch.Tensor) -> torch.Tensor:
+    """A zero ``[E, 1, width]`` bias with the same device layout as a real expert bias."""
+    zeros = torch.zeros(pool.shape[0], 1, pool.shape[-1], dtype=pool.dtype, device=pool.device)
+    if zeros.device.type != "spyre":
+        return zeros
+    return _to_spyre_expert_weight(zeros.cpu(), ())
 
 
 def _name_persistent_dims(
