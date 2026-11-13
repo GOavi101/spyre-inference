@@ -34,6 +34,7 @@ from spyre_inference.moe import (
     _moe_packed_prefill,
     _pack_assignment_tables,
     _packed_capacity,
+    _packed_stick_token_chunk,
     _routing_weights,
 )
 
@@ -42,6 +43,16 @@ _RECIPES = [
     ("silu", "full_softmax"),
     ("silu", "topk_softmax"),
 ]
+
+
+def test_stick_token_chunk_stays_under_one_stick(monkeypatch):
+    """64 tokens would be one fp16 stick of weights, which cannot fan out over hidden."""
+    assert _packed_stick_token_chunk(8, 2816, 64) == 32
+    from spyre_inference import moe as moe_module
+
+    monkeypatch.setattr(moe_module, "_PACKED_REDUCE_ELEMENTS", 512)
+    # Already under a stick: top_k * hidden = 256 and the budget reduces two tokens.
+    assert _packed_stick_token_chunk(2, 128, 64) == 2
 
 
 def test_packed_capacity_follows_the_grouped_mm_rule():

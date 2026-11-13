@@ -452,6 +452,23 @@ def _sum_packed_slots(
     return torch.cat(parts, 0)
 
 
+def _packed_stick_token_chunk(top_k: int, hidden: int, stick: int) -> int:
+    """Token group for a stick-split sum.
+
+    A group of ``stick`` tokens is one stick of routing weights. Spyre cannot
+    scatter that stick onto the hidden sticks, so a full stick is halved. A
+    smaller group from the element budget is left alone.
+    """
+    chunk = _packed_reduce_chunk(top_k, hidden)
+    if chunk < stick:
+        return chunk
+    half = stick // 2
+    period = 64 // math.gcd(max(top_k, 1), 64)
+    if period <= half:
+        return max(period, half - (half % period))
+    return max(half, 1)
+
+
 def _sum_packed_sticks(
     gathered: torch.Tensor,
     weights: torch.Tensor,
@@ -467,7 +484,7 @@ def _sum_packed_sticks(
     as a restickify.
     """
     hidden = nstick * stick
-    chunk = _packed_reduce_chunk(top_k, hidden)
+    chunk = _packed_stick_token_chunk(top_k, hidden, stick)
 
     def reduce(block: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weighted = block * scale.unsqueeze(-1).unsqueeze(-1)
