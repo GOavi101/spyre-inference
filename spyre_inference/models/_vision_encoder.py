@@ -350,7 +350,22 @@ class SpyreVisionEncoderMixin:
 
         One copy to the host here: device views at offsets off the stick read as offset 0
         (torch-spyre#3770), and the embedding merge runs on the host anyway.
+
+        ``_spyre_before_download``, when set, runs after the device forward and before that
+        copy. The graph manager uses it to stage the next independent batch while this one
+        is still queued on the device; the download is what waits for the device.
         """
+        output = self._encoder_device_forward(inputs, path)
+        before_download = getattr(self, "_spyre_before_download", None)
+        if before_download is not None:
+            before_download()
+        return convert(output, device="cpu")
+
+    def _encoder_device_forward(
+        self, inputs: dict[str, torch.Tensor], path: str = "default"
+    ) -> torch.Tensor:
+        """The three graphs, leaving the output on the device."""
+        del path
         embed = getattr(self, "_spyre_vision_embed", self.vision_embed)
         project = getattr(self, "_spyre_vision_project", self.vision_project)
         blocks = self.vision_blocks()
@@ -368,7 +383,7 @@ class SpyreVisionEncoderMixin:
             if i in wanted:
                 hidden[i] = x
         taps = [hidden[t % depth] for t in self.vision_taps]
-        return convert(project(x, taps), device="cpu")
+        return project(x, taps)
 
     def encoder_eager_forward(
         self, mm_kwargs: dict[str, Any], path: str = "default"
