@@ -155,6 +155,50 @@ def test_encoder_data_parallel_is_rejected():
         _manager(_FakeVisionModel(), tp_mode="data")
 
 
+def test_next_batch_is_staged_before_the_current_forward_returns():
+    """Independent batches overlap: the next host pad happens before this download."""
+    model = _FakeVisionModel(max_tokens=300)
+    manager = _manager(model)
+    manager.capture(graph_pool=None)
+
+    events: list[tuple[str, int]] = []
+    fill = manager._fill_and_copy
+
+    def recording_fill(mm_kwargs, token_budget, path, slot):
+        events.append(("prepare", token_budget))
+        return fill(mm_kwargs, token_budget, path, slot)
+
+    forward = model.encoder_cudagraph_forward
+
+    def recording_forward(inputs, path="default"):
+        patches = inputs["patches"].shape[0]
+        events.append(("forward-enter", patches))
+        try:
+            return forward(inputs, path)
+        finally:
+            events.append(("forward-leave", patches))
+
+    manager._fill_and_copy = recording_fill
+    model.encoder_cudagraph_forward = recording_forward
+    model.forward_patches.clear()
+
+    outputs = manager.execute({"tokens": [10, 30]})
+
+    assert [o.shape[0] for o in outputs] == [10, 30]
+    # 16 and 32 token budgets, four patches per token. The second pad is inside the
+    # first forward, before it returns the host output.
+    assert events == [
+        ("prepare", 16),
+        ("forward-enter", 16 * MERGE_PATCHES),
+        ("prepare", 32),
+        ("forward-leave", 16 * MERGE_PATCHES),
+        ("forward-enter", 32 * MERGE_PATCHES),
+        ("forward-leave", 32 * MERGE_PATCHES),
+    ]
+    for i, out in enumerate(outputs):
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))
+
+
 def test_execute_packs_pads_per_block_and_splits_per_item():
     model = _FakeVisionModel(max_tokens=300)
     manager = _manager(model)

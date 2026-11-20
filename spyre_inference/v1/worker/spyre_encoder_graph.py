@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import torch
 from vllm.logger import init_logger
@@ -33,6 +33,19 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Arguments of one compiled replay, in the order ``_execute_packed`` calls them.
+_QueuedCall = tuple[dict[str, Any], int, str, tuple]
+# budget, path, axis keys, device slot, device inputs already copied.
+_Armed = tuple[int, str, tuple, int, dict[str, torch.Tensor]]
+
+
+class _PlannedBatch(NamedTuple):
+    indices: list[int]
+    mm_kwargs: dict[str, Any]
+    axis_keys: tuple
+    path_budgets: dict[str, int | None]
+    path_tokens: dict[str, int]
+
 
 class SpyreEncoderGraphManager(EncoderCudaGraphManager):
     """Compiles the encoder at each token budget during warmup, then serves through it.
@@ -40,8 +53,12 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
     Inherited from upstream: budget selection and user overrides, packing items into budgets,
     replay padding, and the per-item output split. Overridden: capture compiles the model's
     graphs at that budget's static shape, replay copies the inputs into host staging
-    buffers, uploads them once and runs those graphs, and the manager counts as captured
+    buffers, uploads them and runs those graphs, and the manager counts as captured
     while those buffers are staged.
+
+    Packed batches do not depend on each other. While one forward is still on the device,
+    the next batch is padded on the host and its H2D is enqueued, so that work is done by
+    the time the device result is copied back.
     """
 
     def __init__(
@@ -118,12 +135,19 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
                     budgets if fit is None else [b for b in budgets if b <= fit]
                 )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+        # Second host buffer and two device buffers per budget, so the next batch can be
+        # copied while the current forward still reads the first.
+        self._host_slot1: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+        self._device_slots: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
+        self._queue: list[_QueuedCall] | None = None
+        self._armed: _Armed | None = None
+        self._current_slot = 0
 
     def _execute_local(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
         """Upstream's greedy packing, with each item above ``vision_pack_tokens`` run alone."""
         pack = self._pack_tokens
         if pack is None:
-            return super()._execute_local(mm_kwargs)
+            return self._execute_packed(mm_kwargs)
         tokens = self._get_per_item_out_tokens(mm_kwargs)
         small = [i for i, t in enumerate(tokens) if t <= pack]
         budgets = self.path_token_budgets
@@ -133,17 +157,131 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             # capped budgets, and a lone large item every budget.
             self.path_token_budgets = self._pack_budgets
             if len(small) == len(tokens):
-                return super()._execute_local(mm_kwargs)
+                return self._execute_packed(mm_kwargs)
             if small:
                 group = self._select_items(mm_kwargs, small)[0]
-                outputs.update(zip(small, super()._execute_local(group), strict=True))
+                outputs.update(zip(small, self._execute_packed(group), strict=True))
             self.path_token_budgets = budgets
             for i, t in enumerate(tokens):
                 if t > pack:
-                    (outputs[i],) = super()._execute_local(self._select_items(mm_kwargs, [i])[0])
+                    (outputs[i],) = self._execute_packed(self._select_items(mm_kwargs, [i])[0])
         finally:
             self.path_token_budgets = budgets
         return [outputs[i] for i in range(len(tokens))]
+
+    def _plan_batches(self, mm_kwargs: dict[str, Any]) -> list[_PlannedBatch]:
+        """Upstream's greedy pack: smallest items first, one fitting budget per batch."""
+        item_specs = self._get_item_specs(mm_kwargs)
+        paths = tuple(self.path_token_budgets)
+        per_item_path_tokens = {
+            path: [spec.get_path_output_tokens(path) for spec in item_specs] for path in paths
+        }
+        per_item_out_tokens = [spec.output_tokens for spec in item_specs]
+        max_path_budgets = {path: max(self.path_token_budgets[path]) for path in paths}
+        sorted_indices = sorted(range(len(item_specs)), key=lambda i: per_item_out_tokens[i])
+
+        batches: list[tuple[list[int], dict[str, int | None]]] = []
+        current_batch: list[int] = []
+        current_tokens = dict.fromkeys(paths, 0)
+
+        def append_current_batch() -> None:
+            if not current_batch:
+                return
+            path_budgets = {
+                path: self._path_fitting_budget(path, current_tokens[path]) for path in paths
+            }
+            batches.append((list(current_batch), path_budgets))
+
+        def should_defer_item(item_tokens: dict[str, int]) -> bool:
+            """Whether closing the batch strictly reduces summed budgets."""
+            for path in paths:
+                item = item_tokens[path]
+                if item == 0:
+                    continue
+                cur = current_tokens[path]
+                b_cur = self._path_fitting_budget(path, cur)
+                b_alone = self._path_fitting_budget(path, item)
+                b_merged = self._path_fitting_budget(path, cur + item)
+                # Only called when the item fits; lookups land on a budget.
+                assert b_cur is not None and b_alone is not None and b_merged is not None
+                # Only defer items that alone outweigh the whole current batch.
+                if b_cur + b_alone < b_merged and b_alone >= b_cur:
+                    return True
+            return False
+
+        for orig_idx in sorted_indices:
+            item_tokens = {path: per_item_path_tokens[path][orig_idx] for path in paths}
+            fits = len(current_batch) < self.max_batch_size and all(
+                current_tokens[path] + item_tokens[path] <= max_path_budgets[path] for path in paths
+            )
+            if current_batch and (not fits or should_defer_item(item_tokens)):
+                append_current_batch()
+                current_batch = []
+                current_tokens = dict.fromkeys(paths, 0)
+            current_batch.append(orig_idx)
+            for path in paths:
+                current_tokens[path] += item_tokens[path]
+        append_current_batch()
+
+        planned: list[_PlannedBatch] = []
+        for indices, path_budgets in batches:
+            selected, axis_keys = self._select_items(mm_kwargs, indices)
+            path_tokens = {
+                path: sum(per_item_path_tokens[path][i] for i in indices) for path in paths
+            }
+            planned.append(_PlannedBatch(indices, selected, axis_keys, path_budgets, path_tokens))
+        return planned
+
+    def _execute_packed(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        """Run packed batches, staging the next batch under the current forward."""
+        item_specs = self._get_item_specs(mm_kwargs)
+        per_item_out_tokens = [spec.output_tokens for spec in item_specs]
+        paths = tuple(self.path_token_budgets)
+        planned = self._plan_batches(mm_kwargs)
+        queue: list[_QueuedCall] = []
+        for batch in planned:
+            for path in paths:
+                if batch.path_tokens[path] == 0:
+                    continue
+                budget = batch.path_budgets[path]
+                if budget is not None:
+                    queue.append((batch.mm_kwargs, budget, path, batch.axis_keys))
+        outputs: dict[int, torch.Tensor] = {}
+        self._queue = queue
+        self._armed = None
+        try:
+            for batch in planned:
+                graph_outputs: dict[str, torch.Tensor] = {}
+                all_eager = True
+                for path in paths:
+                    if batch.path_tokens[path] == 0:
+                        continue
+                    budget = batch.path_budgets[path]
+                    if budget is None:
+                        with torch.inference_mode():
+                            output = self.model.encoder_eager_forward(batch.mm_kwargs, path=path)
+                    else:
+                        all_eager = False
+                        output = self._run_budget_graph(
+                            batch.mm_kwargs, budget, path=path, axis_keys=batch.axis_keys
+                        )
+                        assert output is not None
+                    graph_outputs[path] = output
+                if all_eager:
+                    self.graph_misses += len(batch.indices)
+                self.model.postprocess_encoder_output(
+                    graph_outputs,
+                    batch.indices,
+                    per_item_out_tokens,
+                    outputs,
+                    clone=True,
+                    batch_mm_kwargs=batch.mm_kwargs,
+                )
+        finally:
+            self._queue = None
+            self._armed = None
+            self.model._spyre_before_download = None
+        return [outputs[i] for i in range(len(item_specs))]
 
     def _capture_budget_graph(
         self, token_budget: int, path: str = "default", axis_keys: tuple = ()
@@ -158,10 +296,17 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             path,
         ).values
         t0 = time.time()
+        device_inputs = self._upload(values)
         with torch.inference_mode():
-            self.model.encoder_cudagraph_forward(self._upload(values), path=path)
+            self.model.encoder_cudagraph_forward(device_inputs, path=path)
         logger.info("Vision encoder budget %d compiled in %.1fs.", token_budget, time.time() - t0)
         self._staging.setdefault(path, {})[token_budget] = values
+        # A second host buffer and a second device buffer, so the next batch at this
+        # budget can be uploaded while this one is still being read.
+        alternate = {key: value.clone() for key, value in values.items()}
+        self._host_slot1.setdefault(path, {})[token_budget] = alternate
+        self._device_slots[(path, token_budget, 0)] = device_inputs
+        self._device_slots[(path, token_budget, 1)] = self._upload(alternate)
 
     def _run_budget_graph(
         self,
@@ -170,22 +315,90 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         path: str = "default",
         axis_keys: tuple = (),
     ) -> torch.Tensor | None:
-        """Run one packed batch through the budget's compiled graphs; ``None`` if uncompiled."""
+        """Run one packed batch through the budget's compiled graphs; ``None`` if uncompiled.
+
+        When ``_execute_packed`` has queued the following call, its host padding and H2D
+        run after this forward is launched and before the output is copied back.
+        """
+        if self._queue is not None:
+            if not self._queue:
+                raise RuntimeError("encoder batch queue underflow")
+            queued = self._queue.pop(0)
+            if queued != (mm_kwargs, token_budget, path, axis_keys):
+                raise RuntimeError("encoder batch queue does not match the call")
         staging = self._staging.get(path, {}).get(token_budget)
         num_items = len(self._get_item_specs(mm_kwargs))
         if staging is None:
             self.graph_misses += num_items
+            self._armed = None
             return None
+        armed = self._armed
+        if armed is not None and armed[:3] == (token_budget, path, axis_keys):
+            _budget, _path, _axis, slot, device_inputs = armed
+            self._armed = None
+        else:
+            self._armed = None
+            slot = 0
+            device_inputs = self._fill_and_copy(mm_kwargs, token_budget, path, slot)
+        self._current_slot = slot
+
+        def stage_next() -> None:
+            # This batch's output is not an input of the next one. Padding and the H2D
+            # enqueue happen before the download below waits for the device.
+            self._arm_next()
+
+        self.model._spyre_before_download = stage_next
+        try:
+            with torch.inference_mode():
+                output = self.model.encoder_cudagraph_forward(device_inputs, path=path)
+        finally:
+            self.model._spyre_before_download = None
+        self.graph_hits += num_items
+        return output
+
+    def _arm_next(self) -> None:
+        """Pad the queued batch into the idle slot and enqueue its H2D."""
+        queue = self._queue
+        if not queue:
+            return
+        mm_kwargs, token_budget, path, axis_keys = queue[0]
+        if self._staging.get(path, {}).get(token_budget) is None:
+            return
+        slot = 1 - self._current_slot
+        device_inputs = self._fill_and_copy(mm_kwargs, token_budget, path, slot)
+        self._armed = (token_budget, path, axis_keys, slot, device_inputs)
+
+    def _host_for(self, path: str, token_budget: int, slot: int) -> dict[str, torch.Tensor]:
+        if slot == 0:
+            return self._staging[path][token_budget]
+        return self._host_slot1[path][token_budget]
+
+    def _fill_and_copy(
+        self,
+        mm_kwargs: dict[str, Any],
+        token_budget: int,
+        path: str,
+        slot: int,
+    ) -> dict[str, torch.Tensor]:
+        """Pad this batch into the host slot and copy it to the matching device slot."""
+        host = self._host_for(path, token_budget, slot)
         replay = self.model.prepare_encoder_cudagraph_replay_buffers(
             mm_kwargs, self.max_batch_size, self.max_frames_per_batch, path
         )
-        for key, buf in staging.items():
+        for key, buf in host.items():
             # The mixin validates replay buffers: every key is present and none is None.
             self.config.padding_logics[key](buf, cast(torch.Tensor, replay.values[key]))
-        with torch.inference_mode():
-            output = self.model.encoder_cudagraph_forward(self._upload(staging), path=path)
-        self.graph_hits += num_items
-        return output
+        device = self._device_slots[(path, token_budget, slot)]
+        for key, buf in host.items():
+            dst = device[key]
+            if dst.data_ptr() == buf.data_ptr() and dst.storage_offset() == buf.storage_offset():
+                # CPU replay keeps the host buffer as the device buffer.
+                continue
+            if dst.device.type == "spyre":
+                dst.copy_(buf, non_blocking=True)
+            else:
+                dst.copy_(buf)
+        return device
 
     def is_captured(self) -> bool:
         # Captured once a budget is staged; upstream's check reads the CUDA graph pool,
@@ -196,6 +409,11 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         # The compiled graphs live on the model; only the staging buffers are dropped.
         super().clear()
         self._staging.clear()
+        self._host_slot1.clear()
+        self._device_slots.clear()
+        self._queue = None
+        self._armed = None
+        self._current_slot = 0
 
     def _upload(self, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Copy host buffers to the encoder's device."""
