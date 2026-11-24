@@ -129,7 +129,7 @@ class TestWarmKernelsTracesTheDeclaredSet:
         monkeypatch.setattr(impl, "_run_fused", record_fused)
         traced = impl.warm_kernels(*_buffers(impl, rows), impl.num_heads, impl.num_kv_heads, 64)
 
-        assert seen_rects == encoder_rectangles(config)
+        assert seen_rects == [(e, w) for e, w in encoder_rectangles(config) if e * w == rows]
         assert seen_groups == encoder_group_shapes(config)
         assert traced == len(seen_rects) + len(seen_groups)
 
@@ -249,45 +249,6 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
     """The constraint that matters: the scheduler is upstream's, so for *any* batch it
     can form, every dispatch the backend makes must be a shape warmup traced."""
 
-    @pytest.mark.parametrize(("max_model_len", "max_num_seqs", "budget"), _CONFIGS)
-    def test_across_the_reachable_batch_space(self, max_model_len, max_num_seqs, budget):
-        config = _config(max_model_len, max_num_seqs, budget)
-        rectangles = encoder_rectangles(config)
-        declared_rects = set(rectangles)
-        declared_groups = set(encoder_group_shapes(config))
-        caps = group_width_caps(encoder_shape_tables(config).groups)
-
-        checked = 0
-        for num_seqs in range(1, max_num_seqs + 1):
-            for length in (1, 63, 64, 65, 200, max_model_len - 1, max_model_len):
-                if length < 1:
-                    continue
-                # Ragged as well as uniform: a step with several extents is what makes
-                # the ragged path's group space multi-dimensional.
-                for lens in (
-                    [length] * num_seqs,
-                    [max(1, length - i * 37) for i in range(num_seqs)],
-                ):
-                    if sum(lens) > budget:
-                        continue
-                    plan = build_encoder_plan(
-                        _fake_metadata(lens),
-                        rectangles=rectangles,
-                        width_cap_for=caps,
-                        device=torch.device("cpu"),
-                        dtype=torch.float16,
-                        batched=True,
-                    )
-                    if isinstance(plan, EncoderRectPlan):
-                        assert (plan.extent, plan.width) in declared_rects
-                    else:
-                        for group in plan:
-                            assert (group.group, group.extent) in declared_groups, (
-                                f"undeclared group {(group.group, group.extent)} for lens={lens}"
-                            )
-                    checked += 1
-        assert checked > 50, "too few batches checked -- test is near-vacuous"
-
     def test_a_group_wider_than_the_cap_is_chunked_onto_declared_widths(self):
         """17 same-extent requests at a cap of 16 must split 16 + 1, not pad to 32."""
         config = _config(512, 32, 2048)
@@ -303,6 +264,50 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
         )
         assert [p.group for p in plan] == [16, 1]
         assert set(encoder_group_shapes(config)) >= {(16, 64), (1, 64)}
+
+
+class TestEveryBatchLandsOnItsOwnBodysShapes:
+    """With several bodies, a step pads to the smallest that holds it and plans against
+    that body's rectangles and groups only, as the runners do."""
+
+    @pytest.mark.parametrize(
+        ("max_model_len", "max_num_seqs", "budget"),
+        [*_CONFIGS, (8192, 4, 8192), (2048, 8, 2048)],
+    )
+    def test_across_the_reachable_batch_space(self, max_model_len, max_num_seqs, budget):
+        tables = encoder_shape_tables(_config(max_model_len, max_num_seqs, budget))
+        groups_by_body = dict(tables.tier_groups)
+        checked = 0
+        for num_seqs in range(1, max_num_seqs + 1):
+            for length in (1, 63, 65, 200, 300, max_model_len // 2 + 1, max_model_len):
+                for lens in (
+                    [length] * num_seqs,
+                    [max(1, length - i * 97) for i in range(num_seqs)],
+                    [length] + [1] * (num_seqs - 1),
+                ):
+                    tokens = sum(lens)
+                    if max(lens) > max_model_len or tokens > tables.budget:
+                        continue
+                    body = next(b for b in tables.budgets if b >= tokens)
+                    rectangles = [(e, w) for e, w in tables.rectangles if e * w == body]
+                    plan = build_encoder_plan(
+                        _fake_metadata(lens),
+                        rectangles=rectangles,
+                        width_cap_for=group_width_caps(groups_by_body[body]),
+                        device=torch.device("cpu"),
+                        dtype=torch.float16,
+                        batched=True,
+                    )
+                    if isinstance(plan, EncoderRectPlan):
+                        assert (plan.extent, plan.width) in rectangles
+                    else:
+                        for group in plan:
+                            assert (group.group, group.extent) in groups_by_body[body], (
+                                f"undeclared group {(group.group, group.extent)} on body "
+                                f"{body} for lens={lens}"
+                            )
+                    checked += 1
+        assert checked > 20, "too few batches checked -- test is near-vacuous"
 
 
 def test_fallback_width_caps_follow_the_query_body():

@@ -282,7 +282,8 @@ class TestEncoderBudget:
 class TestEncoderRectangles:
     def test_worked_example(self):
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
-        assert encoder_rectangles(cfg) == [(64, 32), (128, 16), (256, 8), (512, 4)]
+        on_2048 = [(length, b) for length, b in encoder_rectangles(cfg) if length * b == 2048]
+        assert on_2048 == [(64, 32), (128, 16), (256, 8), (512, 4)]
 
     @pytest.mark.parametrize("max_num_seqs", [1, 4, 32])
     @pytest.mark.parametrize("max_model_len", [64, 100, 320, 384, 512, 576, 1024, 4096])
@@ -346,8 +347,8 @@ class TestLongContextBodyTiers:
             (length, batch) for length, batch in self._tables().rectangles if length * batch == rows
         ]
 
-    def test_bodies_step_from_the_fast_budget_up_to_max_model_len(self):
-        assert self._tables().budgets == (2048, 4096, 8192)
+    def test_bodies_step_from_512_up_to_max_model_len(self):
+        assert self._tables().budgets == (512, 1024, 2048, 4096, 8192)
 
     def test_capping_batched_tokens_at_2k_does_not_change_the_8k_tables(self):
         """The platform caps ``max_num_batched_tokens`` at 2048, then writes the
@@ -358,8 +359,8 @@ class TestLongContextBodyTiers:
         assert capped.budgets == self._tables().budgets
         assert capped.rectangles == self._tables().rectangles
 
-    def test_a_short_request_stays_on_the_fast_rectangle(self):
-        assert encoder_rectangle_for_batch(1, 100, self._rects(2048)) == (128, 16)
+    def test_a_short_request_takes_the_smallest_body(self):
+        assert encoder_rectangle_for_batch(1, 100, self._rects(512)) == (128, 4)
 
     def test_one_document_past_2k_uses_a_4k_rectangle(self):
         """(4096, 1), not an 8192-row body with a padded twin sequence."""
@@ -383,7 +384,7 @@ class TestLongContextBodyTiers:
         is the regression the 2048 cap exists to avoid."""
         assert encoder_rectangle_for_batch(3, 3000, self._rects(8192)) is None
 
-    def test_a_larger_body_omits_extents_that_cannot_reach_it(self):
+    def test_a_larger_body_omits_rectangles_that_cannot_reach_it(self):
         """The 8192 body is only used above 4096 tokens. With four sequences an
         extent of 1024 holds at most 4096, so that rectangle never dispatches."""
         long = self._rects(8192)
@@ -391,13 +392,69 @@ class TestLongContextBodyTiers:
         assert (2048, 4) in long
         assert (4096, 2) in long
         assert (8192, 1) in long
+
+    def test_a_larger_body_groups_every_extent(self):
+        """A 100-token request beside three 2500-token ones is a ragged step on the 8192
+        body, and it lands in a 128-wide group there. An undeclared group would compile
+        mid-serving."""
         groups = dict(self._tables().tier_groups)[8192]
-        assert all(extent > 1024 for _width, extent in groups)
+        assert {extent for _width, extent in groups} == {
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+        }
 
     def test_the_largest_body_stops_at_the_model_length(self):
         """16384 tokens on an 8192 model must not declare a 16K body."""
-        assert encoder_body_budgets(8192, 16384, 4) == (2048, 4096, 8192)
-        assert encoder_body_budgets(512, 8192, 32) == (2048,)
+        assert encoder_body_budgets(8192, 16384, 4) == (512, 1024, 2048, 4096, 8192)
+        assert encoder_body_budgets(512, 8192, 32) == (512, 1024, 2048)
+
+
+class TestSmallBodies:
+    """Bodies start at 512 rows, so a few short requests stop padding to 2048 (#1621)."""
+
+    def _tables(self, max_num_seqs=4):
+        return encoder_shape_tables(
+            _pooling_vllm_config(
+                max_model_len=512, max_num_seqs=max_num_seqs, max_num_batched_tokens=2048
+            )
+        )
+
+    def test_bodies_step_up_from_512(self):
+        assert encoder_body_budgets(512, 2048, 4) == (512, 1024, 2048)
+        assert encoder_body_budgets(8192, 8192, 4) == (512, 1024, 2048, 4096, 8192)
+        # Never more than the largest body.
+        assert encoder_body_budgets(512, 512, 4) == (512,)
+        assert encoder_body_budgets(64, 2048, 1) == (64,)
+
+    def test_four_short_requests_take_a_512_row_rectangle(self):
+        tables = self._tables()
+        on_512 = [(length, b) for length, b in tables.rectangles if length * b == 512]
+        assert encoder_rectangle_for_batch(4, 100, on_512) == (128, 4)
+
+    def test_rectangles_cover_each_body_exactly(self):
+        assert self._tables().rectangles == (
+            (64, 8),
+            (128, 4),
+            (256, 2),
+            (512, 1),
+            (256, 4),
+            (512, 2),
+            (512, 4),
+        )
+
+    def test_a_small_body_groups_what_its_rectangles_miss(self):
+        """A 300- and a 100-token request fit 512 rows but not the (512, 1) rectangle."""
+        groups = dict(self._tables().tier_groups)
+        assert (1, 512) in groups[512] and (1, 128) in groups[512]
+        assert (1, 128) in groups[1024]
+        # Four sequences of any length fit a 2048-row rectangle.
+        assert groups[2048] == ()
 
 
 class TestEncoderGroupShapes:
@@ -424,15 +481,17 @@ class TestEncoderGroupShapes:
 
     def test_declared_shape_count_matches_the_plan(self):
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
-        assert 1 + len(encoder_rectangles(cfg)) + len(encoder_group_shapes(cfg)) == 23
+        tables = encoder_shape_tables(cfg)
+        groups = sum(len(g) for _body, g in tables.tier_groups)
+        assert len(tables.budgets) + len(tables.rectangles) + groups == 57
 
 
 class TestEncoderDispatch:
     @pytest.fixture()
     def rectangles(self):
-        return encoder_rectangles(
-            _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
-        )
+        """The 2048-row body's, as dispatch filters them for a step padded to it."""
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        return [(length, b) for length, b in encoder_rectangles(cfg) if length * b == 2048]
 
     @pytest.mark.parametrize(
         ("num_seqs", "max_len", "expected"),

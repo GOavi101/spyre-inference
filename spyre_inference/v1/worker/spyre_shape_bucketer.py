@@ -17,11 +17,12 @@
 Body (1D, decoder): sorted ``compile_sizes`` token counts; pad the packed batch to
 the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, …]``.
 
-Pooling pads each step to a body of ``R`` rows (see ``encoder_body_budgets``). A model
-whose context fits in 2048 rows has one body, the token budget. A longer model (bge-m3
-at 8K) keeps that 2048-row body for steps that fit it and adds a body per larger
-power of two up to ``max_model_len``. One 8K body would pad a short request out to
-8192 rows and shrink the long rectangles until a multi-document batch missed them.
+Pooling pads each step to a body of ``R`` rows (see ``encoder_body_budgets``). The
+bodies are powers of two from ``POOLING_MIN_BODY_ROWS`` (512) up to the token budget,
+so a few short requests do not pad to 2048 rows. A longer model (bge-m3 at 8K) keeps
+the 2048-row body for steps that fit it and adds a body per larger power of two up to
+``max_model_len``. One 8K body would pad a short request out to 8192 rows and shrink
+the long rectangles until a multi-document batch missed them.
 
 Each body is its own buffer size, so a rectangle and a ragged group are compiled per
 body: both kernels take the buffer as an argument. Steps pick the smallest body that
@@ -63,6 +64,11 @@ ENCODER_SEQ_ALIGNMENT = 64
 # the smallest body and only step up when the batch does not. One constant: the
 # platform reads it from here, so the cap and the tier ladder cannot drift.
 POOLING_FAST_BODY_ROWS = 2048
+
+# Smallest pooling body. Steps of a few short requests pad to this, not to the fast
+# body: four short prompts at --max-concurrency 4 ran 536.59s at 512 rows against
+# 709s at 2048 (#1621).
+POOLING_MIN_BODY_ROWS = 512
 
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
@@ -160,7 +166,7 @@ def _encoder_shape_tables(
         # A step reaches this body only once its token count passes the previous
         # one. An extent whose fullest batch (``max_num_seqs`` sequences of that
         # length) still fits below stays on the smaller body, so its rectangle
-        # and ragged groups here would compile and never dispatch.
+        # here would compile and never dispatch.
         usable = tuple(
             length
             for length in lengths
@@ -169,8 +175,11 @@ def _encoder_shape_tables(
             and _extent_reaches_body(length, previous, max_num_seqs)
         )
         rectangles.extend((length, budget // length) for length in usable)
+        # A ragged step is grouped per request, so a short request on a long step lands
+        # in a short group on this body even when its extent cannot reach it alone.
+        divisors = tuple(length for length in lengths if length <= budget and budget % length == 0)
         tier_groups.append(
-            (budget, _encoder_groups(usable, budget, max_num_seqs) if usable else ())
+            (budget, _encoder_groups(divisors, budget, max_num_seqs) if usable else ())
         )
         previous = budget
 
@@ -275,8 +284,7 @@ def encoder_body_budgets(
     The largest starts as ``encoder_budget_rows`` and is then clamped. A body past
     the aligned model length — 16K rows for an 8K model — is the regression the
     fast body exists to avoid. A short model still packs inside the fast body.
-    When the result is within ``POOLING_FAST_BODY_ROWS`` there is one body, which
-    is what every pooling model at 512 context already runs.
+    A result within ``POOLING_MIN_BODY_ROWS`` is the only body.
 
     Past that, a single body of ``max_model_len`` rows is what makes bge-reranker-v2-m3
     miss the rectangle at long context. vLLM raises ``max_num_batched_tokens`` to the
@@ -285,6 +293,10 @@ def encoder_body_budgets(
     than the rectangle and takes the ragged path. Shorter bodies keep a request that
     fits in 2K on the fast rectangle, and a single document in (2K, 4K] on a 4K
     rectangle instead of an 8K buffer with a padded twin sequence.
+
+    Below the fast body there is one body per power of two from
+    ``POOLING_MIN_BODY_ROWS``, so a step of a few short requests pads to 512 rows rather
+    than 2048, and a full queue still fills the 2048-row body.
     """
     full = encoder_budget_rows(max_model_len, max_num_batched_tokens, max_num_seqs)
     # One max-length sequence already fits in the aligned model length. A body
@@ -295,14 +307,14 @@ def encoder_body_budgets(
     longest = _align_up_pow2(max_model_len)
     if full > longest:
         full = max(longest, min(full, POOLING_FAST_BODY_ROWS))
-    if full <= POOLING_FAST_BODY_ROWS:
+    if full <= POOLING_MIN_BODY_ROWS:
         return (full,)
 
     # Each smaller body is the power of two itself. The loop only runs while
     # ``size < full``, and ``full`` never exceeds ``max_num_seqs`` times the model
     # length, so ``encoder_budget_rows`` of this size returns ``size``.
     tiers: list[int] = []
-    size = POOLING_FAST_BODY_ROWS
+    size = POOLING_MIN_BODY_ROWS
     while size < full:
         tiers.append(size)
         size *= 2

@@ -105,13 +105,17 @@ pooling models), floored at `--max-model-len` rounded up to a power-of-two multi
 floored to a whole multiple of it so that every length divides `R`. `--max-num-seqs` is
 then lowered to `R / 64` if it was higher, since no batch wider than that fits.
 
-- **Body** (Linear / LN): one shape, `R` rows. Every pooling step pads to it.
-  Fixing it is what keeps the attention kernels keyed on sequence shapes alone.
+- **Bodies** (Linear / LN): powers of two from 512 rows up to `R`. A step pads to the
+  smallest body that holds its tokens, so four 100-token requests run on 512 rows rather
+  than 2048. Fixing each body is what keeps the attention kernels keyed on sequence
+  shapes alone.
 - **Lengths**: powers of two from 64 (one Spyre stick) up to `--max-model-len`, rounded
   up to a power-of-two multiple of 64. Every length is then `64 * 2^k`, so each divides
   `R` and each rectangle covers the body exactly. `SPYRE_ATTN_QUERY_BUCKETS` overrides the
   ladder, rounded the same way.
-- **Attention, rectangular path**: for each length `L`, one rectangle `B = R / L`. The
+- **Attention, rectangular path**: for each body and length `L`, one rectangle
+  `B = body / L`. A length whose widest batch already fits a smaller body is left off a
+  larger one. The
   runner pads every sequence to `L` and the batch to `B`, so Q/K/V *are* the grid:
   one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
   inside the layer. Taken whenever `num_seqs <= B`.
@@ -120,12 +124,14 @@ then lowered to `R / 64` if it was higher, since no batch wider than that fits.
   length. Each group is one fused gather/attend/scatter keyed on `(group width,
   extent)`, so a ragged step makes one kernel call per group rather than per
   request. Widths are powers of two up to `B`; a wider group is chunked into
-  descending powers of two.
+  descending powers of two. Each body declares groups for every length, since a short
+  request can share a step with a long one.
 
-With `--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048` that is
-23 shapes: one body, four rectangles (`(64,32) (128,16) (256,8) (512,4)`, each
-exactly 2048 rows), and 18 group pairs. At `--max-num-seqs 4` the group family is
-empty — no batch that narrow can miss the rectangular path — leaving five shapes.
+With `--max-model-len 512 --max-num-seqs 4 --max-num-batched-tokens 2048` that is
+30 shapes: bodies of 512, 1024 and 2048 rows; seven rectangles (`(64,8) (128,4)
+(256,2) (512,1)` on 512 rows, `(256,4) (512,2)` on 1024, `(512,4)` on 2048); and 20
+group pairs, none of them on the 2048-row body, where four sequences always fit a
+rectangle. At `--max-num-seqs 32` it is 57: twelve rectangles and 42 group pairs.
 Those counts assume the rectangular path is opaque; traced into the block graph (see
 below), each rectangle is a block graph of its own rather than an attention kernel.
 
@@ -138,7 +144,7 @@ opaque, with no block graph; a compiled, unpadded sub-stick head size also keeps
 both paths opaque, sharing one block graph. Pooling models such as granite-30m
 pad their native 32-wide heads to 64 before construction.
 
-Compiled pooling warmup runs one dummy at the body shape. With the rectangular path
+Compiled pooling warmup runs one dummy at each body shape. With the rectangular path
 opaque, the first attention call in it traces every declared rectangle and group pair,
 against that call's own tensors (a Spyre tensor's device layout is part of its cache
 key). With it traced in, warmup adds one dummy per rectangle, plus one forced onto the
