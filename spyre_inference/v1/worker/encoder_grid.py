@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool.spyre_pooler import select_rows
+from spyre_inference.v1.worker.encoder_dynamic import RectRange, upload_declared
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_grid_source_rows,
     expand_packed_to_encoder_grid,
@@ -55,6 +56,7 @@ def expand_body_to_grid(
     *,
     pad_token_id: int,
     position_offset: int,
+    declare: tuple[torch.device, RectRange] | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """``(input_ids, inputs_embeds, positions)`` for the ``(extent, width, query_lens)`` grid.
 
@@ -62,6 +64,9 @@ def expand_body_to_grid(
     activation gather. Multimodal pooling with only `inputs_embeds` instead gathers the
     embeddings into the grid on the device, with an index built on the host, so they
     never round-trip through the host. Each result is on its input's device.
+
+    ``declare`` uploads the ids and positions as int64 to that device with their rows
+    declared as that range (ids path only), for a declared-width rectangle.
     """
     extent, width, query_lens = grid
     num_tokens = sum(query_lens)
@@ -77,12 +82,20 @@ def expand_body_to_grid(
             position_offset=position_offset,
         )
         assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
+        if declare is not None:
+            device, rect = declare
+            return (
+                upload_declared(ids, rect, device, torch.int64),
+                inputs_embeds,
+                upload_declared(pos, rect, device, torch.int64),
+            )
         return convert(ids, input_ids.device), inputs_embeds, convert(pos, positions.device)
 
     # A multimodal pooling model (e.g. CLIP) preprocesses straight to embeddings; expand
     # those instead of ids. Positions still need the same padding, so reuse that helper
     # with dummy ids (discarded).
     assert inputs_embeds is not None, "upstream must supply ids or embeds"
+    assert declare is None, "declared-width rectangles take input_ids"
     _, pos = expand_packed_to_encoder_grid(
         torch.zeros(num_tokens, dtype=torch.int64),
         positions[:num_tokens].cpu(),

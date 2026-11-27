@@ -43,6 +43,11 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     plan_encoder_step,
     publish_encoder_grid,
 )
+from spyre_inference.v1.worker.encoder_dynamic import (
+    RectRange,
+    encoder_rect_ranges,
+    upload_declared,
+)
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
     encoder_pad_token_id,
@@ -71,6 +76,9 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         super().__init__(vllm_config, model, encoder_cache, device, spyre_device)
         tables = encoder_shape_tables(vllm_config)
         self._rectangles = list(tables.rectangles)
+        self._lengths = tables.lengths
+        # Declared-width ranges, used once the model reports its encoder runs them tiled.
+        self._ranges = encoder_rect_ranges(vllm_config)
         # Per body, ascending. A step padded to 2048 must not use the 8192 caps.
         self._width_caps_by_rows = {
             body: group_width_caps(groups) for body, groups in tables.tier_groups
@@ -87,6 +95,7 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
 
         # Warmup only, set through forced_plan(); a forced rectangle wins over ragged.
         self._forced_rect: tuple[int, int] | None = None
+        self._forced_range: RectRange | None = None
         self._force_ragged = False
 
         self.encoder_plan: EncoderPlan | None = None
@@ -94,24 +103,44 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         self._planned_batch: InputBatch | None = None
         self.dispatch_stats = EncoderDispatchStats()
 
+    @property
+    def dynamic_ranges(self) -> tuple[RectRange, ...]:
+        """The declared-width ranges steps can take: empty unless the model installed its
+        tiled encoder (``install_tiled_encoder``)."""
+        if (
+            not self._ranges
+            or self.supports_mm_inputs
+            or not self._batched
+            or not getattr(self.model, "spyre_dynamic_width", False)
+        ):
+            return ()
+        return self._ranges
+
     @contextmanager
     def forced_plan(
         self, rect: tuple[int, int] | None = None, ragged: bool = False
     ) -> Generator[None]:
         """Warmup only: plan every step inside as ``rect``, a declared ``(extent, width)``
-        rectangle, or as ragged, whatever the dummy batch's own shape."""
+        rectangle (static, or a width in one of ``dynamic_ranges``), or as ragged,
+        whatever the dummy batch's own shape."""
+        forced_range = None
         if rect is not None:
             # Warmup must not trace a rectangle serving never takes.
             if self.supports_mm_inputs:
                 raise ValueError("multimodal encoders run packed until #1242")
-            if rect not in self._rectangles:
+            extent, width = rect
+            forced_range = next(
+                (r for r in self.dynamic_ranges if r.extent == extent and width in r.widths()),
+                None,
+            )
+            if forced_range is None and rect not in self._rectangles:
                 raise ValueError(f"{rect} is not a declared (extent, width): {self._rectangles}")
-        previous = self._forced_rect, self._force_ragged
-        self._forced_rect, self._force_ragged = rect, ragged
+        previous = self._forced_rect, self._forced_range, self._force_ragged
+        self._forced_rect, self._forced_range, self._force_ragged = rect, forced_range, ragged
         try:
             yield
         finally:
-            self._forced_rect, self._force_ragged = previous
+            self._forced_rect, self._forced_range, self._force_ragged = previous
 
     def _width_caps_for(self, rows: int) -> dict[int, int]:
         """Caps of the body this step belongs to.
@@ -179,11 +208,16 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
             dtype=self._mask_dtype,
             batched=self._batched,
             forced_rect=self._forced_rect,
+            forced_range=self._forced_range,
+            ranges=() if self._force_ragged else self.dynamic_ranges,
+            lengths=self._lengths,
         )
         plan = None
         if attn_plan is not None:
             plan = EncoderPlan(attn_plan=attn_plan)
-            self.dispatch_stats.record(attn_plan, rows)
+            # A declared-width grid is its own size, not the body's.
+            grid = plan.grid if plan.rect_range is not None else None
+            self.dispatch_stats.record(attn_plan, rows if grid is None else grid[0] * grid[1])
         self._set_plan(plan, input_batch)
         return attn_metadata
 
@@ -209,6 +243,8 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
                 model_inputs["positions"] = offset_host_positions(positions, self._position_offset)
             return model_inputs
 
+        rect = self.encoder_plan.rect_range if self.encoder_plan is not None else None
+        declare = (self.spyre_device, rect) if rect is not None else None
         ids, _, pos = expand_body_to_grid(
             input_batch.input_ids,
             None,
@@ -216,15 +252,21 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
             grid,
             pad_token_id=self._pad_token_id,
             position_offset=self._position_offset,
+            declare=declare,
         )
         model_inputs["input_ids"] = ids
         model_inputs["positions"] = pos
         token_types = model_inputs.get("token_type_ids")
         if token_types is not None:
             extent, width, query_lens = grid
-            model_inputs["token_type_ids"] = expand_packed_token_types(
+            grid_types = expand_packed_token_types(
                 token_types[: sum(query_lens)].cpu(), query_lens, width, extent
-            ).to(token_types.device)
+            )
+            model_inputs["token_type_ids"] = (
+                upload_declared(grid_types, rect, self.spyre_device, torch.int64)
+                if rect is not None
+                else grid_types.to(token_types.device)
+            )
         return model_inputs
 
     def _set_plan(self, plan: EncoderPlan | None, input_batch: InputBatch | None) -> None:

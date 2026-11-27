@@ -26,6 +26,7 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     EncoderGroupPlan,
     EncoderRectPlan,
 )
+from spyre_inference.v1.worker.encoder_dynamic import RectRange
 
 
 # eq=False: the generated __eq__/__hash__ would compare the plan's tensors and lists.
@@ -38,6 +39,12 @@ class EncoderPlan:
     @property
     def is_rectangular(self) -> bool:
         return isinstance(self.attn_plan, EncoderRectPlan)
+
+    @property
+    def rect_range(self) -> RectRange | None:
+        """The declared width range of a declared-width rectangle; None otherwise."""
+        plan = self.attn_plan
+        return plan.rect_range if isinstance(plan, EncoderRectPlan) else None
 
     @property
     def grid(self) -> tuple[int, int, list[int]] | None:

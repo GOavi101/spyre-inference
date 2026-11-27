@@ -608,6 +608,15 @@ class TorchSpyrePlatform(CpuPlatform):
             encoder_rectangles(vllm_config),
             encoder_group_shapes(vllm_config) or "none reachable",
         )
+        from spyre_inference.v1.worker.encoder_dynamic import encoder_rect_ranges
+
+        ranges = encoder_rect_ranges(vllm_config)
+        if ranges:
+            logger.info(
+                "Declared encoder batch widths (SPYRE_ENCODER_DYNAMIC_WIDTH), length: rows %s; "
+                "applied if the model's encoder can run them tiled.",
+                {r.extent: r.declaration() for r in ranges},
+            )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

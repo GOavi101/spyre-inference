@@ -48,6 +48,7 @@ from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
 from spyre_inference.v1.worker.compile_granularity import compile_granularity
+from spyre_inference.v1.worker.encoder_dynamic import is_declared
 from spyre_inference.v1.worker.spyre.model_wrapper import (
     _SpyreModelWrapper,
     warm_sample_row_gathers,
@@ -119,6 +120,10 @@ def _dummy_run(runner: "SpyreModelRunnerV2", num_tokens: int, skip_attn: bool):
 
 def _warm_pooling(runner: "SpyreModelRunnerV2", hidden_states: torch.Tensor) -> None:
     assert runner.pooling_runner is not None
+    if is_declared(hidden_states):
+        # The body dummy landed on a declared-width rectangle.
+        _warm_declared_pooling(runner, hidden_states)
+        return
     runner.pooling_runner.dummy_pooler_run(hidden_states)
     if not runner.pooling_on_spyre:
         return
@@ -144,19 +149,64 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
     body-shape dummy only covers whichever rectangle its own batch landed on.
     """
     forced_plan = getattr(runner.model_state, "forced_plan", None)
-    if forced_plan is None or not encoder_inline_active():
+    if forced_plan is None:
+        return
+    ranges = getattr(runner.model_state, "dynamic_ranges", ())
+    # The tiled layer runs declared widths whether or not attention is traced in.
+    for rect in sorted(ranges, key=lambda r: r.extent, reverse=True):
+        _warm_declared_widths(runner, forced_plan, rect)
+    if not encoder_inline_active():
         return
     tables = encoder_shape_tables(runner.vllm_config)
+    # A length with a declared width range never takes a static rectangle: a batch too
+    # wide for the range is too wide for every static rectangle of that length too.
+    ranged = {rect.extent for rect in ranges}
     # A multimodal encoder's body arrives as inputs_embeds, so it always plans ragged.
     rectangles = [] if runner.supports_mm_inputs else tables.rectangles
     for extent, width in sorted(rectangles, reverse=True):
-        if extent * width in bodies:
+        if extent * width in bodies and extent not in ranged:
             with forced_plan(rect=(extent, width)):
                 _dummy_run(runner, extent * width, skip_attn=False)
     for body, groups in tables.tier_groups:
         if groups and body in bodies:
             with forced_plan(ragged=True):
                 _dummy_run(runner, body, skip_attn=False)
+
+
+def _warm_declared_widths(runner: "SpyreModelRunnerV2", forced_plan, rect) -> None:
+    """Every width of one declared range, widest first.
+
+    The widest compiles the length's graphs; the rest should only run them, and warm the
+    pooler's eager gathers, which compile per row count. A graph compiled at a narrower
+    width means something in the trace split the range.
+    """
+    counters = torch._dynamo.utils.counters["stats"]
+    for i, width in enumerate(reversed(rect.widths())):
+        graphs = counters["unique_graphs"]
+        with forced_plan(rect=(rect.extent, width)):
+            hidden_states, _ = _dummy_run(runner, rect.extent * width, skip_attn=False)
+        if i and counters["unique_graphs"] != graphs:
+            logger.warning(
+                "Encoder length %d compiled again at width %d of its declared range %s; "
+                "set TORCH_SPYRE_RECOMPILE_CHECK=error to see the guard.",
+                rect.extent,
+                width,
+                rect.declaration(),
+            )
+        _warm_declared_pooling(runner, hidden_states)
+
+
+def _warm_declared_pooling(runner: "SpyreModelRunnerV2", hidden_states: torch.Tensor) -> None:
+    """The pooler gathers on a declared-width grid: the CLS rows and the unpad gather.
+
+    No rectangle reduce: a declared grid pools MEAN through the unpad gather.
+    """
+    if runner.pooling_runner is None or not runner.pooling_on_spyre:
+        return
+    pooler = cast(VllmModelForPooling, runner.get_model()).pooler
+    warm_pooler_row_widths(pooler, hidden_states, [], runner.max_num_reqs)
+    packed = select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+    warm_pooler_row_widths(pooler, packed, [], runner.max_num_reqs)
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:

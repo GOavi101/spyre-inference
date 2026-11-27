@@ -99,10 +99,18 @@ def pool_rows_for(
     pooler: nn.Module,
     pooling_metadata: PoolingMetadata,
     grid: EncoderGrid | None,
+    declared: bool = False,
 ) -> torch.Tensor:
-    """Point the cursor at the grid for a grid-direct CLS/MEAN step, or unpad the grid."""
+    """Point the cursor at the grid for a grid-direct CLS/MEAN step, or unpad the grid.
+
+    ``declared``: the grid's rows are a declared width. The grid-direct MEAN reduce is a
+    compiled op over those rows outside any loop, which torch-spyre refuses, so MEAN
+    takes the unpad gather instead.
+    """
     # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
     rect_pooling = rect_pooling_method(pooler, pooling_metadata, grid)
+    if declared and isinstance(rect_pooling, SpyreMeanPool):
+        rect_pooling = None
     if grid is not None and isinstance(rect_pooling, SpyreCLSPool):
         extent, _width, query_lens = grid
         pooling_metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(

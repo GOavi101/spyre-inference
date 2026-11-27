@@ -80,7 +80,13 @@ class SpyrePoolingRunner(PoolingRunner):
         )
         # A no-op on Spyre, and the Spyre heads need a Spyre input.
         hidden_states = convert(hidden_states, self.spyre_device)
-        hidden_states = pool_rows_for(hidden_states, self.model.pooler, pooling_metadata, grid)
+        hidden_states = pool_rows_for(
+            hidden_states,
+            self.model.pooler,
+            pooling_metadata,
+            grid,
+            declared=plan is not None and plan.rect_range is not None,
+        )
         pooler_output = self.model.pooler(hidden_states, pooling_metadata)
         finished_mask = pooling_metadata.get_pooling_cursor().get_finished_mask()
         pooler_output = self.late_interaction_runner.postprocess_pooler_output(

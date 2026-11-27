@@ -60,6 +60,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
 )
 from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker.encoder_dynamic import RectRange, range_for_batch, upload_declared
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_rectangle_for_batch,
     encoder_shape_tables,
@@ -360,13 +361,18 @@ class EncoderRectPlan:
 
     extent: int
     width: int
-    mask: torch.Tensor
+    mask: torch.Tensor | None
     """``[width, 1, 1, extent]`` additive key-pad (``[width, 1, extent, extent]`` when
-    causal), already on the device."""
+    causal), already on the device. None on a declared-width plan, which has ``row_mask``."""
     query_lens: list[int]
     """Real length per request. The runner uses it to lay out the grid and, when
     packed-order pooling is needed, to compact hidden states afterwards. The ragged
     lengths were already read off the metadata here."""
+    row_mask: torch.Tensor | None = None
+    """Declared-width plans only: the same key-pad as ``[width * extent]``, one value per
+    grid row, uploaded with its rows declared like the grid's."""
+    rect_range: RectRange | None = None
+    """Declared-width plans only: the range ``width`` lies in."""
 
 
 @dataclass
@@ -395,8 +401,13 @@ def build_encoder_plan(
     device: torch.device,
     dtype: torch.dtype,
     batched: bool,
+    ranges: Sequence[RectRange] = (),
+    lengths: Sequence[int] = (),
 ) -> EncoderRectPlan | list[EncoderGroupPlan]:
     """Choose the path for this step and build what its kernels need.
+
+    ``ranges`` (with the ladder ``lengths``) offers declared-width rectangles, tried
+    before ``rectangles``. Bidirectional only: the tiled layer has no causal mask.
 
     Module-level and query-free so the runner can call it before the model runs: inside
     a traced region its D2H reads and H2D converts would become graph nodes.
@@ -422,6 +433,17 @@ def build_encoder_plan(
         members.append((start, query_len, min(int(seq_lens[seq_idx]), query_len)))
 
     max_len = max((m[1] for m in members), default=0)
+    if ranges and not causal and len(members) == attn_metadata.num_seqs:
+        picked = range_for_batch(len(members), max_len, lengths, ranges)
+        if picked is not None:
+            return declared_rect_plan(
+                picked[0],
+                picked[1],
+                kv_lens=[m[2] for m in members],
+                query_lens=[m[1] for m in members],
+                dtype=dtype,
+                device=device,
+            )
     # A dropped request shifts every later lane, and the pooler addresses rows by its
     # own cumsum over all requests, so the grid would be misaligned rather than padded.
     rect = (
@@ -484,8 +506,36 @@ def build_encoder_plan(
     return plans
 
 
+def declared_rect_plan(
+    rect: RectRange,
+    width: int,
+    *,
+    kv_lens: Sequence[int],
+    query_lens: Sequence[int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> EncoderRectPlan:
+    """A rectangle whose width is a declared range: the key-pad goes up as one row per
+    grid row, declared like the ids, which the tiled encoder layer cuts per trip."""
+    kv = list(kv_lens) + [1] * (width - len(kv_lens))
+    row_mask = encoder_key_pad_mask(rect.extent, kv, dtype).reshape(-1)
+    return EncoderRectPlan(
+        extent=rect.extent,
+        width=width,
+        mask=None,
+        query_lens=list(query_lens),
+        row_mask=upload_declared(row_mask, rect, device),
+        rect_range=rect,
+    )
+
+
 def forced_rect_plan(
-    extent: int, width: int, dtype: torch.dtype, device: torch.device, causal: bool
+    extent: int,
+    width: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    causal: bool,
+    rect: RectRange | None = None,
 ) -> EncoderRectPlan:
     """Warmup's declared rectangle, ignoring the dummy batch's own shape.
 
@@ -494,6 +544,12 @@ def forced_rect_plan(
     ``sum(query_lens)`` the body row count, which keeps the grid expansion an identity.
     The mask takes the group's causality, as its real plans do.
     """
+    if rect is not None:
+        assert not causal, "declared-width rectangles are bidirectional only"
+        full = [extent] * width
+        return declared_rect_plan(
+            rect, width, kv_lens=full, query_lens=full, dtype=dtype, device=device
+        )
     return EncoderRectPlan(
         extent=extent,
         width=width,
@@ -511,6 +567,9 @@ def plan_encoder_step(
     dtype: torch.dtype,
     batched: bool,
     forced_rect: tuple[int, int] | None = None,
+    forced_range: RectRange | None = None,
+    ranges: Sequence[RectRange] = (),
+    lengths: Sequence[int] = (),
 ) -> EncoderRectPlan | list[EncoderGroupPlan] | None:
     """Give each encoder metadata object its own plan, with its own causality; return the last."""
     plan = None
@@ -524,7 +583,9 @@ def plan_encoder_step(
         causal.add(encoder_md.apply_causal_mask)
         if encoder_md.encoder_plan is None:
             if forced_rect is not None:
-                plan = forced_rect_plan(*forced_rect, dtype, device, encoder_md.apply_causal_mask)
+                plan = forced_rect_plan(
+                    *forced_rect, dtype, device, encoder_md.apply_causal_mask, forced_range
+                )
             else:
                 plan = build_encoder_plan(
                     encoder_md,
@@ -533,6 +594,8 @@ def plan_encoder_step(
                     device=device,
                     dtype=dtype,
                     batched=batched,
+                    ranges=ranges,
+                    lengths=lengths,
                 )
             encoder_md.encoder_plan = plan
         else:
@@ -819,6 +882,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         return output
 
     def _forward_rect(self, plan, query, key, value, output, fused_store_ok, head_size) -> None:
+        # A declared-width plan is made only for a model whose tiled layers bypass this.
+        assert plan.mask is not None, "a declared-width rectangle reached the attention impl"
         num_heads, num_kv_heads = query.shape[1], key.shape[1]
         if fused_store_ok:
             self._run_rect(
@@ -910,9 +975,20 @@ class EncoderGrid:
 
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
+        self.row_mask: torch.Tensor | None = None
+        self.rect_range: RectRange | None = None
 
-    def publish(self, mask: torch.Tensor | None) -> None:
+    def publish(
+        self,
+        mask: torch.Tensor | None,
+        row_mask: torch.Tensor | None = None,
+        rect_range: RectRange | None = None,
+    ) -> None:
+        """``mask`` for a static rectangle; ``row_mask`` and ``rect_range`` for a
+        declared-width one, read by the tiled encoder layer and embedding."""
         self.mask = mask
+        self.row_mask = row_mask
+        self.rect_range = rect_range
 
 
 _encoder_grid = EncoderGrid()
@@ -934,7 +1010,10 @@ def publish_encoder_grid(plan: object) -> None:
     it in would make the block graph's *structure* depend on the step's group multiset --
     unbounded, and impossible to warm at startup.
     """
-    _encoder_grid.publish(plan.mask if isinstance(plan, EncoderRectPlan) else None)
+    if isinstance(plan, EncoderRectPlan):
+        _encoder_grid.publish(plan.mask, plan.row_mask, plan.rect_range)
+    else:
+        _encoder_grid.publish(None)
 
 
 def _spyre_encoder_attention_forward(

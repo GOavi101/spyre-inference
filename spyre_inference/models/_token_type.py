@@ -51,6 +51,16 @@ class SpyreTokenTypeEmbedding:
     """
 
     spyre_token_type_ids: torch.Tensor | None = None
+    spyre_tiled: bool = False
+    """Set by ``install_tiled_encoder``: declared-width steps take ``tiled_embedding``."""
+
+    def _declared_rect(self):
+        """This step's declared-width range, or None for a static step."""
+        if not self.spyre_tiled:
+            return None
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_grid
+
+        return encoder_grid().rect_range
 
     def set_spyre_token_type_ids(
         self, input_ids: torch.Tensor, token_type_ids: torch.Tensor | None
@@ -63,6 +73,12 @@ class SpyreTokenTypeEmbedding:
         leave an ``input_ids``-shaped buffer behind, or the next embedding would
         add a stale one of the previous length.
         """
+        if self._declared_rect() is not None:
+            # The ids are a declared upload; a buffer allocated here would not be, and its
+            # fixed row count would pin the compiled loop to one width.
+            self.spyre_token_type_ids = token_type_ids
+            return
+
         buffer = self.spyre_token_type_ids
         if token_type_ids is not None:
             dtype = token_type_ids.dtype
@@ -106,12 +122,29 @@ class SpyreTokenTypeEmbedding:
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        rect = self._declared_rect()
+        if rect is not None and inputs_embeds is None:
+            return self._compiled_tiled_forward(
+                input_ids, position_ids, self.spyre_token_type_ids, rect
+            )
         return self._compiled_forward(
             input_ids,
             position_ids,
             self.spyre_token_type_ids_for(input_ids),
             inputs_embeds,
         )
+
+    @maybe_compile
+    def _compiled_tiled_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_type_ids: torch.Tensor | None,
+        rect,
+    ) -> torch.Tensor:
+        from spyre_inference.models._bert_tiled import tiled_embedding
+
+        return tiled_embedding(self, input_ids, position_ids, token_type_ids, rect)
 
     @maybe_compile
     def _compiled_forward(

@@ -281,10 +281,19 @@ class SpyreSplitQKVMixin:
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs) -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix, **kwargs)  # ty: ignore[unknown-argument]
-        _plan_head_groups(cast(nn.Module, self), vllm_config)
+        from spyre_inference.v1.worker.encoder_dynamic import dynamic_width_requested
+
+        # The tiled layer has no head-group variant, so declared widths go without them.
+        self.spyre_dynamic_width_requested = dynamic_width_requested(vllm_config)
+        if not self.spyre_dynamic_width_requested:
+            _plan_head_groups(cast(nn.Module, self), vllm_config)
 
     def process_weights_after_loading(self) -> None:
         split_bert_qkv(cast(nn.Module, self))
+        if self.spyre_dynamic_width_requested:
+            from spyre_inference.models._bert_tiled import install_tiled_encoder
+
+            install_tiled_encoder(cast(nn.Module, self))
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)

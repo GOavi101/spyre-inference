@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
     SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
+    SPYRE_ENCODER_DYNAMIC_WIDTH: bool = False
+    SPYRE_ENCODER_SEQS_PER_TRIP: int = 1
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
@@ -105,6 +107,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
+    # When "1", a BERT-family pooling encoder compiles one block graph per sequence length,
+    # with the batch width a torch-spyre declared range, instead of one graph per
+    # (length, batch width) rectangle. Needs compiled mode, TP1 and a split-QKV BERT/RoBERTa
+    # model; anything else keeps the per-rectangle graphs. Off by default (#1525).
+    "SPYRE_ENCODER_DYNAMIC_WIDTH": lambda: bool(int(os.getenv("SPYRE_ENCODER_DYNAMIC_WIDTH", "0"))),
+    # Sequences per trip of the tiled encoder loop under SPYRE_ENCODER_DYNAMIC_WIDTH. A
+    # batch width rounds up to a multiple of it. "1" (default) pads least; more makes
+    # each trip's matmuls wider. Rounded down to a power of two.
+    "SPYRE_ENCODER_SEQS_PER_TRIP": lambda: int(os.getenv("SPYRE_ENCODER_SEQS_PER_TRIP", "1")),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
