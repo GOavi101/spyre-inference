@@ -387,6 +387,24 @@ class EncoderGroupPlan:
         return len(self.starts)
 
 
+def encoder_members(attn_metadata: SpyreAttentionMetadata) -> list[tuple[int, int, int]]:
+    """``(start, query_len, kv_len)`` of each request in the packed body, on the host."""
+    query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
+    seq_lens = attn_metadata.seq_lens.cpu().tolist()
+    # The body pads past num_actual_tokens; those rows are not a request.
+    num_tokens = attn_metadata.num_actual_tokens
+
+    members: list[tuple[int, int, int]] = []
+    for seq_idx in range(attn_metadata.num_seqs):
+        start = int(query_start_loc[seq_idx])
+        query_len = int(query_start_loc[seq_idx + 1]) - start
+        if start >= num_tokens or query_len <= 0:
+            continue
+        query_len = min(query_len, num_tokens - start)
+        members.append((start, query_len, min(int(seq_lens[seq_idx]), query_len)))
+    return members
+
+
 def build_encoder_plan(
     attn_metadata: SpyreAttentionMetadata,
     *,
@@ -407,20 +425,7 @@ def build_encoder_plan(
     The masks are causal iff the metadata's ``apply_causal_mask`` is set.
     """
     causal = attn_metadata.apply_causal_mask
-    query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
-    seq_lens = attn_metadata.seq_lens.cpu().tolist()
-    # The body pads past num_actual_tokens; those rows are not a request.
-    num_tokens = attn_metadata.num_actual_tokens
-
-    members: list[tuple[int, int, int]] = []  # (start, query_len, kv_len)
-    for seq_idx in range(attn_metadata.num_seqs):
-        start = int(query_start_loc[seq_idx])
-        query_len = int(query_start_loc[seq_idx + 1]) - start
-        if start >= num_tokens or query_len <= 0:
-            continue
-        query_len = min(query_len, num_tokens - start)
-        members.append((start, query_len, min(int(seq_lens[seq_idx]), query_len)))
-
+    members = encoder_members(attn_metadata)
     max_len = max((m[1] for m in members), default=0)
     # A dropped request shifts every later lane, and the pooler addresses rows by its
     # own cumsum over all requests, so the grid would be misaligned rather than padded.

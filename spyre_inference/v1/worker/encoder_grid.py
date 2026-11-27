@@ -32,6 +32,8 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from spyre_inference.models._dynamic_width_encoder import DynamicWidthPlan
+
     # Not imported at runtime: spyre_encoder_attn is imported lazily.
     from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
         EncoderGroupPlan,
@@ -122,7 +124,11 @@ class EncoderDispatchStats:
     body_rows: int = 0
     seqs: int = 0
 
-    def record(self, plan: EncoderRectPlan | list[EncoderGroupPlan] | None, rows: int) -> None:
+    def record(
+        self,
+        plan: EncoderRectPlan | list[EncoderGroupPlan] | DynamicWidthPlan | None,
+        rows: int,
+    ) -> None:
         if plan is None:
             return
         if isinstance(plan, list):

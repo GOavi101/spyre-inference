@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from spyre_inference.models._dynamic_width_encoder import DynamicWidthEncoder
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     allocate_staging_buffers,
@@ -57,6 +58,7 @@ class SpyreModelRunnerV2(GPUModelRunner):
         # Set by load_model.
         self.pooling_on_spyre = False
         self.compiled_tower_blocks = 0
+        self.dynamic_width_encoder: DynamicWidthEncoder | None = None
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)
@@ -82,6 +84,8 @@ class SpyreModelRunnerV2(GPUModelRunner):
 
     def reload_weights(self, *args: Any, **kwargs: Any) -> None:
         super().reload_weights(*args, **kwargs)
+        if self.dynamic_width_encoder is not None:
+            self.dynamic_width_encoder.drop_position_rows()
         rewarm_after_reload(self)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

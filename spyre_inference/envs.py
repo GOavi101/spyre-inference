@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
     SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
+    SPYRE_ENCODER_DYNAMIC_WIDTH_MIN_LEN: int = 0
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
@@ -105,6 +106,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
+    # Encoder lengths at or above this run as one graph per length with the batch width
+    # declared to torch-spyre (#1525), in place of one graph per (length, width)
+    # rectangle. CLS-pooled RoBERTa-family encoders at TP=1 only; a token-level task at
+    # such a length still takes its rectangle, compiled on first use. "0" (default) is off.
+    "SPYRE_ENCODER_DYNAMIC_WIDTH_MIN_LEN": lambda: int(
+        os.getenv("SPYRE_ENCODER_DYNAMIC_WIDTH_MIN_LEN") or "0"
+    ),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),

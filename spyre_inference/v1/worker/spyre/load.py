@@ -39,11 +39,13 @@ from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.prompt_logprob import CHUNK_SIZE as PROMPT_LOGPROBS_CHUNK_SIZE
 
+from spyre_inference.models import _dynamic_width_encoder as dynamic_width_encoder
 from spyre_inference.models import check_spyre_model
 from spyre_inference.moe import prepare_moe_layers_on_threads
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.pool import configure_pooling_for_spyre
 from spyre_inference.v1.worker.compile_granularity import compile_for_spyre
+from spyre_inference.v1.worker.encoder_grid import encoder_pad_token_id
 from spyre_inference.v1.worker.model_load import (
     fix_padded_model,
     install_pad_loaders,
@@ -51,6 +53,7 @@ from spyre_inference.v1.worker.model_load import (
     resolve_kv_scales,
 )
 from spyre_inference.v1.worker.spyre.model_states import resolve_spyre_model_state
+from spyre_inference.v1.worker.spyre.model_states.encoder_only import SpyreEncoderOnlyModelState
 from spyre_inference.v1.worker.spyre.model_wrapper import _SpyreModelWrapper, model_dtype
 from spyre_inference.v1.worker.spyre.pool.pooling_runner import SpyrePoolingRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -256,3 +259,27 @@ def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> No
         pooling_runner.pooling_on_spyre = runner.pooling_on_spyre
         pooling_runner.spyre_device = runner.spyre_device
         pooling_runner.encoder_plan_source = lambda: getattr(model_state, "encoder_plan", None)
+        if isinstance(model_state, SpyreEncoderOnlyModelState):
+            _install_dynamic_width(runner, model_state, pooling_runner)
+
+
+def _install_dynamic_width(
+    runner: "SpyreModelRunnerV2",
+    model_state: SpyreEncoderOnlyModelState,
+    pooling_runner: SpyrePoolingRunner,
+) -> None:
+    """Build the declared-width encoder when enabled; warmup arms it on the model state."""
+    encoder = dynamic_width_encoder.build(
+        runner.vllm_config,
+        runner.get_model(),
+        runner.spyre_device,
+        model_dtype(runner.model_config),
+        pad_token_id=encoder_pad_token_id(runner.model_config),
+    )
+    if encoder is None:
+        return
+    dynamic_width_encoder.install(encoder)
+    runner.dynamic_width_encoder = encoder
+    model_state.dynamic_width_serves = lambda batch: pooling_runner.pools_only(
+        batch, encoder.cls_tasks
+    )

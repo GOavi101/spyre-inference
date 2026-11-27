@@ -22,7 +22,7 @@ grid expansion are shared functions (spyre_encoder_attn.py, encoder_grid.py).
 MRV2 calls prepare_attn before prepare_inputs, so the plan is built first.
 """
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -38,8 +38,15 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from spyre_inference.models._dynamic_width_encoder import (
+    DynamicWidthEncoder,
+    DynamicWidthPlan,
+    publish_dynamic_width_plan,
+)
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
+from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadata
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    encoder_members,
     plan_encoder_step,
     publish_encoder_grid,
 )
@@ -93,6 +100,12 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         # profile_run skips prepare_attn, so its batch must not inherit the last grid.
         self._planned_batch: InputBatch | None = None
         self.dispatch_stats = EncoderDispatchStats()
+
+        # Set by warmup once the declared-width loops are compiled, so the dummy runs
+        # before it keep the static path. ``dynamic_width_serves`` (set at load) says
+        # whether every request of a batch pools a task the loops' output serves.
+        self.dynamic_width: DynamicWidthEncoder | None = None
+        self.dynamic_width_serves: Callable[[InputBatch], bool] = lambda _batch: False
 
     @contextmanager
     def forced_plan(
@@ -154,6 +167,12 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
             ubatch_idx,
             model_specific_attn_metadata,
         )
+        dynamic = self._plan_dynamic_width(attn_metadata.values(), input_batch)
+        if dynamic is not None:
+            self.dispatch_stats.record(dynamic, dynamic.extent * len(dynamic.query_lens))
+            self._set_plan(EncoderPlan(attn_plan=dynamic), input_batch)
+            return attn_metadata
+
         rows = input_batch.num_tokens_after_padding
         # The expansion is an identity only over a body exactly the forced size.
         # That size is the rectangle's own grid, not the largest tier.
@@ -187,6 +206,43 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         self._set_plan(plan, input_batch)
         return attn_metadata
 
+    def _plan_dynamic_width(
+        self, metadatas: Iterable[object], input_batch: InputBatch
+    ) -> DynamicWidthPlan | None:
+        """The declared-width plan when this step fits it, else None for the static path.
+
+        It fits when every request is a whole bidirectional prompt pooling a CLS task and
+        the batch is no wider than its length's declared width.
+        """
+        encoder = self.dynamic_width
+        if (
+            encoder is None
+            or self._forced_rect is not None
+            or self._force_ragged
+            or self.supports_mm_inputs
+            or not self.dynamic_width_serves(input_batch)
+        ):
+            return None
+        encoder_mds = {id(md): md for md in metadatas if hasattr(md, "encoder_plan")}
+        if len(encoder_mds) != 1:
+            return None
+        md = cast(SpyreAttentionMetadata, next(iter(encoder_mds.values())))
+        if md.apply_causal_mask:
+            return None
+        members = encoder_members(md)
+        # A partial prompt starts past position 0, which the loops' position rows assume.
+        if (
+            not members
+            or len(members) != md.num_seqs
+            or any(kv_len != query_len for _start, query_len, kv_len in members)
+        ):
+            return None
+        query_lens = [query_len for _start, query_len, _kv_len in members]
+        extent = encoder.extent_for(len(members), max(query_lens))
+        if extent is None:
+            return None
+        return encoder.plan(extent, [start for start, _q, _kv in members], query_lens)
+
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor | None]:
@@ -194,6 +250,12 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if self._planned_batch is not input_batch:
             self._set_plan(None, None)
+        dynamic = self.encoder_plan.dynamic_width if self.encoder_plan is not None else None
+        if dynamic is not None:
+            # The loops read their ids off the plan; the packed inputs go unused.
+            assert self.dynamic_width is not None
+            self.dynamic_width.set_input_ids(dynamic, input_batch.input_ids)
+            return model_inputs
         positions = model_inputs.get("positions")
         if positions is None:
             positions = input_batch.positions
@@ -231,3 +293,4 @@ class SpyreEncoderOnlyModelState(SpyreModelStateMixin, EncoderOnlyModelState):
         self.encoder_plan = plan
         self._planned_batch = input_batch
         publish_encoder_grid(plan.attn_plan if plan is not None else None)
+        publish_dynamic_width_plan(plan.dynamic_width if plan is not None else None)

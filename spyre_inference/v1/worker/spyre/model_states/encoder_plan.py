@@ -22,6 +22,7 @@ plan through ``SpyreEncoderOnlyModelState.forced_plan()``, not here.
 
 from dataclasses import dataclass
 
+from spyre_inference.models._dynamic_width_encoder import DynamicWidthPlan
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     EncoderGroupPlan,
     EncoderRectPlan,
@@ -31,17 +32,24 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
 # eq=False: the generated __eq__/__hash__ would compare the plan's tensors and lists.
 @dataclass(frozen=True, eq=False)
 class EncoderPlan:
-    """The current step's encoder dispatch: a dense rectangle or ragged rows."""
+    """The current step's encoder dispatch: a dense rectangle, ragged rows, or the
+    declared-width loops."""
 
-    attn_plan: EncoderRectPlan | list[EncoderGroupPlan]
+    attn_plan: EncoderRectPlan | list[EncoderGroupPlan] | DynamicWidthPlan
 
     @property
     def is_rectangular(self) -> bool:
         return isinstance(self.attn_plan, EncoderRectPlan)
 
     @property
+    def dynamic_width(self) -> DynamicWidthPlan | None:
+        """The declared-width plan, whose output is ``CLS_ROWS`` rows per request."""
+        plan = self.attn_plan
+        return plan if isinstance(plan, DynamicWidthPlan) else None
+
+    @property
     def grid(self) -> tuple[int, int, list[int]] | None:
-        """``(extent, width, query_lens)`` on the rectangular path; None on the ragged one.
+        """``(extent, width, query_lens)`` on the rectangular path; None on the others.
 
         Real rows are ``encoder_dense_row_indices(query_lens, extent)``, the layout
         ``unpad_encoder_grid`` unpads; the ragged body is already packed.

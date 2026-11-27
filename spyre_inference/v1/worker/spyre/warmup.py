@@ -37,6 +37,7 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -48,6 +49,7 @@ from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
 from spyre_inference.v1.worker.compile_granularity import compile_granularity
+from spyre_inference.v1.worker.spyre.model_states.encoder_only import SpyreEncoderOnlyModelState
 from spyre_inference.v1.worker.spyre.model_wrapper import (
     _SpyreModelWrapper,
     warm_sample_row_gathers,
@@ -149,14 +151,46 @@ def _warm_encoder_inline_paths(runner: "SpyreModelRunnerV2", bodies: set[int]) -
     tables = encoder_shape_tables(runner.vllm_config)
     # A multimodal encoder's body arrives as inputs_embeds, so it always plans ragged.
     rectangles = [] if runner.supports_mm_inputs else tables.rectangles
+    # The declared-width loops serve CLS batches at these lengths; a token-level batch
+    # there compiles its rectangle on first use.
+    encoder = runner.dynamic_width_encoder
+    declared = encoder.lengths if encoder is not None else ()
     for extent, width in sorted(rectangles, reverse=True):
-        if extent * width in bodies:
+        if extent * width in bodies and extent not in declared:
             with forced_plan(rect=(extent, width)):
                 _dummy_run(runner, extent * width, skip_attn=False)
     for body, groups in tables.tier_groups:
         if groups and body in bodies:
             with forced_plan(ragged=True):
                 _dummy_run(runner, body, skip_attn=False)
+
+
+def _warm_dynamic_width(runner: "SpyreModelRunnerV2") -> None:
+    """Compile the declared-width loops and the pooler over their rows, then arm them.
+
+    Armed last, so every dummy run before keeps the static path.
+    """
+    encoder = runner.dynamic_width_encoder
+    if encoder is None:
+        return
+    t0 = time.time()
+    encoder.warm()
+    if runner.pooling_on_spyre:
+        # The pooling runner pads the CLS rows to a power of two before the pooler.
+        pooler = cast(VllmModelForPooling, runner.get_model()).pooler
+        hidden = int(encoder.bert.config.hidden_size)
+        widest = 1 << max(0, max(encoder.widths.values()) - 1).bit_length()
+        for rows in (1 << i for i in range(widest.bit_length())):
+            hidden_states = convert(
+                torch.zeros(rows, hidden, dtype=encoder.dtype), runner.spyre_device
+            )
+            warm_pooler_row_widths(pooler, hidden_states, [], runner.max_num_reqs)
+    cast(SpyreEncoderOnlyModelState, runner.model_state).dynamic_width = encoder
+    logger.info(
+        "Declared-width encoder lengths %s warmed in %.3fs.",
+        list(encoder.lengths),
+        time.time() - t0,
+    )
 
 
 def _warm_multimodal(runner: "SpyreModelRunnerV2", sizes: list[int]) -> None:
@@ -310,6 +344,7 @@ def run(runner: "SpyreModelRunnerV2") -> None:
             runner.speculator.warm_draft_batches()
         if runner.pooling_runner is not None and not runner.model_config.enforce_eager:
             _warm_encoder_inline_paths(runner, {c.num_tokens for c in calls})
+            _warm_dynamic_width(runner)
         if not runner.model_config.enforce_eager:
             _warm_multimodal(runner, [c.num_tokens for c in calls])
         if widest is not None:
