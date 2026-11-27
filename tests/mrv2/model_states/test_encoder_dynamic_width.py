@@ -17,9 +17,13 @@ plan a batch gets, and the grid the model state lays out. CPU-only."""
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
+from vllm.pooling_params import PoolingParams
+from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
 from spyre_inference import envs
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
@@ -27,6 +31,8 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     encoder_grid,
     encoder_key_pad_mask,
 )
+from spyre_inference.v1.pool.encoder_grid import pool_rows_for
+from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool, SpyreMeanPool
 from spyre_inference.v1.worker.encoder_dynamic import (
     RectRange,
     _rect_ranges,
@@ -217,3 +223,36 @@ def test_forced_ragged_ignores_the_ranges():
     with state.forced_plan(ragged=True):
         _step(state, make_input_batch([100, 90], num_tokens_after_padding=2048))
     assert not state.encoder_plan.is_rectangular
+
+
+@pytest.mark.parametrize("pooling", [SpyreCLSPool, SpyreMeanPool, SpyreLastPool])
+@pytest.mark.parametrize("query_lens", [[5], [3, 1, 2]])
+def test_pooling_a_declared_grid(pooling, query_lens):
+    extent, count = 8, len(query_lens)
+    hidden = torch.randn(count * extent, 4, generator=torch.Generator().manual_seed(0))
+    pooler = SequencePooler(pooling=pooling(), head=nn.Identity())
+    prompt = torch.tensor(query_lens, dtype=torch.int64)
+    metadata = PoolingMetadata(
+        prompt_lens=prompt,
+        prompt_token_ids=None,
+        prompt_token_ids_cpu=None,
+        pooling_params=[PoolingParams(task="embed") for _ in query_lens],
+        pooling_states=[PoolingStates() for _ in query_lens],
+    )
+    metadata.build_pooling_cursor(
+        np.array(query_lens, dtype=np.int32), seq_lens_cpu=prompt, device=torch.device("cpu")
+    )
+
+    rows = pool_rows_for(hidden, pooler, metadata, (extent, count, query_lens), declared=True)
+    pooled = pooler.pooling(rows, metadata)
+
+    lanes = [hidden[i * extent : i * extent + n] for i, n in enumerate(query_lens)]
+    want = {
+        SpyreCLSPool: [lane[0] for lane in lanes],
+        SpyreMeanPool: [lane.mean(dim=0) for lane in lanes],
+        SpyreLastPool: [lane[-1] for lane in lanes],
+    }[pooling]
+    torch.testing.assert_close(pooled, torch.stack(want))
+    if pooling is SpyreCLSPool:
+        # Only the CLS rows, padded to a power of two.
+        assert rows.shape[0] == {1: 1, 3: 4}[count]

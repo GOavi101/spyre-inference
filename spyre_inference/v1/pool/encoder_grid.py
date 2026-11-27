@@ -23,11 +23,13 @@ import torch.nn as nn
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.v1.pool.metadata import PoolingMetadata
 
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreCLSPool,
     SpyreDispatchPooler,
     SpyreMeanPool,
     SpyrePoolingCursor,
+    pad_row_count_to_bucket,
     select_rows,
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_cls_rows
@@ -62,6 +64,17 @@ def unpad_encoder_grid(hidden_states: torch.Tensor, grid: EncoderGrid | None) ->
         return hidden_states
     rows_list = rows_list + [0] * (total - len(rows_list))
     return select_rows(hidden_states, torch.tensor(rows_list, dtype=torch.int64, device="cpu"))
+
+
+def copy_declared_rows(hidden_states: torch.Tensor, rows: list[int]) -> torch.Tensor:
+    """``rows`` of a declared-width output as a plain tensor, padded to a power of two.
+
+    torch-spyre refuses an eager gather over a declared dim, so each row goes through the
+    host. The padding repeats the last row, as ``pad_row_count_to_bucket`` does.
+    """
+    host = torch.cat([convert(hidden_states.narrow(0, row, 1), "cpu") for row in rows])
+    idx, _ = pad_row_count_to_bucket(torch.arange(len(rows)))
+    return convert(host.index_select(0, idx), device=hidden_states.device)
 
 
 def rect_pooling_method(
@@ -103,14 +116,22 @@ def pool_rows_for(
 ) -> torch.Tensor:
     """Point the cursor at the grid for a grid-direct CLS/MEAN step, or unpad the grid.
 
-    ``declared``: the grid's rows are a declared width. The grid-direct MEAN reduce is a
-    compiled op over those rows outside any loop, which torch-spyre refuses, so MEAN
-    takes the unpad gather instead.
+    ``declared``: the grid's rows are a declared width, which no op outside a loop can
+    read. CLS copies just its rows; every other pooling reads a plain copy of the grid, and
+    MEAN takes the unpad gather there.
     """
     # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
     rect_pooling = rect_pooling_method(pooler, pooling_metadata, grid)
-    if declared and isinstance(rect_pooling, SpyreMeanPool):
-        rect_pooling = None
+    if declared:
+        if grid is not None and isinstance(rect_pooling, SpyreCLSPool):
+            extent, _width, query_lens = grid
+            pooling_metadata.get_pooling_cursor().first_token_indices_gpu = torch.arange(
+                len(query_lens), dtype=torch.int64
+            )
+            return copy_declared_rows(hidden_states, encoder_cls_rows(len(query_lens), extent))
+        hidden_states = convert(convert(hidden_states, "cpu"), device=hidden_states.device)
+        if isinstance(rect_pooling, SpyreMeanPool):
+            rect_pooling = None
     if grid is not None and isinstance(rect_pooling, SpyreCLSPool):
         extent, _width, query_lens = grid
         pooling_metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(

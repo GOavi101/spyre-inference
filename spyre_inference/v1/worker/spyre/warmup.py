@@ -37,6 +37,7 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -46,6 +47,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_inline_active
 from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import select_rows
+from spyre_inference.v1.pool.encoder_grid import copy_declared_rows
 from spyre_inference.v1.pool.warmup import warm_pooler_row_widths
 from spyre_inference.v1.worker.compile_granularity import compile_granularity
 from spyre_inference.v1.worker.encoder_dynamic import is_declared
@@ -197,15 +199,20 @@ def _warm_declared_widths(runner: "SpyreModelRunnerV2", forced_plan, rect) -> No
 
 
 def _warm_declared_pooling(runner: "SpyreModelRunnerV2", hidden_states: torch.Tensor) -> None:
-    """The pooler gathers on a declared-width grid: the CLS rows and the unpad gather.
+    """The pooler gathers after a declared-width grid, which ``pool_rows_for`` copies.
 
-    No rectangle reduce: a declared grid pools MEAN through the unpad gather.
+    CLS pools a power-of-two count of rows; the rest pool a plain copy of the grid and its
+    unpad gather. No rectangle reduce: a declared grid pools MEAN through that gather.
     """
     if runner.pooling_runner is None or not runner.pooling_on_spyre:
         return
     pooler = cast(VllmModelForPooling, runner.get_model()).pooler
-    warm_pooler_row_widths(pooler, hidden_states, [], runner.max_num_reqs)
-    packed = select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
+    for i in range((runner.max_num_reqs - 1).bit_length() + 1):
+        cls_rows = copy_declared_rows(hidden_states, [0] * (1 << i))
+        warm_pooler_row_widths(pooler, cls_rows, [], 1 << i)
+    plain = convert(convert(hidden_states, "cpu"), device=hidden_states.device)
+    warm_pooler_row_widths(pooler, plain, [], runner.max_num_reqs)
+    packed = select_rows(plain, torch.zeros(plain.shape[0], dtype=torch.int64))
     warm_pooler_row_widths(pooler, packed, [], runner.max_num_reqs)
 
 

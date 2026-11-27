@@ -19,6 +19,10 @@ sequences, since torch-spyre compiles a declared dim only that way: the embeddin
 row tiles, each layer in trips of ``S`` sequences, attention within the trip. Weights go
 in as loop operands, as in every other ``for_each_tile`` body here. Off such a step
 (ragged, or a length with a static rectangle) each module runs its upstream forward.
+
+The loops spell layer norm as fp32 arithmetic (``_layer_norm_kernel``): torch-spyre rejects
+``F.layer_norm`` inside a ``for_each_tile`` loop, where its element-arrangement exemption,
+keyed on the op name, sees ``while_loop``.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.models.bert import BertEncoder, BertLayer, BertSelfAttention
 
+from spyre_inference.custom_ops.layer_norm import _layer_norm_kernel
 from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod, spyre_linear_t
 from spyre_inference.models._retype import retype
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
@@ -131,10 +136,10 @@ class SpyreTiledBertLayer(BertLayer):
                 head_dim,
             ).reshape(-1, heads * head_dim)
             x = spyre_linear_t(attn, aw, ab, pad_rows=pad1) + h
-            x = F.layer_norm(x, ln1.normalized_shape, n1w, n1b, ln1.eps)
+            x = _layer_norm_kernel(x, n1w, n1b, ln1.eps)
             y = act(spyre_linear_t(x, iw, ib, pad_rows=pad2))
             y = spyre_linear_t(y, ow, ob, pad_rows=pad3) + x
-            return F.layer_norm(y, ln2.normalized_shape, n2w, n2b, ln2.eps)
+            return _layer_norm_kernel(y, n2w, n2b, ln2.eps)
 
         weights = (
             proj.q_weight_t,
@@ -194,7 +199,7 @@ def tiled_embedding(
     tile = min(rect.granule, _EMBED_TILE_ROWS)
 
     def norm(e, lw, lb):
-        return F.layer_norm(e, ln.normalized_shape, lw, lb, ln.eps)
+        return _layer_norm_kernel(e, lw, lb, ln.eps)
 
     if token_type_ids is None:
 
