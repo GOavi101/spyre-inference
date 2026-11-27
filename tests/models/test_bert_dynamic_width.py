@@ -135,7 +135,7 @@ def test_tiled_layer_matches_the_grid_layer(
     assert _layer_refusal(layer) is None
     tiled = retype(layer, SpyreTiledBertLayer)
     tiled.spyre_tile_pads = (False, False, False)
-    row_mask = encoder_key_pad_mask(EXTENT, kv_lens, torch.float32).reshape(-1)
+    row_mask = encoder_key_pad_mask(EXTENT, kv_lens, torch.float32).reshape(-1, 1)
     encoder_grid().publish(None, row_mask, rect)
     got = tiled(x)
     assert trips == [width // seqs_per_trip]
@@ -183,5 +183,6 @@ def test_tiled_embedding_matches_the_untiled_one(default_vllm_config, tp_group, 
 
     untiled = SpyreTokenTypeEmbedding._compiled_forward.__wrapped__  # ty: ignore
     want = untiled(emb, ids, pos, segments if with_segments else torch.zeros_like(ids))
-    got = tiled_embedding(emb, ids, pos, segments, RectRange(EXTENT, 1, max_width=4))
+    rows_of = [None if t is None else t.unsqueeze(1) for t in (ids, pos, segments)]
+    got = tiled_embedding(emb, *rows_of, RectRange(EXTENT, 1, max_width=4))
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)

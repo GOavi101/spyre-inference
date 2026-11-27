@@ -122,7 +122,7 @@ class SpyreTiledBertLayer(BertLayer):
                 spyre_linear_t(h, qw, qb).view(-1, heads, head_dim),
                 spyre_linear_t(h, kw, kb).view(-1, kv_heads, head_dim),
                 spyre_linear_t(h, vw, vb).view(-1, kv_heads, head_dim),
-                m.view(seqs, 1, 1, extent),
+                m.reshape(seqs, 1, 1, extent),
                 scale,
                 seqs,
                 extent,
@@ -181,7 +181,8 @@ def tiled_embedding(
 ) -> torch.Tensor:
     """The embedding sum and LayerNorm over declared rows, ``_EMBED_TILE_ROWS`` at a time.
 
-    Without segment ids every row is segment 0, so its table row is added directly.
+    The ids arrive as ``[B * L, 1]`` (see ``upload_declared``). Without segment ids every
+    row is segment 0, so its table row is added directly.
     """
     check_rows(input_ids.shape[0], rect)
     ln = emb.LayerNorm
@@ -198,14 +199,16 @@ def tiled_embedding(
     if token_type_ids is None:
 
         def body(ids, p, ww, pw, sw, lw, lb):
-            return norm(F.embedding(ids, ww) + sw.narrow(0, 0, 1) + F.embedding(p, pw), lw, lb)
+            words, positions = F.embedding(ids.flatten(), ww), F.embedding(p.flatten(), pw)
+            return norm(words + sw.narrow(0, 0, 1) + positions, lw, lb)
 
         operands = (input_ids, position_ids, word, pos, segment, ln.weight, ln.bias)
         dims = (0, 0, None, None, None, None, None)
     else:
 
         def body(ids, p, s, ww, pw, sw, lw, lb):
-            return norm(F.embedding(ids, ww) + F.embedding(s, sw) + F.embedding(p, pw), lw, lb)
+            words, positions = F.embedding(ids.flatten(), ww), F.embedding(p.flatten(), pw)
+            return norm(words + F.embedding(s.flatten(), sw) + positions, lw, lb)
 
         operands = (input_ids, position_ids, token_type_ids, word, pos, segment, ln.weight, ln.bias)
         dims = (0, 0, 0, None, None, None, None, None)

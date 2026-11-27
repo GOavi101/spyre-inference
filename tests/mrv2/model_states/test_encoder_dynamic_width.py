@@ -161,11 +161,12 @@ def test_a_batch_static_rectangles_miss_gets_a_declared_width():
     assert isinstance(plan, EncoderRectPlan)
     assert (plan.extent, plan.width, plan.mask) == (2048, 2, None)
     assert plan.rect_range is not None and plan.rect_range.extent == 2048
-    want_mask = encoder_key_pad_mask(2048, [1100, 10], torch.float16).reshape(-1)
+    want_mask = encoder_key_pad_mask(2048, [1100, 10], torch.float16).reshape(-1, 1)
     torch.testing.assert_close(plan.row_mask, want_mask)
     # The grid is the declared width, not the 2048-row body.
-    assert inputs["input_ids"].shape == (4096,)
-    assert inputs["positions"].shape == (4096,)
+    # Two-dimensional: torch-spyre cannot declare the innermost dim of a tensor.
+    assert inputs["input_ids"].shape == (4096, 1)
+    assert inputs["positions"].shape == (4096, 1)
     grid = encoder_grid()
     assert grid.mask is None and grid.rect_range is plan.rect_range
     assert grid.row_mask is plan.row_mask
@@ -176,7 +177,7 @@ def test_width_rounds_to_the_batch_not_the_body():
     _step(state, make_input_batch([100, 90, 80], num_tokens_after_padding=2048))
     assert state.encoder_plan.grid == (128, 3, [100, 90, 80])
     # Batch-pad lanes only up to the width: none here.
-    assert state.encoder_plan.attn_plan.row_mask.shape == (3 * 128,)
+    assert state.encoder_plan.attn_plan.row_mask.shape == (3 * 128, 1)
 
 
 def test_a_model_without_the_tiled_encoder_keeps_static_rectangles():

@@ -52,7 +52,7 @@ def _runner(
     runner.max_num_reqs = 8
     runner.pooling_on_spyre = True
     runner.spyre_device = torch.device(device)
-    plan = types.SimpleNamespace(grid=grid) if grid is not None else None
+    plan = types.SimpleNamespace(grid=grid, rect_range=None) if grid is not None else None
     runner.encoder_plan_source = lambda: plan  # ty: ignore[invalid-assignment]
     runner.late_interaction_runner = LateInteractionRunner()
     runner.prompt_token_ids = {}

@@ -369,7 +369,7 @@ class EncoderRectPlan:
     packed-order pooling is needed, to compact hidden states afterwards. The ragged
     lengths were already read off the metadata here."""
     row_mask: torch.Tensor | None = None
-    """Declared-width plans only: the same key-pad as ``[width * extent]``, one value per
+    """Declared-width plans only: the same key-pad as ``[width * extent, 1]``, one value per
     grid row, uploaded with its rows declared like the grid's."""
     rect_range: RectRange | None = None
     """Declared-width plans only: the range ``width`` lies in."""

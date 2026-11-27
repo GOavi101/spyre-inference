@@ -70,7 +70,7 @@ class RectRange:
         return list(range(self.seqs_per_trip, self.max_width + 1, self.seqs_per_trip))
 
     def declaration(self) -> dict[str, int]:
-        """The ``dynamic={0: ...}`` entry for a ``[B * L, ...]`` tensor."""
+        """The ``dynamic={0: ...}`` entry for a ``[B * L, N]`` tensor."""
         return {"min": self.granule, "max": self.max_rows, "granularity": self.granule}
 
 
@@ -163,11 +163,15 @@ def range_for_batch(
 def upload_declared(
     host: torch.Tensor, rect: RectRange, device: torch.device, dtype: torch.dtype | None = None
 ) -> torch.Tensor:
-    """Copy ``host`` (``[B * L, ...]``) to ``device`` with its rows declared as ``rect``.
+    """Copy ``host`` (``[B * L]`` or ``[B * L, N]``) to ``device`` with its rows declared
+    as ``rect``. A 1-D ``host`` comes back as ``[B * L, 1]``: torch-spyre cannot reserve
+    the innermost dim.
 
     Copied whole at the reserved size, then shrunk: copying part of a reservation is
     several times slower (torch-spyre#6026). A plain copy off Spyre.
     """
+    if host.ndim == 1:
+        host = host.unsqueeze(1)
     if device.type != "spyre":
         return convert(host, device=device, dtype=dtype)
     padded = host.new_zeros((rect.max_rows, *host.shape[1:]))
